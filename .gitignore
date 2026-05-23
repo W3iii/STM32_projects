@@ -1,0 +1,38 @@
+# STM32CubeIDE / Eclipse workspace state
+.metadata/
+.recommenders/
+RemoteSystemsTempFiles/
+
+# Editor-local settings
+.vscode/
+**/.settings/
+
+# Build output directories
+**/Debug/
+**/Release/
+**/build/
+**/Objects/
+**/Listings/
+
+# Build artifacts
+*.o
+*.d
+*.su
+*.cyclo
+*.elf
+*.hex
+*.bin
+*.map
+*.list
+*.lst
+*.a
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+
+# OS metadata
+.DS_Store
+Thumbs.db
+desktop.ini
