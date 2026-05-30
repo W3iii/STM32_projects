@@ -30,11 +30,11 @@
 /*                          Status codes                                     */
 /* ========================================================================= */
 typedef enum {
-    UART_OK = 0,
-    UART_ERR_TIMEOUT,
-    UART_ERR_BUSY,         /* DMA 還在傳，不能發新的 */
-    UART_ERR_PARAM,        /* buf == NULL 或 len == 0 */
-} uart_status_t;
+    USART1_OK = 0,
+    USART1_ERR_TIMEOUT,
+    USART1_ERR_BUSY,         /* DMA 還在傳，不能發新的 */
+    USART1_ERR_PARAM,        /* buf == NULL 或 len == 0 */
+} usart1_status_t;
 
 
 /* ========================================================================= */
@@ -51,7 +51,7 @@ typedef enum {
  *
  * 常用 baudrate: 1200, 9600, 115200
  */
-void uart_init(uint32_t baudrate);
+void usart1_init(uint32_t baudrate);
 
 
 /* ========================================================================= */
@@ -63,20 +63,20 @@ void uart_init(uint32_t baudrate);
  *   等到 TXE = 1 才寫 DR
  *   有 timeout 保護（避免硬體異常卡死）
  */
-uart_status_t uart_send_byte(uint8_t b);
+usart1_status_t usart1_send_byte(uint8_t b);
 
 /*
  * 送一個 null-terminated 字串
  *   不會自動加換行
  */
-uart_status_t uart_send_string(const char *s);
+usart1_status_t usart1_send_string(const char *s);
 
 /*
  * 收一個 byte
  *   等到 RXNE = 1 才讀 DR
  *   有 timeout 保護
  */
-uart_status_t uart_recv_byte(uint8_t *b);
+usart1_status_t usart1_recv_byte(uint8_t *b);
 
 
 /* ========================================================================= */
@@ -87,19 +87,19 @@ uart_status_t uart_recv_byte(uint8_t *b);
  * 非同步送 buf[0..len-1]
  *   - 啟動 DMA2 Stream7 → USART1_DR
  *   - 立刻 return，CPU 不等
- *   - 如果上一筆還在傳，回傳 UART_ERR_BUSY
+ *   - 如果上一筆還在傳，回傳 USART1_ERR_BUSY
  *
  * IMPORTANT:
  *   傳輸期間 buf 內容不可改！
  *   不要傳 stack 上的區域變數（除非確定 caller 會等完）。
  */
-uart_status_t uart_send_dma(const uint8_t *buf, uint16_t len);
+usart1_status_t usart1_send_dma(const uint8_t *buf, uint16_t len);
 
 /*
  * 查詢 DMA 是否還在傳
  *   1 = busy（還在傳）
  *   0 = idle（可以發下一筆）
  */
-int uart_send_busy(void);
+int usart1_send_busy(void);
 
 #endif /* DRIVER_USART1_H_ */

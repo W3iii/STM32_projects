@@ -1,6 +1,7 @@
 #include "systick.h"
 #include "driver_spi1.h"
 #include "driver_i2c1.h"
+#include "driver_usart1.h"
 #include "device_ssd1306.h"
 #include "device_mpu6050.h"
 
@@ -18,6 +19,10 @@ int main(void)
     ssd1306_draw_string(0, 0, "Boot...");
     ssd1306_update_screen();
     delay_ms(500);
+
+    /* ---- 初始化 USART1 設備 ---- */
+    usart1_init(1200);
+    usart1_send_string("Boot...\r\n");
 
     /* ---- 初始化 MPU6050 ---- */
     if (mpu6050_init() != 0) {

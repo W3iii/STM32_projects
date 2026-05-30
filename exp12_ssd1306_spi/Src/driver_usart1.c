@@ -24,7 +24,7 @@
  * 不依賴 SysTick，避免 driver 之間互相依賴
  * 16MHz 下大約對應 100ms 等級
  */
-#define UART_TIMEOUT    1600000U
+#define USART1_TIMEOUT    1600000U
 
 
 /* ========================================================================= */
@@ -68,7 +68,7 @@ void DMA2_Stream7_IRQHandler(void)
 /*                          Initialization                                   */
 /* ========================================================================= */
 
-void uart_init(uint32_t baudrate)
+void usart1_init(uint32_t baudrate)
 {
     /* --- 開 clock --- */
     RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;    /* GPIOA for PA9/PA10 */
@@ -150,57 +150,57 @@ void uart_init(uint32_t baudrate)
 /*                          Polling API                                      */
 /* ========================================================================= */
 
-uart_status_t uart_send_byte(uint8_t b)
+usart1_status_t usart1_send_byte(uint8_t b)
 {
     /* 等 TXE = 1 (TX register empty)
      * 有 timeout 保護
      */
-    uint32_t timeout = UART_TIMEOUT;
+    uint32_t timeout = USART1_TIMEOUT;
     while (!(USART1->SR & USART_SR_TXE)) {
         if (--timeout == 0) {
-            return UART_ERR_TIMEOUT;
+            return USART1_ERR_TIMEOUT;
         }
     }
 
     USART1->DR = b;
-    return UART_OK;
+    return USART1_OK;
 }
 
 
-uart_status_t uart_send_string(const char *s)
+usart1_status_t usart1_send_string(const char *s)
 {
     if (s == 0) {
-        return UART_ERR_PARAM;
+        return USART1_ERR_PARAM;
     }
 
     while (*s) {
-        uart_status_t st = uart_send_byte((uint8_t)*s);
-        if (st != UART_OK) {
+        usart1_status_t st = usart1_send_byte((uint8_t)*s);
+        if (st != USART1_OK) {
             return st;      /* timeout → 提早結束，告訴上層 */
         }
         s++;
     }
 
-    return UART_OK;
+    return USART1_OK;
 }
 
 
-uart_status_t uart_recv_byte(uint8_t *b)
+usart1_status_t usart1_recv_byte(uint8_t *b)
 {
     if (b == 0) {
-        return UART_ERR_PARAM;
+        return USART1_ERR_PARAM;
     }
 
     /* 等 RXNE = 1 (RX register not empty) */
-    uint32_t timeout = UART_TIMEOUT;
+    uint32_t timeout = USART1_TIMEOUT;
     while (!(USART1->SR & USART_SR_RXNE)) {
         if (--timeout == 0) {
-            return UART_ERR_TIMEOUT;
+            return USART1_ERR_TIMEOUT;
         }
     }
 
     *b = (uint8_t)(USART1->DR & 0xFF);
-    return UART_OK;
+    return USART1_OK;
 }
 
 
@@ -208,15 +208,15 @@ uart_status_t uart_recv_byte(uint8_t *b)
 /*                          DMA TX API                                       */
 /* ========================================================================= */
 
-uart_status_t uart_send_dma(const uint8_t *buf, uint16_t len)
+usart1_status_t usart1_send_dma(const uint8_t *buf, uint16_t len)
 {
     if (buf == 0 || len == 0) {
-        return UART_ERR_PARAM;
+        return USART1_ERR_PARAM;
     }
 
     /* 如果上一筆還沒傳完，拒絕（讓上層自己決定要等或要跳過）*/
     if (!dma_idle) {
-        return UART_ERR_BUSY;
+        return USART1_ERR_BUSY;
     }
 
     /* 標記 busy，必須在啟動 DMA 之前
@@ -251,11 +251,11 @@ uart_status_t uart_send_dma(const uint8_t *buf, uint16_t len)
                      | DMA_CR_TCIE
                      | DMA_CR_EN;
 
-    return UART_OK;
+    return USART1_OK;
 }
 
 
-int uart_send_busy(void)
+int usart1_send_busy(void)
 {
     return !dma_idle;
 }
