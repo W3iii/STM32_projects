@@ -16,9 +16,9 @@ static void uart_print_hex(uint8_t v)
     s[4] = '\r';
     s[5] = '\n';
 
-    /* uart_send_string 需要 null-terminated，這裡逐 byte 送 */
+    /* usart1_send_string 需要 null-terminated，這裡逐 byte 送 */
     for (int i = 0; i < 6; i++) {
-        uart_send_byte((uint8_t)s[i]);
+        usart1_send_byte((uint8_t)s[i]);
     }
 }
 
@@ -42,14 +42,14 @@ int main(void)
     usart1_send_string("Boot...\r\n");
 
     /* ---- I2C bus scan ---- */
-    uart_send_string("Scanning I2C bus...\r\n");
+    usart1_send_string("Scanning I2C bus...\r\n");
     uint8_t addrs[8];
     int n = i2c1_scan(addrs, 8);
 
     if (n == 0) {
-        uart_send_string("No I2C device found\r\n");
+        usart1_send_string("No I2C device found\r\n");
     } else {
-        uart_send_string("Found device(s):\r\n");
+        usart1_send_string("Found device(s):\r\n");
         for (int i = 0; i < n; i++) {
             uart_print_hex(addrs[i]);
         }

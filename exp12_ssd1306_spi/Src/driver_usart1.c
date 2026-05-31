@@ -9,6 +9,7 @@
 
 #include "driver_usart1.h"
 #include "stm32f407xx.h"
+#include "systick.h"
 
 /* ========================================================================= */
 /*                          Private constants                                */
@@ -20,11 +21,11 @@
  */
 #define PCLK2_HZ        16000000U
 
-/* Timeout 設定（單位：迴圈次數，非精確 ms）
- * 不依賴 SysTick，避免 driver 之間互相依賴
- * 16MHz 下大約對應 100ms 等級
+/* Timeout 設定（ms）
+ * 與 I2C driver 一樣使用 SysTick 做 timeout，避免 busy-loop 次數
+ * 隨 compiler optimization 或系統 clock 改變而失準。
  */
-#define USART1_TIMEOUT    1600000U
+#define USART1_TIMEOUT_MS    100U
 
 
 /* ========================================================================= */
@@ -38,6 +39,24 @@
  * volatile 因為會被 ISR 修改
  */
 static volatile int dma_idle = 1;
+
+
+/* ========================================================================= */
+/*                          Wait helpers                                     */
+/* ========================================================================= */
+
+static usart1_status_t wait_sr_flag(uint32_t flag)
+{
+    uint32_t start = systick_get_ms();
+
+    while (!(USART1->SR & flag)) {
+        if ((systick_get_ms() - start) >= USART1_TIMEOUT_MS) {
+            return USART1_ERR_TIMEOUT;
+        }
+    }
+
+    return USART1_OK;
+}
 
 
 /* ========================================================================= */
@@ -152,14 +171,10 @@ void usart1_init(uint32_t baudrate)
 
 usart1_status_t usart1_send_byte(uint8_t b)
 {
-    /* 等 TXE = 1 (TX register empty)
-     * 有 timeout 保護
-     */
-    uint32_t timeout = USART1_TIMEOUT;
-    while (!(USART1->SR & USART_SR_TXE)) {
-        if (--timeout == 0) {
-            return USART1_ERR_TIMEOUT;
-        }
+    /* 等 TXE = 1 (TX register empty)，有 SysTick timeout 保護 */
+    usart1_status_t st = wait_sr_flag(USART_SR_TXE);
+    if (st != USART1_OK) {
+        return st;
     }
 
     USART1->DR = b;
@@ -191,12 +206,10 @@ usart1_status_t usart1_recv_byte(uint8_t *b)
         return USART1_ERR_PARAM;
     }
 
-    /* 等 RXNE = 1 (RX register not empty) */
-    uint32_t timeout = USART1_TIMEOUT;
-    while (!(USART1->SR & USART_SR_RXNE)) {
-        if (--timeout == 0) {
-            return USART1_ERR_TIMEOUT;
-        }
+    /* 等 RXNE = 1 (RX register not empty)，有 SysTick timeout 保護 */
+    usart1_status_t st = wait_sr_flag(USART_SR_RXNE);
+    if (st != USART1_OK) {
+        return st;
     }
 
     *b = (uint8_t)(USART1->DR & 0xFF);
@@ -227,8 +240,14 @@ usart1_status_t usart1_send_dma(const uint8_t *buf, uint16_t len)
 
     /* 設定 stream，必須先 disable 才能改 NDTR/M0AR */
     DMA2_Stream7->CR &= ~DMA_CR_EN;
-    /* 等真的 disable（硬體 DMA 不是立刻停的）*/
-    while (DMA2_Stream7->CR & DMA_CR_EN) {}
+    /* 等真的 disable（硬體 DMA 不是立刻停的），有 SysTick timeout 保護 */
+    uint32_t start = systick_get_ms();
+    while (DMA2_Stream7->CR & DMA_CR_EN) {
+        if ((systick_get_ms() - start) >= USART1_TIMEOUT_MS) {
+            dma_idle = 1;
+            return USART1_ERR_TIMEOUT;
+        }
+    }
 
     /* 清除所有 stream7 flag（不只 TCIF，避免之前的 error flag 殘留）*/
     DMA2->HIFCR = DMA_FLAGS_STREAM7;
