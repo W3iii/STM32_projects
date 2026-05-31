@@ -63,15 +63,25 @@ uint8_t mpu6050_who_am_i(void)
 
 int mpu6050_init(void)
 {
-    /* Step 1: 確認 WHO_AM_I 是不是真的有接到 MPU6050 */
-    if (mpu6050_who_am_i() != MPU6050_WHO_AM_I_VAL) {
-        return -1;
+    uint8_t id;
+
+    /* Step 1: 讀 WHO_AM_I，順便偵測 bus 狀態 */
+    i2c_status_t st = i2c1_read_regs(MPU6050_ADDR, REG_WHO_AM_I, &id, 1);
+
+    if (st == I2C_ERR_TIMEOUT) {
+        /* bus 卡住，試著恢復 */
+        i2c1_bus_recovery();
+        return -2;              /* bus error */
+    }
+    if (st != I2C_OK) {
+        return -1;              /* NACK / 其他：沒接到 sensor */
+    }
+    if (id != MPU6050_WHO_AM_I_VAL) {
+        return -1;              /* 有回應但不是 MPU6050 */
     }
 
-    /* Step 2: 喚醒 (PWR_MGMT_1 = 0x00 → 清 SLEEP bit) */
+    /* Step 2: 喚醒 */
     i2c1_write_reg(MPU6050_ADDR, REG_PWR_MGMT_1, 0x00);
-
-    /* 之後想加 DLPF / 變更量程，在這裡多寫幾個 reg 就好 */
 
     return 0;
 }
