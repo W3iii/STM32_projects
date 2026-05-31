@@ -90,5 +90,23 @@ i2c_status_t i2c1_read_regs(uint8_t slave, uint8_t reg, uint8_t *buf, uint8_t le
  */
 i2c_status_t i2c1_bus_recovery(void);
 
+/*
+ * I2C bus scanner
+ *   掃描 0x08 ~ 0x77 的 7-bit 位址，
+ *   對每個位址送 START + addr+W，回 ACK 代表有裝置。
+ *
+ * 參數：
+ *   found    - 呼叫端提供的 buffer，存找到的位址
+ *   max      - found buffer 的大小
+ *
+ * 回傳：找到的裝置數量（<= max）
+ *
+ * 用法：
+ *   uint8_t addrs[8];
+ *   int n = i2c1_scan(addrs, 8);
+ *   for (int i = 0; i < n; i++) { ... addrs[i] ... }
+ */
+int i2c1_scan(uint8_t *found, int max);
+
 
 #endif /* DRIVER_I2C1_H_ */

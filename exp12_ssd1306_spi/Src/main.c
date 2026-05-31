@@ -5,6 +5,23 @@
 #include "device_ssd1306.h"
 #include "device_mpu6050.h"
 
+static void uart_print_hex(uint8_t v)
+{
+    const char *hex = "0123456789ABCDEF";
+    char s[6];
+    s[0] = '0';
+    s[1] = 'x';
+    s[2] = hex[(v >> 4) & 0xF];
+    s[3] = hex[v & 0xF];
+    s[4] = '\r';
+    s[5] = '\n';
+
+    /* uart_send_string 需要 null-terminated，這裡逐 byte 送 */
+    for (int i = 0; i < 6; i++) {
+        uart_send_byte((uint8_t)s[i]);
+    }
+}
+
 int main(void)
 {
     systick_init(16000);
@@ -24,11 +41,33 @@ int main(void)
     usart1_init(1200);
     usart1_send_string("Boot...\r\n");
 
+    /* ---- I2C bus scan ---- */
+    uart_send_string("Scanning I2C bus...\r\n");
+    uint8_t addrs[8];
+    int n = i2c1_scan(addrs, 8);
+
+    if (n == 0) {
+        uart_send_string("No I2C device found\r\n");
+    } else {
+        uart_send_string("Found device(s):\r\n");
+        for (int i = 0; i < n; i++) {
+            uart_print_hex(addrs[i]);
+        }
+    }
+
     /* ---- 初始化 MPU6050 ---- */
-    if (mpu6050_init() != 0) {
+    int mpu_st = mpu6050_init();
+    if (mpu_st != 0) {
         ssd1306_clear();
-        ssd1306_draw_string(0, 0,  "MPU NOT FOUND");
-        ssd1306_draw_string(0, 16, "Check wiring");
+        if (mpu_st == -2) {
+            /* bus 卡住（SDA/SCL stuck），driver 已嘗試 recovery */
+            ssd1306_draw_string(0, 0,  "I2C BUS STUCK");
+            ssd1306_draw_string(0, 16, "Recovery tried");
+        } else {
+            /* NACK / WHO_AM_I 錯：sensor 沒接好 */
+            ssd1306_draw_string(0, 0,  "MPU NOT FOUND");
+            ssd1306_draw_string(0, 16, "Check wiring");
+        }
         ssd1306_update_screen();
         while (1);
     }

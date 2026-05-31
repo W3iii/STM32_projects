@@ -108,7 +108,7 @@ static i2c_status_t wait_flag(uint32_t flag)
 }
 
 /*
- * 專門等 ADDR flag，因為送完位址後有兩種結果（決策 3）：
+ * 專門等 ADDR flag，因為送完位址後有兩種結果：
  *   - slave 存在 → 回 ACK → ADDR flag 置位
  *   - slave 不存在 → 回 NACK → AF flag 置位
  * 所以這裡要同時監看 ADDR 和 AF。
@@ -374,4 +374,71 @@ i2c_status_t i2c1_bus_recovery(void)
     i2c1_init();
 
     return result;
+}
+
+/* ========================================================================= */
+/*                          Bus scanner                                      */
+/* ========================================================================= */
+
+/*
+ * 探測單一位址：送 START + addr+W，看回 ACK 還是 NACK。
+ * 回傳 1 = 有裝置（ACK），0 = 沒有（NACK 或 timeout）。
+ *
+ * 注意：這裡不能直接用 wait_addr()，因為 wait_addr 在 NACK 時
+ *       會自動送 STOP。掃描時我們也要送 STOP，邏輯剛好可重用，
+ *       但 ACK 的情況要自己補 STOP。
+ */
+static int i2c1_probe(uint8_t addr)
+{
+    /* START */
+    I2C1->CR1 |= I2C_CR1_START;
+    if (wait_flag(I2C_SR1_SB) != I2C_OK) {
+        return 0;
+    }
+
+    /* 送 addr + W */
+    I2C1->DR = (addr << 1) | 0;
+
+    /* 等 ADDR 或 AF */
+    uint32_t start = systick_get_ms();
+    int found = 0;
+    while (1) {
+        if (I2C1->SR1 & I2C_SR1_ADDR) {
+            /* 有裝置：清 ADDR，送 STOP */
+            (void)I2C1->SR1; (void)I2C1->SR2;
+            I2C1->CR1 |= I2C_CR1_STOP;
+            found = 1;
+            break;
+        }
+        if (I2C1->SR1 & I2C_SR1_AF) {
+            /* 沒裝置：清 AF，送 STOP */
+            I2C1->SR1 &= ~I2C_SR1_AF;
+            I2C1->CR1 |= I2C_CR1_STOP;
+            found = 0;
+            break;
+        }
+        if ((systick_get_ms() - start) >= I2C_TIMEOUT_MS) {
+            I2C1->CR1 |= I2C_CR1_STOP;
+            found = 0;
+            break;
+        }
+    }
+    return found;
+}
+
+int i2c1_scan(uint8_t *found, int max)
+{
+    int count = 0;
+
+    /* 0x00~0x07 和 0x78~0x7F 是 I2C 保留位址，不掃 */
+    for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
+        if (count >= max) {
+            break;
+        }
+        if (i2c1_probe(addr)) {
+            found[count++] = addr;
+        }
+    }
+
+    return count;
 }
