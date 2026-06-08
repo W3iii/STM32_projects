@@ -80,6 +80,12 @@ void DMA2_Stream7_IRQHandler(void)
         DMA2->HIFCR = DMA_TCIF_STREAM7;
         dma_idle = 1;
     }
+
+    /* TEIF error handling*/
+    if (DMA2->HISR & DMA_TEIF_STREAM7) {
+        DMA2->HIFCR = DMA_TEIF_STREAM7;
+        dma_idle = 1;   // error 也釋放 busy，讓系統能繼續
+    }
 }
 
 
@@ -268,10 +274,25 @@ usart1_status_t usart1_send_dma(const uint8_t *buf, uint16_t len)
                      | DMA_CR_DIR_M2P
                      | DMA_CR_MINC
                      | DMA_CR_TCIE
+                     | DMA_CR_TEIE
                      | DMA_CR_EN;
 
     return USART1_OK;
 }
+
+usart1_status_t usart1_send(const uint8_t *buf, uint16_t len)
+{
+    uint32_t t = systick_get_ms();
+    while (usart1_send_busy()) {
+        if (systick_get_ms() - t > USART1_TIMEOUT_MS) {
+            DMA2_Stream7->CR &= ~DMA_CR_EN;
+            dma_idle = 1;
+            return USART1_ERR_TIMEOUT;
+        }
+    }
+    return usart1_send_dma(buf, len);
+}
+
 
 
 int usart1_send_busy(void)

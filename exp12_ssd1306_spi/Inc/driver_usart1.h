@@ -96,6 +96,12 @@ usart1_status_t usart1_recv_byte(uint8_t *b);
 usart1_status_t usart1_send_dma(const uint8_t *buf, uint16_t len);
 
 /*
+ * 等上一筆傳完（含 timeout），再送新的
+ * 適合大多數情況：不需要真正 async，只是不想 polling TXE
+ */
+usart1_status_t usart1_send(const uint8_t *buf, uint16_t len);
+
+/*
  * 查詢 DMA 是否還在傳
  *   1 = busy（還在傳）
  *   0 = idle（可以發下一筆）
