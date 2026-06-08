@@ -36,3 +36,6 @@ RemoteSystemsTempFiles/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Local test/scratch project
+test/
