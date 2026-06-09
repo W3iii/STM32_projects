@@ -40,17 +40,35 @@
  */
 static volatile int dma_idle = 1;
 
-/* RX ring buffer
- * SPSC：ISR 寫 head，main 讀 tail
- * SIZE 必須是 2 的次方才能用 mask 取代取模
- * 最多存 SIZE-1 = 127 bytes（保留一格區分 empty / full）
+/* RX circular DMA buffer
+ * DMA2 Stream2 以 circular 模式持續把 USART1->DR 寫進這個 buffer。
+ * SIZE 必須是 2 的次方才能用 mask 取代取模。
+ * 最多存 SIZE-1 = 127 bytes（保留一格區分 empty / full）。
+ *
+ * head（DMA 下一個要寫的位置）由 dma_head() 從 NDTR 計算：
+ *   head = (RX_BUF_SIZE - NDTR) & RX_BUF_MASK
+ * tail 由 main 管理，只有 main 推進。
  */
 #define RX_BUF_SIZE  128U
 #define RX_BUF_MASK  (RX_BUF_SIZE - 1U)
 
-static volatile uint8_t rx_buf[RX_BUF_SIZE];
-static volatile uint8_t rx_head = 0;  /* ISR writes, only ISR advances */
-static          uint8_t rx_tail = 0;  /* main reads, only main advances */
+static volatile uint8_t rx_dma_buf[RX_BUF_SIZE];
+static          uint8_t rx_tail = 0;   /* main reads, only main advances */
+
+/* IDLE 旗標：USART1 IDLE interrupt 觸發時設 1
+ * main loop 可以用這個旗標決定要不要呼叫 usart1_read_line()，
+ * 而不是不斷 polling rx_available()。
+ */
+static volatile int rx_idle_flag = 0;
+
+/* 計算 DMA 目前寫到哪（= ring buffer head）
+ * NDTR counts down: 128 → 127 → ... → 1 → 128（circular reload）
+ * head = RX_BUF_SIZE - NDTR，剛好對應 DMA 下一個要寫的 index。
+ */
+static inline uint8_t dma_head(void)
+{
+    return (uint8_t)((RX_BUF_SIZE - (uint16_t)DMA2_Stream2->NDTR) & RX_BUF_MASK);
+}
 
 
 /* ========================================================================= */
@@ -102,27 +120,17 @@ void DMA2_Stream7_IRQHandler(void)
 
 
 /*
- * USART1 RX interrupt handler
- *   觸發條件：RXNEIE=1 時，RXNE=1（收到一個 byte）
- *   也處理 ORE/NE/FE：讀一次 DR 即可清除所有這些 flag
+ * USART1 interrupt handler
+ *   觸發條件：IDLEIE=1 時，IDLE flag 被拉起（接收到資料後，線路靜默一個 frame 以上）
+ *   清除方式：讀 SR 再讀 DR（STM32F4 的 IDLE flag 用這個序列清除）
  */
 void USART1_IRQHandler(void)
 {
     uint32_t sr = USART1->SR;
 
-    if (sr & (USART_SR_RXNE | USART_SR_ORE | USART_SR_NE | USART_SR_FE)) {
-        uint8_t data = (uint8_t)(USART1->DR & 0xFFU);  /* 讀 DR 清除 RXNE/ORE/NE/FE */
-
-        if (sr & USART_SR_RXNE) {
-            uint8_t h    = rx_head;
-            uint8_t next = (uint8_t)((h + 1U) & RX_BUF_MASK);
-            if (next != rx_tail) {
-                rx_buf[h] = data;
-                rx_head   = next;
-            }
-            /* buffer full: byte silently dropped */
-        }
-        /* ORE/NE/FE without RXNE: the data byte is already lost in hardware */
+    if (sr & USART_SR_IDLE) {
+        (void)USART1->DR;   /* 讀 DR 清除 IDLE flag（必須先讀 SR 再讀 DR）*/
+        rx_idle_flag = 1;   /* 通知 main loop：有新資料可以 parse */
     }
 }
 
@@ -177,29 +185,34 @@ void usart1_init(uint32_t baudrate)
      *   PAR 永遠指向 USART1->DR，不會變，
      *   一次設好可省每次 dma 呼叫的開銷。
      */
-    DMA2_Stream7->CR  = 0;                          /* 先 disable + 清零 */
-    DMA2_Stream7->PAR = (uint32_t)&USART1->DR;      /* peripheral 固定 */
+    /* --- DMA2 Stream7 Channel4：USART1_TX（fire-and-forget，每次 send_dma 再啟動）--- */
+    DMA2_Stream7->CR  = 0;
+    DMA2_Stream7->PAR = (uint32_t)&USART1->DR;
 
-    /* DMA CR 的非變動位元先設好：
-     *   Channel 4 (USART1_TX)
-     *   Memory → Peripheral
-     *   Memory increment
-     *   Transfer complete interrupt enable
-     * EN bit 不在這裡開，留到 uart_send_dma 啟動
-     */
+    /* --- DMA2 Stream2 Channel4：USART1_RX（circular，永遠跑）--- */
+    DMA2_Stream2->CR  = 0;
+    while (DMA2_Stream2->CR & DMA_CR_EN) {}         /* 確保 disable 完成 */
+    DMA2->LIFCR = DMA_FLAGS_STREAM2;                /* 清除殘留 flag */
+    DMA2_Stream2->PAR  = (uint32_t)&USART1->DR;     /* 來源：USART1 資料暫存器 */
+    DMA2_Stream2->M0AR = (uint32_t)rx_dma_buf;      /* 目的：rx buffer */
+    DMA2_Stream2->NDTR = RX_BUF_SIZE;               /* 計數器，circular 會自動 reload */
+    DMA2_Stream2->CR   = DMA_CR_CHSEL(4)            /* Channel 4 = USART1_RX */
+                       | DMA_CR_DIR_P2M             /* Peripheral → Memory */
+                       | DMA_CR_MINC                /* memory 位址遞增 */
+                       | DMA_CR_CIRC                /* circular：到尾自動 reload */
+                       | DMA_CR_EN;                 /* 啟動，永遠跑 */
 
     /* --- 開啟 USART1 ---
-     * UE = USART enable
-     * TE = TX enable
-     * RE = RX enable
      * CR3 DMAT = DMA transmitter enable
+     * CR3 DMAR = DMA receiver enable（讓 RXNE 觸發 DMA 請求）
+     * CR1 IDLEIE = IDLE interrupt enable（接收結束後通知 main loop）
      */
-    USART1->CR3 = USART_CR3_DMAT;
-    USART1->CR1 = USART_CR1_UE | USART_CR1_TE | USART_CR1_RE | USART_CR1_RXNEIE;
+    USART1->CR3 = USART_CR3_DMAT | USART_CR3_DMAR;
+    USART1->CR1 = USART_CR1_UE | USART_CR1_TE | USART_CR1_RE | USART_CR1_IDLEIE;
 
     /* --- 開 NVIC --- */
-    NVIC_EnableIRQ(IRQ_DMA2_Stream7);  /* DMA2 Stream7 IRQ = 70 */
-    NVIC_EnableIRQ(IRQ_USART1);        /* USART1 RX IRQ = 37   */
+    NVIC_EnableIRQ(IRQ_DMA2_Stream7);  /* USART1 TX DMA complete，IRQ 70 */
+    NVIC_EnableIRQ(IRQ_USART1);        /* USART1 IDLE line，IRQ 37       */
 
     /* 初始狀態：DMA 沒在傳 */
     dma_idle = 1;
@@ -248,14 +261,14 @@ usart1_status_t usart1_recv_byte(uint8_t *b)
     }
 
     uint32_t start = systick_get_ms();
-    while (rx_head == rx_tail) {
+    while (dma_head() == rx_tail) {
         if ((systick_get_ms() - start) >= USART1_TIMEOUT_MS) {
             return USART1_ERR_TIMEOUT;
         }
     }
 
-    *b       = rx_buf[rx_tail];
-    rx_tail  = (uint8_t)((rx_tail + 1U) & RX_BUF_MASK);
+    *b      = rx_dma_buf[rx_tail];
+    rx_tail = (uint8_t)((rx_tail + 1U) & RX_BUF_MASK);
     return USART1_OK;
 }
 
@@ -331,7 +344,6 @@ usart1_status_t usart1_send(const uint8_t *buf, uint16_t len)
 }
 
 
-
 int usart1_send_busy(void)
 {
     return !dma_idle;
@@ -344,7 +356,7 @@ int usart1_send_busy(void)
 
 uint16_t usart1_rx_available(void)
 {
-    return (uint16_t)((rx_head - rx_tail) & RX_BUF_MASK);
+    return (uint16_t)((dma_head() - rx_tail) & RX_BUF_MASK);
 }
 
 
@@ -353,10 +365,10 @@ usart1_status_t usart1_read_byte(uint8_t *b)
     if (b == 0) {
         return USART1_ERR_PARAM;
     }
-    if (rx_head == rx_tail) {
+    if (dma_head() == rx_tail) {
         return USART1_ERR_EMPTY;
     }
-    *b      = rx_buf[rx_tail];
+    *b      = rx_dma_buf[rx_tail];
     rx_tail = (uint8_t)((rx_tail + 1U) & RX_BUF_MASK);
     return USART1_OK;
 }
@@ -373,14 +385,14 @@ usart1_status_t usart1_read_line(char *buf, uint16_t buf_size, uint16_t *len_out
         return USART1_ERR_PARAM;
     }
 
-    uint8_t avail = (uint8_t)((rx_head - rx_tail) & RX_BUF_MASK);
+    uint8_t avail = (uint8_t)((dma_head() - rx_tail) & RX_BUF_MASK);
 
     for (uint8_t i = 0; i < avail; i++) {
-        if (rx_buf[(rx_tail + i) & RX_BUF_MASK] == '\n') {
+        if (rx_dma_buf[(rx_tail + i) & RX_BUF_MASK] == '\n') {
             /* 最多複製 min(i, buf_size-1) 個字元（不含 '\n'） */
             uint8_t n = (i < (uint8_t)(buf_size - 1U)) ? i : (uint8_t)(buf_size - 1U);
             for (uint8_t j = 0; j < n; j++) {
-                buf[j]  = (char)rx_buf[rx_tail];
+                buf[j]  = (char)rx_dma_buf[rx_tail];
                 rx_tail = (uint8_t)((rx_tail + 1U) & RX_BUF_MASK);
             }
             /* 跳過截斷的剩餘字元，再跳過 '\n' */
@@ -400,5 +412,5 @@ usart1_status_t usart1_read_line(char *buf, uint16_t buf_size, uint16_t *len_out
 
 void usart1_rx_flush(void)
 {
-    rx_tail = rx_head;
+    rx_tail = dma_head();
 }
