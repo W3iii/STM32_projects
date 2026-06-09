@@ -561,6 +561,9 @@ typedef struct {
 #define USART_SR_RXNE           (1U << 5)   /* RX data register not empty   */
 #define USART_SR_IDLE           (1U << 4)   /* Idle line detected           */
 #define USART_SR_ORE            (1U << 3)   /* Overrun error                */
+#define USART_SR_NE             (1U << 2)   /* Noise error                  */
+#define USART_SR_FE             (1U << 1)   /* Framing error                */
+#define USART_SR_PE             (1U << 0)   /* Parity error                 */
 
 /* CR1 */
 #define USART_CR1_UE            (1U << 13)  /* USART enable                 */

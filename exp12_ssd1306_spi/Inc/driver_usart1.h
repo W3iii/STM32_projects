@@ -34,6 +34,7 @@ typedef enum {
     USART1_ERR_TIMEOUT,
     USART1_ERR_BUSY,         /* DMA 還在傳，不能發新的 */
     USART1_ERR_PARAM,        /* buf == NULL 或 len == 0 */
+    USART1_ERR_EMPTY,        /* RX ring buffer 為空     */
 } usart1_status_t;
 
 
@@ -107,5 +108,34 @@ usart1_status_t usart1_send(const uint8_t *buf, uint16_t len);
  *   0 = idle（可以發下一筆）
  */
 int usart1_send_busy(void);
+
+
+/* ========================================================================= */
+/*                          RX Ring Buffer API                               */
+/* ========================================================================= */
+
+/*
+ * 查詢 RX ring buffer 有幾個 byte 可讀
+ */
+uint16_t usart1_rx_available(void);
+
+/*
+ * 取出一個 byte
+ *   USART1_ERR_EMPTY = buffer 為空
+ */
+usart1_status_t usart1_read_byte(uint8_t *b);
+
+/*
+ * 讀一整行（直到 '\n' 或 buf 滿為止）
+ *   結尾會加 '\0'，不包含 '\n'
+ *   USART1_ERR_EMPTY  = buffer 還沒有完整一行（不會消耗任何 byte）
+ *   USART1_OK         = 成功，*len_out 為字元數（不含 '\0'）
+ */
+usart1_status_t usart1_read_line(char *buf, uint16_t buf_size, uint16_t *len_out);
+
+/*
+ * 清空 RX ring buffer
+ */
+void usart1_rx_flush(void);
 
 #endif /* DRIVER_USART1_H_ */

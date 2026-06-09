@@ -40,6 +40,18 @@
  */
 static volatile int dma_idle = 1;
 
+/* RX ring buffer
+ * SPSC：ISR 寫 head，main 讀 tail
+ * SIZE 必須是 2 的次方才能用 mask 取代取模
+ * 最多存 SIZE-1 = 127 bytes（保留一格區分 empty / full）
+ */
+#define RX_BUF_SIZE  128U
+#define RX_BUF_MASK  (RX_BUF_SIZE - 1U)
+
+static volatile uint8_t rx_buf[RX_BUF_SIZE];
+static volatile uint8_t rx_head = 0;  /* ISR writes, only ISR advances */
+static          uint8_t rx_tail = 0;  /* main reads, only main advances */
+
 
 /* ========================================================================= */
 /*                          Wait helpers                                     */
@@ -85,6 +97,32 @@ void DMA2_Stream7_IRQHandler(void)
     if (DMA2->HISR & DMA_TEIF_STREAM7) {
         DMA2->HIFCR = DMA_TEIF_STREAM7;
         dma_idle = 1;   // error 也釋放 busy，讓系統能繼續
+    }
+}
+
+
+/*
+ * USART1 RX interrupt handler
+ *   觸發條件：RXNEIE=1 時，RXNE=1（收到一個 byte）
+ *   也處理 ORE/NE/FE：讀一次 DR 即可清除所有這些 flag
+ */
+void USART1_IRQHandler(void)
+{
+    uint32_t sr = USART1->SR;
+
+    if (sr & (USART_SR_RXNE | USART_SR_ORE | USART_SR_NE | USART_SR_FE)) {
+        uint8_t data = (uint8_t)(USART1->DR & 0xFFU);  /* 讀 DR 清除 RXNE/ORE/NE/FE */
+
+        if (sr & USART_SR_RXNE) {
+            uint8_t h    = rx_head;
+            uint8_t next = (uint8_t)((h + 1U) & RX_BUF_MASK);
+            if (next != rx_tail) {
+                rx_buf[h] = data;
+                rx_head   = next;
+            }
+            /* buffer full: byte silently dropped */
+        }
+        /* ORE/NE/FE without RXNE: the data byte is already lost in hardware */
     }
 }
 
@@ -157,14 +195,11 @@ void usart1_init(uint32_t baudrate)
      * CR3 DMAT = DMA transmitter enable
      */
     USART1->CR3 = USART_CR3_DMAT;
-    USART1->CR1 = USART_CR1_UE | USART_CR1_TE | USART_CR1_RE;
+    USART1->CR1 = USART_CR1_UE | USART_CR1_TE | USART_CR1_RE | USART_CR1_RXNEIE;
 
-    /* --- 開 NVIC ---
-     * DMA2_Stream7 IRQ = 70
-     * NVIC->ISER[70/32] |= (1 << (70%32))
-     * 用 stm32f407xx.h 提供的 macro 更清楚
-     */
-    NVIC_EnableIRQ(IRQ_DMA2_Stream7);
+    /* --- 開 NVIC --- */
+    NVIC_EnableIRQ(IRQ_DMA2_Stream7);  /* DMA2 Stream7 IRQ = 70 */
+    NVIC_EnableIRQ(IRQ_USART1);        /* USART1 RX IRQ = 37   */
 
     /* 初始狀態：DMA 沒在傳 */
     dma_idle = 1;
@@ -212,13 +247,15 @@ usart1_status_t usart1_recv_byte(uint8_t *b)
         return USART1_ERR_PARAM;
     }
 
-    /* 等 RXNE = 1 (RX register not empty)，有 SysTick timeout 保護 */
-    usart1_status_t st = wait_sr_flag(USART_SR_RXNE);
-    if (st != USART1_OK) {
-        return st;
+    uint32_t start = systick_get_ms();
+    while (rx_head == rx_tail) {
+        if ((systick_get_ms() - start) >= USART1_TIMEOUT_MS) {
+            return USART1_ERR_TIMEOUT;
+        }
     }
 
-    *b = (uint8_t)(USART1->DR & 0xFF);
+    *b       = rx_buf[rx_tail];
+    rx_tail  = (uint8_t)((rx_tail + 1U) & RX_BUF_MASK);
     return USART1_OK;
 }
 
@@ -298,4 +335,70 @@ usart1_status_t usart1_send(const uint8_t *buf, uint16_t len)
 int usart1_send_busy(void)
 {
     return !dma_idle;
+}
+
+
+/* ========================================================================= */
+/*                          RX Ring Buffer API                               */
+/* ========================================================================= */
+
+uint16_t usart1_rx_available(void)
+{
+    return (uint16_t)((rx_head - rx_tail) & RX_BUF_MASK);
+}
+
+
+usart1_status_t usart1_read_byte(uint8_t *b)
+{
+    if (b == 0) {
+        return USART1_ERR_PARAM;
+    }
+    if (rx_head == rx_tail) {
+        return USART1_ERR_EMPTY;
+    }
+    *b      = rx_buf[rx_tail];
+    rx_tail = (uint8_t)((rx_tail + 1U) & RX_BUF_MASK);
+    return USART1_OK;
+}
+
+
+/*
+ * 掃描 ring buffer 找 '\n'，找到才消耗整行。
+ * 這樣避免「讀了一半但 '\n' 還沒到」的問題。
+ * 支援 \r\n：輸出會自動去掉尾端的 '\r'。
+ */
+usart1_status_t usart1_read_line(char *buf, uint16_t buf_size, uint16_t *len_out)
+{
+    if (buf == 0 || buf_size < 2U) {
+        return USART1_ERR_PARAM;
+    }
+
+    uint8_t avail = (uint8_t)((rx_head - rx_tail) & RX_BUF_MASK);
+
+    for (uint8_t i = 0; i < avail; i++) {
+        if (rx_buf[(rx_tail + i) & RX_BUF_MASK] == '\n') {
+            /* 最多複製 min(i, buf_size-1) 個字元（不含 '\n'） */
+            uint8_t n = (i < (uint8_t)(buf_size - 1U)) ? i : (uint8_t)(buf_size - 1U);
+            for (uint8_t j = 0; j < n; j++) {
+                buf[j]  = (char)rx_buf[rx_tail];
+                rx_tail = (uint8_t)((rx_tail + 1U) & RX_BUF_MASK);
+            }
+            /* 跳過截斷的剩餘字元，再跳過 '\n' */
+            rx_tail = (uint8_t)((rx_tail + (i - n) + 1U) & RX_BUF_MASK);
+            /* 去掉尾端 '\r'（Tera Term 預設送 \r\n） */
+            if (n > 0U && buf[n - 1U] == '\r') {
+                n--;
+            }
+            buf[n] = '\0';
+            if (len_out) *len_out = (uint16_t)n;
+            return USART1_OK;
+        }
+    }
+    return USART1_ERR_EMPTY;
+}
+
+
+void usart1_rx_flush(void)
+{
+    rx_tail = rx_head;
 }
