@@ -354,6 +354,16 @@ int usart1_send_busy(void)
 /*                          RX Ring Buffer API                               */
 /* ========================================================================= */
 
+int usart1_rx_idle_pending(void)
+{
+    if (rx_idle_flag) {
+        rx_idle_flag = 0;
+        return 1;
+    }
+    return 0;
+}
+
+
 uint16_t usart1_rx_available(void)
 {
     return (uint16_t)((dma_head() - rx_tail) & RX_BUF_MASK);

@@ -115,6 +115,14 @@ int usart1_send_busy(void);
 /* ========================================================================= */
 
 /*
+ * 查詢 USART IDLE 事件是否觸發（= 一次資料傳輸結束）
+ *   1 = 有；0 = 無。呼叫即清除（read-and-clear）。
+ *
+ *   if (usart1_rx_idle_pending()) { usart1_read_line(...); }
+ */
+int usart1_rx_idle_pending(void);
+
+/*
  * 查詢 RX ring buffer 有幾個 byte 可讀
  */
 uint16_t usart1_rx_available(void);
