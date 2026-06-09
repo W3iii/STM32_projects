@@ -43,7 +43,11 @@ static volatile int dma_idle = 1;
 /* RX circular DMA buffer
  * DMA2 Stream2 以 circular 模式持續把 USART1->DR 寫進這個 buffer。
  * SIZE 必須是 2 的次方才能用 mask 取代取模。
- * 最多存 SIZE-1 = 127 bytes（保留一格區分 empty / full）。
+ *
+ * 注意：DMA 硬體不認識 rx_tail，NDTR 到 0 就 reload、無條件繞圈繼續寫。
+ * 「保留一格區分 empty/full」在 ISR 版本成立（ISR 會檢查），但在 DMA 模式下
+ * 沒有人守那一格——若 main 來不及 drain，最舊的資料會被無聲覆蓋。
+ * 正確性靠「buffer 夠大 + 每次 IDLE 都清空」來保證，不靠硬體約束。
  *
  * head（DMA 下一個要寫的位置）由 dma_head() 從 NDTR 計算：
  *   head = (RX_BUF_SIZE - NDTR) & RX_BUF_MASK
@@ -190,6 +194,12 @@ void usart1_init(uint32_t baudrate)
     DMA2_Stream7->PAR = (uint32_t)&USART1->DR;
 
     /* --- DMA2 Stream2 Channel4：USART1_RX（circular，永遠跑）--- */
+    /* 先歸零軟體狀態，保證與 NDTR=128（head=0）同步
+     * 若是二次呼叫 init（換 baudrate 等），rx_tail 可能停在舊值，不歸零會讓
+     * available() / read_line() 算出錯誤的結果。 */
+    rx_tail      = 0;
+    rx_idle_flag = 0;
+
     DMA2_Stream2->CR  = 0;
     while (DMA2_Stream2->CR & DMA_CR_EN) {}         /* 確保 disable 完成 */
     DMA2->LIFCR = DMA_FLAGS_STREAM2;                /* 清除殘留 flag */
