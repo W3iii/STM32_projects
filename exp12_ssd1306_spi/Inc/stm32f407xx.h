@@ -531,6 +531,16 @@ typedef struct {
 #define DMA_TCIF_STREAM6        (1U << 21)
 #define DMA_TCIF_STREAM7        (1U << 27)
 
+/* HTIF (Half Transfer) — bit positions within LISR/HISR/LIFCR/HIFCR */
+#define DMA_HTIF_STREAM0        (1U << 4)   /* LISR/LIFCR */
+#define DMA_HTIF_STREAM1        (1U << 10)
+#define DMA_HTIF_STREAM2        (1U << 20)
+#define DMA_HTIF_STREAM3        (1U << 26)
+#define DMA_HTIF_STREAM4        (1U << 4)   /* HISR/HIFCR */
+#define DMA_HTIF_STREAM5        (1U << 10)
+#define DMA_HTIF_STREAM6        (1U << 20)
+#define DMA_HTIF_STREAM7        (1U << 26)
+
 /* TEIF (Transfer Error) — bit positions within LISR/HISR/LIFCR/HIFCR */
 #define DMA_TEIF_STREAM0        (1U << 3)   /* LISR/LIFCR */
 #define DMA_TEIF_STREAM1        (1U << 9)

@@ -124,6 +124,24 @@ void DMA2_Stream7_IRQHandler(void)
 
 
 /*
+ * DMA2 Stream2 中斷 handler（USART1_RX circular）
+ *   HTIF（半滿，64 bytes 已寫）和 TCIF（全滿，128 bytes 已寫）都走這裡。
+ *
+ *   收到這兩個中斷代表 DMA 快要或已經繞圈，若 main 不及時讀走，
+ *   DMA 下一圈會覆蓋最舊的資料。通知 main 立刻 drain。
+ */
+void DMA2_Stream2_IRQHandler(void)
+{
+    uint32_t lisr = DMA2->LISR;
+
+    if (lisr & (DMA_HTIF_STREAM2 | DMA_TCIF_STREAM2)) {
+        DMA2->LIFCR = DMA_HTIF_STREAM2 | DMA_TCIF_STREAM2;  /* 清除已觸發的 flag */
+        rx_idle_flag = 1;  /* 與 USART IDLE ISR 共用同一個通知機制 */
+    }
+}
+
+
+/*
  * USART1 interrupt handler
  *   觸發條件：IDLEIE=1 時，IDLE flag 被拉起（接收到資料後，線路靜默一個 frame 以上）
  *   清除方式：讀 SR 再讀 DR（STM32F4 的 IDLE flag 用這個序列清除）
@@ -210,6 +228,8 @@ void usart1_init(uint32_t baudrate)
                        | DMA_CR_DIR_P2M             /* Peripheral → Memory */
                        | DMA_CR_MINC                /* memory 位址遞增 */
                        | DMA_CR_CIRC                /* circular：到尾自動 reload */
+                       | DMA_CR_HTIE                /* 半滿（64 bytes）觸發中斷 */
+                       | DMA_CR_TCIE                /* 全滿（128 bytes）觸發中斷 */
                        | DMA_CR_EN;                 /* 啟動，永遠跑 */
 
     /* --- 開啟 USART1 ---
@@ -221,8 +241,9 @@ void usart1_init(uint32_t baudrate)
     USART1->CR1 = USART_CR1_UE | USART_CR1_TE | USART_CR1_RE | USART_CR1_IDLEIE;
 
     /* --- 開 NVIC --- */
-    NVIC_EnableIRQ(IRQ_DMA2_Stream7);  /* USART1 TX DMA complete，IRQ 70 */
-    NVIC_EnableIRQ(IRQ_USART1);        /* USART1 IDLE line，IRQ 37       */
+    NVIC_EnableIRQ(IRQ_DMA2_Stream2);  /* USART1 RX DMA half/full，IRQ 58 */
+    NVIC_EnableIRQ(IRQ_DMA2_Stream7);  /* USART1 TX DMA complete，IRQ 70  */
+    NVIC_EnableIRQ(IRQ_USART1);        /* USART1 IDLE line，IRQ 37        */
 
     /* 初始狀態：DMA 沒在傳 */
     dma_idle = 1;
