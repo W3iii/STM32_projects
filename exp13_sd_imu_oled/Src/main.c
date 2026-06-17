@@ -51,13 +51,35 @@ int main(void)
 
     usart1_send_string("\r\n=== exp13 SD card init ===\r\n");
 
-    sd_status = sd_init();        // 第一步：CMD0 → 期望 sd_status == SD_OK(0)
+    sd_status = sd_init();        // CMD0 → CMD8 → ACMD41 → CMD58
 
     if (sd_status == SD_OK) {
-        usart1_send_string("[OK]   CMD0 accepted, card in idle state\r\n");
-    } else {
+        usart1_send_string("[OK]   init done, card type = ");
+        if (sd_card_type == SD_TYPE_SDHC) {
+            usart1_send_string("SDHC/SDXC (block addressing)\r\n");
+        } else if (sd_card_type == SD_TYPE_V2) {
+            usart1_send_string("SDSC v2 (byte addressing)\r\n");
+        } else if (sd_card_type == SD_TYPE_V1) {
+            usart1_send_string("SD v1.x / MMC\r\n");
+        } else {
+            usart1_send_string("UNKNOWN\r\n");
+        }
+        usart1_send_string("       OCR[0] = ");
+        uart_print_hex(sd_ocr[0]);      // bit6 = CCS（1 = SDHC）
+    } else if (sd_status == SD_ERR_CMD0) {
         usart1_send_string("[FAIL] CMD0, raw R1 = ");
         uart_print_hex(sd_last_r1);     // 0xFF=沒回應 0x01=ok 其他=error bit
+    } else if (sd_status == SD_ERR_CMD8) {
+        usart1_send_string("[FAIL] CMD8, raw R1 = ");
+        uart_print_hex(sd_last_r1);
+    } else if (sd_status == SD_ERR_ACMD41) {
+        usart1_send_string("[FAIL] ACMD41 timeout, R1 = ");
+        uart_print_hex(sd_last_r1);         // 0x01=還在 idle（沒完成 init）
+        usart1_send_string("       CMD55 R1 = ");
+        uart_print_hex(sd_last_cmd55_r1);   // 應該 0x01；若 0x05 = CMD55 沒被認得
+    } else {                            // SD_ERR_CMD58
+        usart1_send_string("[FAIL] CMD58, raw R1 = ");
+        uart_print_hex(sd_last_r1);
     }
 
     /* Loop forever */
