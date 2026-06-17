@@ -1,7 +1,7 @@
 /*
  * device_sdcard.h
  *
- *  SD 卡 (SPI 模式) driver — exp13（CMD0 → CMD8 → ACMD41 → CMD58）
+ *  SD 卡 (SPI 模式) driver — exp13（init + CMD17 讀 / CMD24 寫 block）
  *  ─────────────────────────────────────────────
  *  接線：
  *    SCK  = PA5   (SPI1, AF5)
@@ -25,6 +25,11 @@
 #define SD_ERR_CMD8      2   /* CMD8 電壓/pattern 不符或非預期回應      */
 #define SD_ERR_ACMD41    3   /* ACMD41 逾時，卡沒離開 idle              */
 #define SD_ERR_CMD58     4   /* CMD58 讀 OCR 失敗                       */
+#define SD_ERR_READ      5   /* CMD17 讀失敗（R1 非 0 或沒等到 data token）*/
+#define SD_ERR_WRITE     6   /* CMD24 寫失敗（R1 非 0 / 拒絕 / busy 逾時） */
+
+/* 一個 block 固定 512 byte */
+#define SD_BLOCK_SIZE    512
 
 /* 卡片類型 */
 #define SD_TYPE_UNKNOWN  0
@@ -47,5 +52,14 @@ void sd_cs_init(void);
  * 成功時 sd_card_type 會被設成 SD_TYPE_V1 / SD_TYPE_V2 / SD_TYPE_SDHC。
  * 回傳 SD_OK 或對應的 SD_ERR_*。 */
 uint8_t sd_init(void);
+
+/* CMD17：讀單一 block（512 byte）到 buf。
+ * block = 邏輯 block 號（SDHC 直接用；SDSC 內部換算成 byte 位址）。
+ * 回傳 SD_OK 或 SD_ERR_READ。 */
+uint8_t sd_read_block(uint32_t block, uint8_t *buf);
+
+/* CMD24：把 buf（512 byte）寫進單一 block。
+ * 回傳 SD_OK 或 SD_ERR_WRITE。 */
+uint8_t sd_write_block(uint32_t block, const uint8_t *buf);
 
 #endif /* DEVICE_SDCARD_H_ */

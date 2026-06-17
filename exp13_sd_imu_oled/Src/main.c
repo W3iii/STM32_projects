@@ -25,20 +25,96 @@
 #include "device_mpu6050.h"
 #include "device_sdcard.h"
 
+/* 讀寫測試用的 sector。寫高一點（>100000）避開之後 FAT32 的檔案系統結構，
+ * 那塊在格式化前是空白區，拿來做 raw 讀寫測試不會破壞 FS。 */
+#define SD_TEST_SECTOR  100000u
+
 /* SD init 結果，用 debugger watch 這個變數確認：0 = SD_OK */
 volatile uint8_t sd_status = 0xFF;
+
+/* 一個 block 的暫存（放 global，避免吃 stack） */
+static uint8_t sd_buf[SD_BLOCK_SIZE];
+
+static const char k_hex[] = "0123456789ABCDEF";
 
 /* 印 "0xHH\r\n"：把一個 byte 用 16 進位印出來 */
 static void uart_print_hex(uint8_t v)
 {
-    static const char hex[] = "0123456789ABCDEF";
-    char s[6] = { '0', 'x', hex[v >> 4], hex[v & 0x0F], '\r', '\n' };
-    usart1_send_byte(s[0]);
-    usart1_send_byte(s[1]);
-    usart1_send_byte(s[2]);
-    usart1_send_byte(s[3]);
-    usart1_send_byte(s[4]);
-    usart1_send_byte(s[5]);
+    char s[6] = { '0', 'x', k_hex[v >> 4], k_hex[v & 0x0F], '\r', '\n' };
+    for (int i = 0; i < 6; i++) {
+        usart1_send_byte(s[i]);
+    }
+}
+
+/* 印 "0xHHHHHHHH\r\n"：32-bit 值 */
+static void uart_print_hex32(uint32_t v)
+{
+    usart1_send_byte('0');
+    usart1_send_byte('x');
+    for (int i = 28; i >= 0; i -= 4) {
+        usart1_send_byte(k_hex[(v >> i) & 0xF]);
+    }
+    usart1_send_byte('\r');
+    usart1_send_byte('\n');
+}
+
+/* dump buffer 前 16 byte（"HH HH ... \r\n"） */
+static void uart_dump16(const uint8_t *b)
+{
+    for (int i = 0; i < 16; i++) {
+        usart1_send_byte(k_hex[b[i] >> 4]);
+        usart1_send_byte(k_hex[b[i] & 0xF]);
+        usart1_send_byte(' ');
+    }
+    usart1_send_byte('\r');
+    usart1_send_byte('\n');
+}
+
+/* CMD17/CMD24 讀寫測試：讀原內容 → 寫 pattern → 讀回 → 逐 byte 驗證 */
+static void sd_rw_test(void)
+{
+    usart1_send_string("\r\n--- SD read/write test ---\r\n");
+    usart1_send_string("sector = ");
+    uart_print_hex32(SD_TEST_SECTOR);
+
+    /* 1. 先讀原內容，dump 前 16 byte */
+    if (sd_read_block(SD_TEST_SECTOR, sd_buf) != SD_OK) {
+        usart1_send_string("[FAIL] read (before)\r\n");
+        return;
+    }
+    usart1_send_string("before: ");
+    uart_dump16(sd_buf);
+
+    /* 2. 填 pattern：buf[i] = i & 0xFF（00 01 02 ... 方便肉眼比對） */
+    for (int i = 0; i < SD_BLOCK_SIZE; i++) {
+        sd_buf[i] = (uint8_t)i;
+    }
+
+    /* 3. 寫進去 */
+    if (sd_write_block(SD_TEST_SECTOR, sd_buf) != SD_OK) {
+        usart1_send_string("[FAIL] write\r\n");
+        return;
+    }
+
+    /* 4. 清掉 buffer，再讀回來（確認真的從卡讀，不是讀到殘留） */
+    for (int i = 0; i < SD_BLOCK_SIZE; i++) {
+        sd_buf[i] = 0;
+    }
+    if (sd_read_block(SD_TEST_SECTOR, sd_buf) != SD_OK) {
+        usart1_send_string("[FAIL] read (back)\r\n");
+        return;
+    }
+    usart1_send_string("after:  ");
+    uart_dump16(sd_buf);
+
+    /* 5. 逐 byte 驗證 */
+    for (int i = 0; i < SD_BLOCK_SIZE; i++) {
+        if (sd_buf[i] != (uint8_t)i) {
+            usart1_send_string("[FAIL] verify mismatch\r\n");
+            return;
+        }
+    }
+    usart1_send_string("[OK]   write/read verified\r\n");
 }
 
 int main(void)
@@ -80,6 +156,11 @@ int main(void)
     } else {                            // SD_ERR_CMD58
         usart1_send_string("[FAIL] CMD58, raw R1 = ");
         uart_print_hex(sd_last_r1);
+    }
+
+    /* init 成功才做讀寫測試 */
+    if (sd_status == SD_OK) {
+        sd_rw_test();
     }
 
     /* Loop forever */

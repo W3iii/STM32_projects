@@ -11,6 +11,9 @@
  *    5. ACMD41 (SD_SEND_OP_COND)→ 反覆送直到 R1 = 0x00（卡離開 idle）
  *    6. CMD58  (READ_OCR)       → 讀 OCR，CCS bit 判斷 SDHC / SDSC
  *    7. 鮑率加速到 4MHz
+ *  讀寫：
+ *    sd_read_block  (CMD17) / sd_write_block (CMD24)，單一 512B block。
+ *    SDHC 用 block 號定址、SDSC 用 byte 位址，由 sd_block_to_addr() 處理。
  *  ─────────────────────────────────────────────
  *
  *  Created on: Jun 16, 2026
@@ -32,6 +35,13 @@
 
 /* ACMD41 等卡完成 init 的逾時（ms）。規格上限約 1 秒，留點餘裕。 */
 #define SD_ACMD41_TIMEOUT_MS  1500
+
+/* 讀：等 data token 的逾時；寫：等卡 busy 結束的逾時（ms） */
+#define SD_READ_TIMEOUT_MS    200
+#define SD_WRITE_TIMEOUT_MS   500
+
+/* 資料 token */
+#define SD_TOKEN_START        0xFE   /* 單 block 讀/寫的起始 token */
 
 /* 最後一次命令收到的原始 R1，給 main 印出來 debug 用：
  *   0xFF = 完全沒回應（卡沒電 / MISO 沒通 / CS 沒拉低）
@@ -77,14 +87,20 @@ void sd_cs_init(void)
  *                              Private helpers
  * ============================================================================ */
 
-/* 送一個命令，回傳 R1。CS 在這個函式內自己拉低 / 拉高。
+/* 拉高 CS 並補一個 dummy byte，讓卡釋放 DO（每次交易收尾用）。 */
+static void sd_deselect(void)
+{
+    SD_CS_HIGH();
+    spi1_transfer_byte(0xFF);
+}
+
+/* 送一個命令 frame（6 byte）+ 讀 R1。不碰 CS —— 由呼叫者自己管。
  *   格式：6 bytes = [0x40|cmd][arg31..24][arg23..16][arg15..8][arg7..0][CRC]
  *   R1 的特徵：MSB = 0，所以連讀最多 8 次直到收到 MSB=0 的 byte。
  *
- *   resp4 != NULL 時，在 R1 之後再讀 4 個 byte（給 R3/R7 用，例如 CMD8、CMD58）。 */
-static uint8_t sd_send_cmd(uint8_t cmd, uint32_t arg, uint8_t crc, uint8_t *resp4)
+ *   讀寫 block 要在資料階段維持 CS 拉低，所以才把這段抽出來共用。 */
+static uint8_t sd_cmd_frame(uint8_t cmd, uint32_t arg, uint8_t crc)
 {
-    SD_CS_LOW();
     spi1_transfer_byte(0xFF);                  // 同步用 dummy（讓卡準備好）
 
     spi1_transfer_byte(0x40 | cmd);
@@ -102,6 +118,15 @@ static uint8_t sd_send_cmd(uint8_t cmd, uint32_t arg, uint8_t crc, uint8_t *resp
             break;
         }
     }
+    return r1;
+}
+
+/* 送一個短命令並回傳 R1，CS 自己拉低 / 拉高（init 階段那些命令用）。
+ *   resp4 != NULL 時，在 R1 之後再讀 4 個 byte（給 R3/R7 用，例如 CMD8、CMD58）。 */
+static uint8_t sd_send_cmd(uint8_t cmd, uint32_t arg, uint8_t crc, uint8_t *resp4)
+{
+    SD_CS_LOW();
+    uint8_t r1 = sd_cmd_frame(cmd, arg, crc);
 
     /* R3 / R7：R1 之後固定再跟 4 個 byte */
     if (resp4) {
@@ -110,8 +135,7 @@ static uint8_t sd_send_cmd(uint8_t cmd, uint32_t arg, uint8_t crc, uint8_t *resp
         }
     }
 
-    SD_CS_HIGH();
-    spi1_transfer_byte(0xFF);                  // 收尾 dummy，讓卡釋放 DO
+    sd_deselect();
     return r1;
 }
 
@@ -223,5 +247,95 @@ uint8_t sd_init(void)
     /* 7. init 全部完成，鮑率加速到 4MHz */
     spi1_set_baud(SD_BAUD_FAST);
 
+    return SD_OK;
+}
+
+/* block 號 → 命令參數：SDHC/SDXC 用 block 號，SDSC 用 byte 位址(block*512)。 */
+static uint32_t sd_block_to_addr(uint32_t block)
+{
+    return (sd_card_type == SD_TYPE_SDHC) ? block : (block * SD_BLOCK_SIZE);
+}
+
+uint8_t sd_read_block(uint32_t block, uint8_t *buf)
+{
+    SD_CS_LOW();
+
+    /* CMD17 (READ_SINGLE_BLOCK)，CRC 被忽略送 0x01 */
+    uint8_t r1 = sd_cmd_frame(17, sd_block_to_addr(block), 0x01);
+    if (r1 != 0x00) {
+        sd_deselect();
+        return SD_ERR_READ;
+    }
+
+    /* 等 data token：busy 時卡回 0xFF，收到非 0xFF 就停。
+     * 正常是 0xFE；其他值代表 error token。 */
+    uint8_t token = 0xFF;
+    uint32_t start = systick_get_ms();
+    do {
+        token = spi1_transfer_byte(0xFF);
+        if (token != 0xFF) {
+            break;
+        }
+        if (systick_get_ms() - start > SD_READ_TIMEOUT_MS) {
+            sd_deselect();
+            return SD_ERR_READ;
+        }
+    } while (1);
+
+    if (token != SD_TOKEN_START) {             // error token，不是 0xFE
+        sd_deselect();
+        return SD_ERR_READ;
+    }
+
+    /* 讀 512 byte 資料 + 2 byte CRC（丟掉，CRC 沒開） */
+    for (int i = 0; i < SD_BLOCK_SIZE; i++) {
+        buf[i] = spi1_transfer_byte(0xFF);
+    }
+    spi1_transfer_byte(0xFF);
+    spi1_transfer_byte(0xFF);
+
+    sd_deselect();
+    return SD_OK;
+}
+
+uint8_t sd_write_block(uint32_t block, const uint8_t *buf)
+{
+    SD_CS_LOW();
+
+    /* CMD24 (WRITE_SINGLE_BLOCK) */
+    uint8_t r1 = sd_cmd_frame(24, sd_block_to_addr(block), 0x01);
+    if (r1 != 0x00) {
+        sd_deselect();
+        return SD_ERR_WRITE;
+    }
+
+    /* token 前先送一個 dummy（規格建議的 Nwr 間隔），再送 start token */
+    spi1_transfer_byte(0xFF);
+    spi1_transfer_byte(SD_TOKEN_START);
+
+    /* 送 512 byte 資料 + 2 byte 假 CRC */
+    for (int i = 0; i < SD_BLOCK_SIZE; i++) {
+        spi1_transfer_byte(buf[i]);
+    }
+    spi1_transfer_byte(0xFF);
+    spi1_transfer_byte(0xFF);
+
+    /* data response token：低 5 bit = xxx00101 (0x05) 代表卡已接受 */
+    uint8_t resp = spi1_transfer_byte(0xFF);
+    if ((resp & 0x1F) != 0x05) {
+        sd_deselect();
+        return SD_ERR_WRITE;
+    }
+
+    /* 卡寫 flash 期間會把 MISO 拉低(回 0x00) = busy，等到回 0xFF 才算寫完 */
+    uint32_t start = systick_get_ms();
+    while (spi1_transfer_byte(0xFF) == 0x00) {
+        if (systick_get_ms() - start > SD_WRITE_TIMEOUT_MS) {
+            sd_deselect();
+            return SD_ERR_WRITE;
+        }
+    }
+
+    sd_deselect();
     return SD_OK;
 }
