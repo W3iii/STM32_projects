@@ -181,6 +181,13 @@ void spi1_wait_done(void)
 {
     while (!s_dma_done);                             // ← 你問的那個 polling
     while (SPI1->SR & (1 << 7));                     // 確保 SPI 真的空了
+
+    /* TX-only DMA 全程沒讀 RX → 結束時 RXNE/OVR 是髒的。
+     * 不清掉的話，下一個共用 SPI1 的裝置（SD 卡的 spi1_transfer_byte）
+     * 會讀到這裡殘留的舊 byte，命令/資料流被汙染。
+     * 清 OVR 的標準順序：先讀 DR、再讀 SR。 */
+    (void)SPI1->DR;
+    (void)SPI1->SR;
 }
 
 /* ============================================================================
