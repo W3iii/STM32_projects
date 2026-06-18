@@ -94,6 +94,10 @@ t_ms,ax,ay,az,gx,gy,gz
 | `stop` | `f_sync` + `f_close`、回 IDLE |
 | `status` | 顯示狀態、檔名、已記錄筆數 |
 | `dump` | 把上一個 CSV 從卡讀回來印到 UART（**沒讀卡機也能驗證真實資料**）|
+| `ls` | 列出卡上檔案 + 大小 + 剩餘空間（像真的設備 console）|
+| `clear` | 刪掉所有 `log_NNN.csv`（重複 demo 前清場）|
+
+> 檔名**自動遞增**（`log_000` → `log_001` → …），永不覆蓋舊資料 —— 這是刻意的設計（資料安全）。`clear` 才會清檔。
 
 ---
 
