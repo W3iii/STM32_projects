@@ -3,7 +3,7 @@
  *
  *  UART console：start / stop / status。
  *  ─────────────────────────────────────────────
- *  用 usart1_read_byte() 從 RX ring buffer 一個一個取，自己組行，
+ *  用 usart1_try_read_byte() 從 RX ring buffer 一個一個取，自己組行，
  *  '\r' 或 '\n' 當行結尾 —— 這樣 Tera Term 送 CR / LF / CRLF 都吃得下。
  *
  *  Created on: Jun 18, 2026
@@ -184,7 +184,7 @@ void app_cli_init(void)
 void app_cli_poll(void)
 {
     uint8_t c;
-    while (usart1_read_byte(&c) == USART1_OK) {
+    while (usart1_try_read_byte(&c) == USART1_OK) {
         if (c == '\r' || c == '\n') {
             /* 只在有內容時才處理：CRLF 終端機的第二個 \n（此時 s_idx==0）
              * 會被這裡略過，不會跑出兩次 prompt。 */

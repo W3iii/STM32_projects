@@ -60,7 +60,7 @@ static volatile uint8_t rx_dma_buf[RX_BUF_SIZE];
 static          uint8_t rx_tail = 0;   /* main reads, only main advances */
 
 /* IDLE 旗標：USART1 IDLE interrupt 觸發時設 1
- * main loop 可以用這個旗標決定要不要呼叫 usart1_read_line()，
+ * main loop 可以用這個旗標決定要不要呼叫 usart1_try_read_line()，
  * 而不是不斷 polling rx_available()。
  */
 static volatile int rx_idle_flag = 0;
@@ -98,10 +98,10 @@ static usart1_status_t wait_sr_flag(uint32_t flag)
 /* ========================================================================= */
 
 /*
- * DMA2 Stream7 中斷 handler
+ * DMA2 Stream7 中斷 handler（USART1_TX fire-and-forget）
  *   - 對應 IRQ_DMA2_Stream7 (IRQ 70)
- *   - 只處理 Transfer Complete (TCIF)
- *   - TODO: 之後可加 TEIF/DMEIF error handling
+ *   - Transfer Complete (TCIF)：傳完，釋放 busy
+ *   - Transfer Error  (TEIF)：出錯也釋放 busy，讓系統能繼續發下一筆
  *
  * 函式名必須跟 startup file 的 vector table entry 完全一致，
  * 不然 linker 不會把這個 handler 填進中斷向量表。
@@ -251,7 +251,7 @@ void usart1_init(uint32_t baudrate)
 
 
 /* ========================================================================= */
-/*                          Polling API                                      */
+/*                          Blocking TX API (polling TXE)                    */
 /* ========================================================================= */
 
 usart1_status_t usart1_send_byte(uint8_t b)
@@ -285,30 +285,11 @@ usart1_status_t usart1_send_string(const char *s)
 }
 
 
-usart1_status_t usart1_recv_byte(uint8_t *b)
-{
-    if (b == 0) {
-        return USART1_ERR_PARAM;
-    }
-
-    uint32_t start = systick_get_ms();
-    while (dma_head() == rx_tail) {
-        if ((systick_get_ms() - start) >= USART1_TIMEOUT_MS) {
-            return USART1_ERR_TIMEOUT;
-        }
-    }
-
-    *b      = rx_dma_buf[rx_tail];
-    rx_tail = (uint8_t)((rx_tail + 1U) & RX_BUF_MASK);
-    return USART1_OK;
-}
-
-
 /* ========================================================================= */
-/*                          DMA TX API                                       */
+/*                          Non-Blocking TX API (DMA)                        */
 /* ========================================================================= */
 
-usart1_status_t usart1_send_dma(const uint8_t *buf, uint16_t len)
+usart1_status_t usart1_try_send(const uint8_t *buf, uint16_t len)
 {
     if (buf == 0 || len == 0) {
         return USART1_ERR_PARAM;
@@ -371,7 +352,7 @@ usart1_status_t usart1_send(const uint8_t *buf, uint16_t len)
             return USART1_ERR_TIMEOUT;
         }
     }
-    return usart1_send_dma(buf, len);
+    return usart1_try_send(buf, len);
 }
 
 
@@ -382,8 +363,33 @@ int usart1_send_busy(void)
 
 
 /* ========================================================================= */
-/*                          RX Ring Buffer API                               */
+/*                          RX Ring Buffer API (DMA circular)                */
 /* ========================================================================= */
+
+/*
+ * 收一個 byte（阻塞版）
+ *   等到 DMA 把資料寫進 ring buffer（dma_head() != rx_tail）才取，
+ *   有 SysTick timeout 保護。注意這只是 usart1_try_read_byte 的 blocking 包裝，
+ *   資料來源跟非阻塞版完全相同，都是 rx_dma_buf。
+ */
+usart1_status_t usart1_read_byte(uint8_t *b)
+{
+    if (b == 0) {
+        return USART1_ERR_PARAM;
+    }
+
+    uint32_t start = systick_get_ms();
+    while (dma_head() == rx_tail) {
+        if ((systick_get_ms() - start) >= USART1_TIMEOUT_MS) {
+            return USART1_ERR_TIMEOUT;
+        }
+    }
+
+    *b      = rx_dma_buf[rx_tail];
+    rx_tail = (uint8_t)((rx_tail + 1U) & RX_BUF_MASK);
+    return USART1_OK;
+}
+
 
 int usart1_rx_idle_pending(void)
 {
@@ -401,7 +407,7 @@ uint16_t usart1_rx_available(void)
 }
 
 
-usart1_status_t usart1_read_byte(uint8_t *b)
+usart1_status_t usart1_try_read_byte(uint8_t *b)
 {
     if (b == 0) {
         return USART1_ERR_PARAM;
@@ -420,7 +426,7 @@ usart1_status_t usart1_read_byte(uint8_t *b)
  * 這樣避免「讀了一半但 '\n' 還沒到」的問題。
  * 支援 \r\n：輸出會自動去掉尾端的 '\r'。
  */
-usart1_status_t usart1_read_line(char *buf, uint16_t buf_size, uint16_t *len_out)
+usart1_status_t usart1_try_read_line(char *buf, uint16_t buf_size, uint16_t *len_out)
 {
     if (buf == 0 || buf_size < 2U) {
         return USART1_ERR_PARAM;
