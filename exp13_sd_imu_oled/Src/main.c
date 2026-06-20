@@ -19,6 +19,7 @@
 #include "device_sdcard.h"
 #include "app_datalogger.h"
 #include "app_cli.h"
+#include "app_button.h"
 
 #if !defined(__SOFT_FP__) && defined(__ARM_FP)
   #warning "FPU is not initialized, but the project is compiling for an FPU. Please initialize the FPU before use."
@@ -40,6 +41,21 @@ static void update_oled(void)
         ssd1306_draw_string(0, 16, "READY");
     }
     ssd1306_update_screen();
+}
+
+/* 按鈕按下 → 切換記錄狀態。OLED 由 update_oled() 自動反映，這裡補 UART 回饋。 */
+static void toggle_logging(void)
+{
+    if (app_datalogger_state() == DL_LOGGING) {
+        app_datalogger_stop();
+        usart1_send_string("\r\n[BTN] stopped\r\n> ");
+    } else if (app_datalogger_start() == 0) {
+        usart1_send_string("\r\n[BTN] started: ");
+        usart1_send_string(app_datalogger_filename());
+        usart1_send_string("\r\n> ");
+    } else {
+        usart1_send_string("\r\n[BTN] start failed\r\n> ");
+    }
 }
 
 int main(void)
@@ -73,6 +89,7 @@ int main(void)
     usart1_send_string("[OK]   sensors + FAT32 ready\r\n");
 
     app_cli_init();
+    app_button_init();            // PA0 user button：按一下切換 start/stop
 
     /* ---- co-operative 主迴圈 ---- */
     uint32_t t_display = 0;
@@ -81,6 +98,9 @@ int main(void)
 
         app_datalogger_tick(now);      // 100Hz 取樣 + 週期 sync（內部自己看時間）
         app_cli_poll();                // 處理 UART 命令
+        if (app_button_poll(now)) {    // PA0 去抖 + 邊緣偵測
+            toggle_logging();          // 切換交給 main
+        }
 
         if (now - t_display >= DISPLAY_PERIOD_MS) {
             t_display = now;
