@@ -36,7 +36,8 @@ DSTATUS disk_initialize(BYTE pdrv)
     if (pdrv != DEV_SD) {
         return STA_NOINIT;
     }
-    if (sd_init() == SD_OK) {
+    sd_last_init_rc = sd_init();     // 診斷：保留卡在哪一步（SD_ERR_*）
+    if (sd_last_init_rc == SD_OK) {
         s_stat &= ~STA_NOINIT;       // 清 NOINIT = ready
     } else {
         s_stat = STA_NOINIT;

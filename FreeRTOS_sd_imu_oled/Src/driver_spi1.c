@@ -54,6 +54,13 @@ void spi1_init(void)
     GPIOA->AFRL &= ~((0xF << (5*4)) | (0xF << (6*4)) | (0xF << (7*4)));
     GPIOA->AFRL |=  ((0x5 << (5*4)) | (0x5 << (6*4)) | (0x5 << (7*4))); // AF5
 
+    /* SCK(PA5)/MOSI(PA7) 輸出速度設 Medium(01)：預設 Low 在 fast 階段(2.6MHz)
+     * 邊緣會被麵包板電容拖圓。但長線無端接不要拉到 Very High，邊緣太快會
+     * ringing/串擾到 MISO，反而更糟——Medium 是折衷。
+     * MISO(PA6) 是輸入，OSPEEDR 對它無效，不設。 */
+    GPIOA->OSPEEDR &= ~((0x3U << (5*2)) | (0x3U << (7*2)));
+    GPIOA->OSPEEDR |=  ((0x1U << (5*2)) | (0x1U << (7*2)));   // 01 = Medium
+
     // PA6 MISO 加上拉
     GPIOA->PUPDR &= ~(0x3U << (6 * 2));
     GPIOA->PUPDR |=  (0x1U << (6 * 2));   // pull-up
@@ -63,7 +70,7 @@ void spi1_init(void)
     SPI1->CR1 = 0;
     SPI1->CR1 |= (1 << 2);                          // MSTR
     SPI1->CR1 |= (1 << 9) | (1 << 8);               // SSM + SSI（軟體 NSS）
-    SPI1->CR1 |= (3 << 3);                          // BR = fPCLK/16
+    SPI1->CR1 |= (3 << 3);                          // BR = fPCLK/16 = 84M/16 = 5.25MHz（OLED 用，SD init 會再降速）
     SPI1->CR2 = 0;
     SPI1->CR1 |= (1 << 6);                          // SPE
 
@@ -145,9 +152,9 @@ uint8_t spi1_transfer_byte(uint8_t data)
 }
 
 /* 切換 SPI 鮑率（BR = CR1[5:3]）
- * SD 卡初始化規定 ≤ 400kHz，本系統 PCLK2 = 16MHz：
- *   br = 5 → /64  = 250kHz（init 用）
- *   br = 2 → /8   = 2MHz  （init 完成後可加速）
+ * SD 卡初始化規定 ≤ 400kHz，本系統 PCLK2 = 84MHz（PLL 168MHz）：
+ *   br = 7 → /256 = 328kHz（init 用，≤400kHz）
+ *   br = 4 → /32  = 2.6MHz（init 完成後加速）
  * 改 BR 必須在 SPI 沒在傳的時候，這裡先關 SPE 再改再開最保險。 */
 void spi1_set_baud(uint8_t br)
 {

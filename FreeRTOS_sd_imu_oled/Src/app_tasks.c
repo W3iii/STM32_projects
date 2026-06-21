@@ -163,6 +163,14 @@ static void console_task(void *arg)
     }
 }
 
+/* 診斷小工具：把一個 byte 以兩位十六進位印到 UART */
+static void uart_hex(uint8_t b)
+{
+    static const char H[] = "0123456789ABCDEF";
+    char s[2] = { H[(b >> 4) & 0xF], H[b & 0xF] };
+    usart1_send((const uint8_t *)s, 2);
+}
+
 /* ───────────────── Bootstrap task ─────────────────
  * 初始化集中在這裡：跑在排程器啟動後（delay_ms = vTaskDelay 才有效），
  * 完成後建立四個工作 task，再把自己刪掉。 */
@@ -171,7 +179,7 @@ static void bootstrap_task(void *arg)
     (void)arg;
 
     /* ---- 匯流排 / 周邊初始化 ---- */
-    usart1_init(1200);            // UART console（CH340 不穩就 1200）
+    usart1_init(115200);          // UART console（PCLK2=84MHz：BRR=729，誤差 0.02%；CP2102 可穩定跑此速率）
     spi1_init();                  // SPI1（OLED + SD 共用）
     i2c1_init();                  // I2C1（MPU6050）
     sd_cs_init();                 // SD CS = PB10
@@ -189,9 +197,22 @@ static void bootstrap_task(void *arg)
         ssd1306_update_screen();
         vTaskSuspend(NULL);
     } else if (rc == -2) {
-        usart1_send_string("[FATAL] FAT32 mount failed\r\n");
+        int mr = app_datalogger_mount_result();   /* FRESULT: 13=非FAT32, 1/3=SPI/卡片 */
+        usart1_send_string("[FATAL] FAT32 mount failed, FRESULT=");
+        char num[4] = { (char)('0' + (mr / 10) % 10), (char)('0' + mr % 10), '\r', '\n' };
+        usart1_send((const uint8_t *)num, 4);
+        /* ---- SD 原始回應 dump（v2.5 韌體標記）---- */
+        usart1_send_string("[SD] init_rc="); uart_hex(sd_last_init_rc);
+        usart1_send_string(" CMD8 r1="); uart_hex(sd_last_r1);
+        usart1_send_string(" r7=");
+        uart_hex(sd_r7[0]); uart_hex(sd_r7[1]); uart_hex(sd_r7[2]); uart_hex(sd_r7[3]);
+        usart1_send_string("  (good: r1=01 r7=000001AA)\r\n");
         ssd1306_clear();
         ssd1306_draw_string(0, 0, "FS FAIL");
+        ssd1306_draw_string(0, 16, "FRES:");
+        ssd1306_draw_int(48, 16, mr);
+        ssd1306_draw_string(0, 32, "SDINIT:");      /* 卡在哪一步：1=CMD0 3=ACMD41 */
+        ssd1306_draw_int(64, 32, sd_last_init_rc);
         ssd1306_update_screen();
         vTaskSuspend(NULL);
     } else if (rc != 0) {

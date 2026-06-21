@@ -4,7 +4,9 @@
  *  Phase 2 config：Sensor/Logger/Display/Console 四 task + Queue + mutex。
  *  mutex / queue / timer 等 API 都已打開。
  *
- *  時脈：16MHz HSI（專案沒設 PLL）→ configCPU_CLOCK_HZ 必須等於 16e6，
+ *  時脈：HSE 8MHz → PLL → 168MHz SYSCLK（rcc_clock_init_168mhz() 在 main()
+ *  最前面設定）。configCPU_CLOCK_HZ 必須等於實際 SYSCLK=168e6，否則 port
+ *  算出的 SysTick reload 會錯、整個 RTOS tick / vTaskDelay 都失準。
  *  configTICK_RATE_HZ=1000 讓 1 tick = 1ms，對齊原本的 ms 時間基準。
  */
 
@@ -18,7 +20,7 @@
 #define configUSE_16_BIT_TICKS                  0
 
 /* ---- 時脈 / tick ---- */
-#define configCPU_CLOCK_HZ                      ( 16000000UL )  /* 16MHz HSI */
+#define configCPU_CLOCK_HZ                      ( 168000000UL ) /* HSE 8M→PLL 168MHz */
 #define configTICK_RATE_HZ                      ( 1000 )        /* 1 tick = 1ms */
 
 /* ---- 記憶體 ---- */

@@ -41,8 +41,9 @@
 /*                          Configuration                                    */
 /* ========================================================================= */
 
-/* APB1 clock (I2C1 在 APB1) — 目前 16MHz HSI，APB1 prescaler = 1 */
-#define APB1_MHZ            16U
+/* APB1 clock (I2C1 在 APB1) — PLL 168MHz，APB1 prescaler = 4 → 42MHz。
+ * CR2 FREQ / CCR / TRISE 全部從這個值推導，改這裡即可同步。 */
+#define APB1_MHZ            42U
 
 /* 每個 flag 等待的 timeout（ms）
  * 100kHz 下讀 14 byte 約 1.5ms，100ms 綽綽有餘，
@@ -56,29 +57,31 @@
 /* ========================================================================= */
 
 /*
- * 設定 PB6/PB9 為 I2C1 AF mode（open-drain + pull-up）
+ * 設定 PB8/PB9 為 I2C1 AF mode（open-drain + pull-up）
  * init 和 bus_recovery 結束後都會呼叫，所以抽成 static helper（決策 2）
  */
 static void i2c1_gpio_init(void)
 {
     RCC->AHB1ENR |= RCC_AHB1ENR_GPIOBEN;
 
-    /* PB6 = I2C1_SCL, PB9 = I2C1_SDA → AF mode */
-    GPIOB->MODER &= ~(0x3U << (6 * 2));
-    GPIOB->MODER |=  (GPIO_MODER_AF << (6 * 2));
+    /* PB8 = I2C1_SCL, PB9 = I2C1_SDA → AF mode
+     * （SCL 從 PB6 改到 PB8，把 PB6 讓給 USART1_TX）*/
+    GPIOB->MODER &= ~(0x3U << (8 * 2));
+    GPIOB->MODER |=  (GPIO_MODER_AF << (8 * 2));
     GPIOB->MODER &= ~(0x3U << (9 * 2));
     GPIOB->MODER |=  (GPIO_MODER_AF << (9 * 2));
 
-    GPIOB->AFRL &= ~(0xFU << (6 * 4));
-    GPIOB->AFRL |=  (GPIO_AF4_I2C1 << (6 * 4));
+    /* PB8/PB9 都在 AFRH（pin 8~15）*/
+    GPIOB->AFRH &= ~(0xFU << ((8 - 8) * 4));
+    GPIOB->AFRH |=  (GPIO_AF4_I2C1 << ((8 - 8) * 4));
     GPIOB->AFRH &= ~(0xFU << ((9 - 8) * 4));
     GPIOB->AFRH |=  (GPIO_AF4_I2C1 << ((9 - 8) * 4));
 
     /* I2C 必須 open-drain + pull-up */
-    GPIOB->OTYPER |= (1U << 6);
+    GPIOB->OTYPER |= (1U << 8);
     GPIOB->OTYPER |= (1U << 9);
-    GPIOB->PUPDR &= ~(0x3U << (6 * 2));
-    GPIOB->PUPDR |=  (0x1U << (6 * 2));
+    GPIOB->PUPDR &= ~(0x3U << (8 * 2));
+    GPIOB->PUPDR |=  (0x1U << (8 * 2));
     GPIOB->PUPDR &= ~(0x3U << (9 * 2));
     GPIOB->PUPDR |=  (0x1U << (9 * 2));
 }
@@ -156,9 +159,9 @@ void i2c1_init(void)
     I2C1->CR2 = APB1_MHZ;
 
     /* CCR：standard mode 100kHz
-     * CCR = APB1 / (2 × I2C_speed) = 16M / (2 × 100k) = 80
+     * CCR = APB1 / (2 × I2C_speed) = 42M / (2 × 100k) = 210
      */
-    I2C1->CCR = (APB1_MHZ * 1000000U) / (2U * 100000U);   /* = 80 */
+    I2C1->CCR = (APB1_MHZ * 1000000U) / (2U * 100000U);   /* = 210 */
 
     /* TRISE：standard mode = APB1_MHz + 1 */
     I2C1->TRISE = APB1_MHZ + 1U;
@@ -328,10 +331,11 @@ i2c_status_t i2c1_read_regs(uint8_t slave, uint8_t reg, uint8_t *buf, uint8_t le
 /*
  * 簡單的 µs 級延遲（bus recovery 的 clock pulse 用）
  * 100kHz I2C → 半週期 5µs，這裡用粗略 busy loop 即可。
+ * 迴圈次數隨 HCLK 縮放：16MHz 時 80 次 ≈ 5µs，168MHz（×10.5）→ 約 840 次。
  */
 static void short_delay(void)
 {
-    for (volatile int i = 0; i < 80; i++) { __asm volatile("nop"); }
+    for (volatile int i = 0; i < 840; i++) { __asm volatile("nop"); }
 }
 
 i2c_status_t i2c1_bus_recovery(void)
@@ -339,14 +343,14 @@ i2c_status_t i2c1_bus_recovery(void)
     /* 1. disable I2C peripheral，準備手動操作腳位 */
     I2C1->CR1 &= ~I2C_CR1_PE;
 
-    /* 2. PB6(SCL)、PB9(SDA) 切成 GPIO output（open-drain 保留）*/
-    GPIOB->MODER &= ~(0x3U << (6 * 2));
-    GPIOB->MODER |=  (GPIO_MODER_OUTPUT << (6 * 2));
+    /* 2. PB8(SCL)、PB9(SDA) 切成 GPIO output（open-drain 保留）*/
+    GPIOB->MODER &= ~(0x3U << (8 * 2));
+    GPIOB->MODER |=  (GPIO_MODER_OUTPUT << (8 * 2));
     GPIOB->MODER &= ~(0x3U << (9 * 2));
     GPIOB->MODER |=  (GPIO_MODER_OUTPUT << (9 * 2));
     /* OTYPER 在 gpio_init 已設 open-drain，SDA 拉高靠 pull-up */
     GPIOB->ODR |= (1U << 9);    /* SDA 放開（high）*/
-    GPIOB->ODR |= (1U << 6);    /* SCL high */
+    GPIOB->ODR |= (1U << 8);    /* SCL high */
 
     /* 3. 送最多 9 個 clock pulse，期間檢查 SDA 是否被釋放 */
     i2c_status_t result = I2C_ERR_BUS;
@@ -356,16 +360,16 @@ i2c_status_t i2c1_bus_recovery(void)
             result = I2C_OK;
             break;
         }
-        GPIOB->ODR &= ~(1U << 6);   /* SCL low */
+        GPIOB->ODR &= ~(1U << 8);   /* SCL low */
         short_delay();
-        GPIOB->ODR |=  (1U << 6);   /* SCL high */
+        GPIOB->ODR |=  (1U << 8);   /* SCL high */
         short_delay();
     }
 
     /* 4. 產生一次 STOP condition（SDA 由 low → high 當 SCL high）*/
     GPIOB->ODR &= ~(1U << 9);   /* SDA low */
     short_delay();
-    GPIOB->ODR |=  (1U << 6);   /* SCL high */
+    GPIOB->ODR |=  (1U << 8);   /* SCL high */
     short_delay();
     GPIOB->ODR |=  (1U << 9);   /* SDA high → STOP */
     short_delay();

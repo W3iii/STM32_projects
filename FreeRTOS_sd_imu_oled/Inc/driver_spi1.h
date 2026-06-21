@@ -20,7 +20,7 @@ void spi1_send_buffer(const uint8_t *buf, uint32_t len);
 /* 全雙工：送一個 byte 同時收回 MISO（SD 卡用） */
 uint8_t spi1_transfer_byte(uint8_t b);
 
-/* 切鮑率：br = CR1[5:3]，5=/64(250kHz, SD init), 2=/8(2MHz) */
+/* 切鮑率：br = CR1[5:3]，PCLK2=84MHz：7=/256(328kHz, SD init), 4=/32(2.6MHz) */
 void spi1_set_baud(uint8_t br);
 
 /* 非同步：啟動 DMA 就 return */

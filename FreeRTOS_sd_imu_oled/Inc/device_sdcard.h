@@ -39,6 +39,7 @@
 
 /* debug 用全域（數值意義見 .c） */
 extern volatile uint8_t sd_last_r1;       /* 最後一次命令的原始 R1     */
+extern volatile uint8_t sd_last_init_rc;  /* 最後一次 sd_init() 回傳碼  */
 extern volatile uint8_t sd_last_cmd55_r1; /* 最後一次 CMD55 的 R1      */
 extern volatile uint8_t sd_card_type;     /* SD_TYPE_*                 */
 extern volatile uint8_t sd_r7[4];       /* CMD8 的 4-byte trailing */

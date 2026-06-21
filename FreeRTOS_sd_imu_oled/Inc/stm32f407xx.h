@@ -36,10 +36,12 @@ extern "C" {
 #define GPIOD_BASE          0x40020C00UL
 #define GPIOE_BASE          0x40021000UL
 #define RCC_BASE            0x40023800UL
+#define FLASH_R_BASE        0x40023C00UL    /* Flash interface register（latency/cache）*/
 #define DMA1_BASE           0x40026000UL
 #define DMA2_BASE           0x40026400UL
 
 /* --- APB1 peripherals --- */
+#define PWR_BASE            0x40007000UL    /* Power control（VOS scale）*/
 #define TIM2_BASE           0x40000000UL
 #define TIM3_BASE           0x40000400UL
 #define TIM4_BASE           0x40000800UL
@@ -123,6 +125,26 @@ typedef struct {
     volatile uint32_t SSCGR;        /* 0x80  Spread spectrum clock gen     */
     volatile uint32_t PLLI2SCFGR;   /* 0x84  PLLI2S configuration          */
 } RCC_TypeDef;
+
+/* -------------------------------------------------------------------------
+ * FLASH interface (RM0090 §3.9) — 升頻時要先設好 wait state 才能切 PLL
+ * ------------------------------------------------------------------------- */
+typedef struct {
+    volatile uint32_t ACR;          /* 0x00  Access control (latency/cache) */
+    volatile uint32_t KEYR;         /* 0x04  Key register                   */
+    volatile uint32_t OPTKEYR;      /* 0x08  Option key register            */
+    volatile uint32_t SR;           /* 0x0C  Status register                */
+    volatile uint32_t CR;           /* 0x10  Control register               */
+    volatile uint32_t OPTCR;        /* 0x14  Option control register        */
+} FLASH_TypeDef;
+
+/* -------------------------------------------------------------------------
+ * PWR (RM0090 §5.4) — 168MHz 需要 VOS = Scale 1
+ * ------------------------------------------------------------------------- */
+typedef struct {
+    volatile uint32_t CR;           /* 0x00  Power control register         */
+    volatile uint32_t CSR;          /* 0x04  Power control/status register  */
+} PWR_TypeDef;
 
 /* -------------------------------------------------------------------------
  * USART (RM0090 §30.6)
@@ -355,6 +377,10 @@ typedef struct {
 /* --- RCC --- */
 #define RCC         ((RCC_TypeDef *)   RCC_BASE)
 
+/* --- FLASH / PWR（時脈升頻用）--- */
+#define FLASH       ((FLASH_TypeDef *) FLASH_R_BASE)
+#define PWR         ((PWR_TypeDef *)   PWR_BASE)
+
 /* --- USART --- */
 #define USART1      ((USART_TypeDef *) USART1_BASE)
 #define USART2      ((USART_TypeDef *) USART2_BASE)
@@ -501,6 +527,7 @@ typedef struct {
 #define RCC_APB1ENR_I2C1EN      (1U << 21)
 #define RCC_APB1ENR_I2C2EN      (1U << 22)
 #define RCC_APB1ENR_I2C3EN      (1U << 23)
+#define RCC_APB1ENR_PWREN       (1U << 28)  /* Power interface clock */
 
 /* APB2ENR */
 #define RCC_APB2ENR_TIM1EN      (1U << 0)
@@ -509,6 +536,45 @@ typedef struct {
 #define RCC_APB2ENR_ADC1EN      (1U << 8)
 #define RCC_APB2ENR_SPI1EN      (1U << 12)
 #define RCC_APB2ENR_SYSCFGEN    (1U << 14)
+
+/* ========================================================================= */
+/*                    Clock tree (HSE / PLL / FLASH / PWR)                    */
+/*  168MHz 升頻用，集中放這裡，driver_rcc.c 會用到（RM0090 §7）             */
+/* ========================================================================= */
+
+/* RCC_CR */
+#define RCC_CR_HSION            (1U << 0)   /* HSI oscillator enable */
+#define RCC_CR_HSIRDY           (1U << 1)   /* HSI ready flag        */
+#define RCC_CR_HSEON            (1U << 16)  /* HSE oscillator enable */
+#define RCC_CR_HSERDY           (1U << 17)  /* HSE ready flag        */
+#define RCC_CR_PLLON            (1U << 24)  /* Main PLL enable       */
+#define RCC_CR_PLLRDY           (1U << 25)  /* Main PLL ready flag   */
+
+/* RCC_PLLCFGR 欄位位移（PLLSRC=1 選 HSE）*/
+#define RCC_PLLCFGR_PLLM_Pos    0
+#define RCC_PLLCFGR_PLLN_Pos    6
+#define RCC_PLLCFGR_PLLP_Pos    16          /* 00=/2 01=/4 10=/6 11=/8 */
+#define RCC_PLLCFGR_PLLSRC_HSE  (1U << 22)
+#define RCC_PLLCFGR_PLLQ_Pos    24
+
+/* RCC_CFGR：SYSCLK 切換 + bus 分頻 */
+#define RCC_CFGR_SW_PLL         (2U << 0)   /* SW[1:0]=10 選 PLL      */
+#define RCC_CFGR_SWS_PLL        (2U << 2)   /* SWS[3:2]=10 已切到 PLL */
+#define RCC_CFGR_SWS_Msk        (3U << 2)
+#define RCC_CFGR_HPRE_DIV1      (0U << 4)   /* AHB  = SYSCLK          */
+#define RCC_CFGR_PPRE1_DIV4     (5U << 10)  /* APB1 = HCLK/4 = 42MHz  */
+#define RCC_CFGR_PPRE2_DIV2     (4U << 13)  /* APB2 = HCLK/2 = 84MHz  */
+
+/* FLASH_ACR：168MHz @ 3.3V → 5 wait state（RM0090 表 10）*/
+#define FLASH_ACR_LATENCY_5WS   (5U << 0)
+#define FLASH_ACR_PRFTEN        (1U << 8)   /* prefetch enable        */
+#define FLASH_ACR_ICEN          (1U << 9)   /* instruction cache      */
+#define FLASH_ACR_DCEN          (1U << 10)  /* data cache             */
+
+/* PWR_CR：VOS = Scale 1（168MHz 必須）。
+ * 注意 F405/407/415/417 的 VOS 只有單一 bit[14]（0=Scale2,1=Scale1）；
+ * 兩 bit 的 VOS[15:14] 是 F42x/43x 才有，這裡用單 bit。 */
+#define PWR_CR_VOS_SCALE1       (1U << 14)
 
 /* ========================================================================= */
 /*                    DMA Flag Bit Positions                                 */

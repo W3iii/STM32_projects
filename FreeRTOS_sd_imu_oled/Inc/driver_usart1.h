@@ -2,9 +2,9 @@
  * driver_usart1.h
  *
  * USART1 driver for STM32F407
- *   - PA9  = TX (AF7)
- *   - PA10 = RX (AF7)
- *   - 預期接 CP2102 或 CH340 USB-UART → Tera Term
+ *   - PB6 = TX (AF7)   ← 從 PA9 改來：Discovery PA9/PA10 被 USB-OTG 佔用會亂碼
+ *   - PB7 = RX (AF7)   ← 從 PA10 改來
+ *   - 預期接 CP2102 USB-UART → Tera Term（115200）
  *
  * TX 有兩種送法：
  *   1. Polling (blocking)     - usart1_send_byte/string，poll TXE，適合 init/debug print
@@ -20,11 +20,12 @@
  * usart1_rx_idle_pending() 得知「有新資料可 parse」，不必一直 polling。
  *
  * NOTE:
- *   目前系統 clock = 16MHz HSI（RCC->CFGR = 0 驗證）
- *   USART1 在 APB2 bus，PCLK2 = 16MHz
+ *   系統 clock = PLL 168MHz（HSE 8MHz 源，見 driver_rcc.c）
+ *   USART1 在 APB2 bus，PCLK2 = HCLK/2 = 84MHz
  *
- *   CH340 5V 介面下，9600+ baud 偶有訊號完整性問題，
- *   建議 baudrate=1200 測試。換 CP2102 後可用 115200。
+ *   目前 console 用 115200（PCLK2=84MHz 下 BRR=729，誤差 0.02%）。
+ *   若 CH340 5V 介面訊號完整性不佳要降速，注意 16-bit BRR 上限讓最低
+ *   baud ≈ 1283——1200 已做不到，最近的有效低速是 2400。
  *
  *  Created on: May 19, 2026
  *      Author: xushu
@@ -53,8 +54,8 @@ typedef enum {
 
 /*
  * 初始化 USART1
- *   - 開 GPIOA / USART1 / DMA2 clock
- *   - PA9/PA10 設為 AF7
+ *   - 開 GPIOB / USART1 / DMA2 clock
+ *   - PB6/PB7 設為 AF7
  *   - 設定 baudrate（自動計算 BRR）
  *   - 開啟 UE + TE + RE + IDLEIE
  *   - DMA2 Stream7 Channel 4 給 USART1_TX（只設固定參數，不啟動）

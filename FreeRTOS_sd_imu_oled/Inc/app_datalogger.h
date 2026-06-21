@@ -36,6 +36,10 @@ typedef struct {
  * 注意：I2C1/SPI1/SD CS 等匯流排要先初始化好；需在排程器啟動後呼叫。 */
 int app_datalogger_init(void);
 
+/* 診斷：回傳最後一次 f_mount 的 FRESULT（掛載失敗時看原因）。
+ *   1=FR_DISK_ERR / 3=FR_NOT_READY → SPI/卡片；13=FR_NO_FILESYSTEM → 不是 FAT32。 */
+int app_datalogger_mount_result(void);
+
 /* 開新檔 log_NNN.csv、寫表頭、進 LOGGING。回傳 0=OK / <0=失敗。 */
 int app_datalogger_start(void);
 

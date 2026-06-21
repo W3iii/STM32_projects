@@ -29,9 +29,11 @@
 #define SD_CS_HIGH()   (GPIOB->BSRR = (1U << 10))        // set   PB10 = 1
 #define SD_CS_LOW()    (GPIOB->BSRR = (1U << (10 + 16))) // reset PB10 = 0
 
-/* SPI 鮑率（PCLK2 = 16MHz） */
-#define SD_BAUD_INIT   5   /* /64 = 250kHz，符合 init ≤ 400kHz 規定 */
-#define SD_BAUD_FAST   1   /* /4  = 4MHz，init 完成後加速（麵包板保守值） */
+/* SPI 鮑率（PCLK2 = 84MHz，BR = CR1[5:3]）
+ * 升頻後分頻器要重算，否則 init 速率會超過 SD 規格的 ≤400kHz。 */
+#define SD_BAUD_INIT   7   /* /256 = 328kHz，仍符合 init ≤ 400kHz 規定 */
+#define SD_BAUD_FAST   4   /* /32  = 2.6MHz，init 完成後加速（麵包板保守值；
+                            *        線路乾淨可改 3 → /16 = 5.25MHz）       */
 
 /* ACMD41 等卡完成 init 的逾時（ms）。規格上限約 1 秒，留點餘裕。 */
 #define SD_ACMD41_TIMEOUT_MS  1500
@@ -48,6 +50,10 @@
  *   0x01 = 正常 idle
  *   其他 = R1 error bit（例如 0x05 = illegal command） */
 volatile uint8_t sd_last_r1 = 0xFF;
+
+/* 診斷：最後一次 sd_init() 的回傳碼（由 diskio 的 disk_initialize 設）。
+ *   SD_ERR_CMD0(1)=卡完全沒回應(接線/MISO/電源)、ACMD41(3)=卡沒離開 idle(電源/挑卡)。 */
+volatile uint8_t sd_last_init_rc = 0xFF;
 
 /* 卡片類型（CMD8 判定結果），見 .h 的 SD_TYPE_* */
 volatile uint8_t sd_card_type = SD_TYPE_UNKNOWN;
@@ -184,26 +190,32 @@ uint8_t sd_init(void)
      *    arg = 0x000001AA：VHS=1（2.7~3.6V）+ check pattern 0xAA
      *    CRC = 0x87（CMD8 在 SPI 模式下也是固定 CRC）
      *    這是 R7 回應：R1 + 4 byte。 */
+    /* CMD8 比照 CMD0 加重試：R7 要讀 5 byte，麵包板雜訊常吃掉 trailing bytes，
+     * 單發容易失敗。重試到讀出乾淨的合法回應為止。 */
     uint8_t r7[4];
-    r1 = sd_send_cmd(8, 0x000001AA, 0x87, r7);
-    sd_last_r1 = r1;
-    sd_r7[0] = r7[0];
-    sd_r7[1] = r7[1];
-    sd_r7[2] = r7[2];
-    sd_r7[3] = r7[3];
+    sd_card_type = SD_TYPE_UNKNOWN;
+    for (int i = 0; i < 10; i++) {
+        r1 = sd_send_cmd(8, 0x000001AA, 0x87, r7);
+        sd_last_r1 = r1;
+        sd_r7[0] = r7[0];
+        sd_r7[1] = r7[1];
+        sd_r7[2] = r7[2];
+        sd_r7[3] = r7[3];
 
-    if (r1 == 0x01) {
-        /* v2.0+ 卡：要確認電壓與 pattern 都回對，否則卡不可用 */
-        if (r7[2] == 0x01 && r7[3] == 0xAA) {
-            sd_card_type = SD_TYPE_V2;
-        } else {
-            return SD_ERR_CMD8;                // 電壓不支援 / pattern 對不上
+        if (r1 == 0x01 && r7[2] == 0x01 && r7[3] == 0xAA) {
+            sd_card_type = SD_TYPE_V2;          // v2.0+：電壓 + pattern 都回對
+            break;
         }
-    } else if (r1 & 0x04) {
-        /* illegal command bit = 1 → 不認得 CMD8 → v1.x SD 卡 (或 MMC) */
-        sd_card_type = SD_TYPE_V1;
-    } else {
-        return SD_ERR_CMD8;                    // 其他非預期 R1
+        if (r1 == 0x05) {
+            /* idle(0x01)+illegal cmd(0x04) → 不認得 CMD8 → v1.x SD/MMC。
+             * 用精確值 0x05 判，避免雜訊 0xFF（& 0x04 也成立）誤判成 v1。 */
+            sd_card_type = SD_TYPE_V1;
+            break;
+        }
+        delay_ms(1);                            // r1 idle 但 echo 不對 → 雜訊，重試
+    }
+    if (sd_card_type == SD_TYPE_UNKNOWN) {
+        return SD_ERR_CMD8;                     // 重試完還是讀不到合法回應
     }
 
     /* 5. ACMD41 (SD_SEND_OP_COND)：反覆送，直到卡完成內部 init（R1 = 0x00）。
@@ -226,8 +238,16 @@ uint8_t sd_init(void)
 
     /* 6. CMD58 (READ_OCR)：讀 OCR，看 CCS bit(30) 判斷定址方式。
      *    這是 R3 回應：R1 + 4 byte OCR（MSB first）。 */
-    uint8_t ocr[4];
-    r1 = sd_send_cmd(58, 0x00000000, 0x01, ocr);
+    /* CMD58 也讀 5 byte（R1+4 OCR），同樣加重試抗雜訊 */
+    uint8_t ocr[4] = { 0 };
+    r1 = 0xFF;
+    for (int i = 0; i < 10; i++) {
+        r1 = sd_send_cmd(58, 0x00000000, 0x01, ocr);
+        if (r1 == 0x00) {
+            break;
+        }
+        delay_ms(1);
+    }
     sd_last_r1 = r1;
     if (r1 != 0x00) {
         return SD_ERR_CMD58;

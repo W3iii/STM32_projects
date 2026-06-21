@@ -2,9 +2,9 @@
  * driver_i2c1.h
  *
  * I2C1 driver for STM32F407
- *   - PB6 = SCL (AF4)
+ *   - PB8 = SCL (AF4)   ← 從 PB6 改來，把 PB6 讓給 USART1_TX
  *   - PB9 = SDA (AF4)
- *   - Standard mode 100kHz @ APB1 16MHz
+ *   - Standard mode 100kHz @ APB1 42MHz（PLL 168MHz / 4）
  *
  * 所有 transaction API 有 timeout 保護 + 回傳 status code，
  * sensor 掉線時不會卡死。
@@ -42,7 +42,7 @@ typedef enum {
 /*
  * 初始化 I2C1
  *   - 開 GPIOB / I2C1 clock
- *   - PB6 SCL / PB9 SDA 設為 AF4 open-drain + pull-up
+ *   - PB8 SCL / PB9 SDA 設為 AF4 open-drain + pull-up
  *   - Standard mode 100kHz
  */
 void i2c1_init(void);

@@ -36,6 +36,10 @@ static uint8_t    s_mounted;
 
 static SemaphoreHandle_t s_state_mtx;   /* 保護 s_state / s_count / s_filename */
 
+/* 診斷：保留最後一次 f_mount 的 FRESULT，方便 bootstrap 顯示掛載失敗原因
+ *   1=FR_DISK_ERR、3=FR_NOT_READY → SPI/卡片硬體；13=FR_NO_FILESYSTEM → 不是 FAT32 */
+static volatile FRESULT s_mount_res = FR_OK;
+
 static inline void state_lock(void)   { xSemaphoreTake(s_state_mtx, portMAX_DELAY); }
 static inline void state_unlock(void) { xSemaphoreGive(s_state_mtx); }
 
@@ -72,12 +76,18 @@ int app_datalogger_init(void)
     if (mpu6050_init() != 0) {
         return -1;                  /* WHO_AM_I 不對 */
     }
-    if (f_mount(&s_fs, "", 1) != FR_OK) {
-        return -2;                  /* 掛載失敗（卡沒 FAT32？）*/
+    s_mount_res = f_mount(&s_fs, "", 1);
+    if (s_mount_res != FR_OK) {
+        return -2;                  /* 掛載失敗：FRESULT 存在 s_mount_res */
     }
     s_mounted = 1;
     s_state = DL_IDLE;
     return 0;
+}
+
+int app_datalogger_mount_result(void)
+{
+    return (int)s_mount_res;        /* 診斷用：最後一次 f_mount 的 FRESULT */
 }
 
 int app_datalogger_start(void)

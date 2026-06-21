@@ -78,7 +78,10 @@ FatFs → SD → SPI1 是同一條路，OLED 也掛在 SPI1 上。**一支 `mBus
 
 **Phase 1 — 排程器 bring-up（先確認 RTOS 能跑、功能不退化）**
 - Kernel 原始碼丟 `Src/`、headers 丟 `Inc/`：STM32CubeIDE managed build 自動收編，**零 `.cproject` 改動**。
-- port = `GCC/ARM_CM4F`（Cortex-M4F、hard float）、`heap_4`、16MHz HSI、1ms tick。
+- port = `GCC/ARM_CM4F`（Cortex-M4F、hard float）、`heap_4`、PLL 168MHz、1ms tick。
+  時脈在 `driver_rcc.c`（`rcc_clock_init_168mhz()`，main() 最前面、排程器之前呼叫）；
+  來源以外部 **HSE 8MHz** 晶振為主，HSERDY timeout 自動 fallback 回 **HSI 16MHz**
+  （永不卡死，兩條路都到 168MHz）。PCLK1=42MHz / PCLK2=84MHz，分頻常數已對齊。
 - **SysTick 交接**：`SVC/PendSV/SysTick_Handler` 改由 port 經 `FreeRTOSConfig.h` alias 接管；
   `systick.c` 移除自己的 handler，`systick_get_ms()`→`xTaskGetTickCount()`、
   `delay_ms()`→`vTaskDelay()`，上層 driver 一行不用改。

@@ -15,9 +15,14 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include "app_tasks.h"
+#include "driver_rcc.h"
 
 int main(void)
 {
+    /* 先把 SYSCLK 拉到 168MHz（HSE 8MHz→PLL，失敗 fallback HSI，見 driver_rcc.c）。
+     * 必須在排程器之前：port 用 configCPU_CLOCK_HZ(=168e6) 算 SysTick reload，硬體得先到位。 */
+    rcc_clock_init_168mhz();
+
     app_tasks_start();        // 建 queue/mutex + bootstrap task
     vTaskStartScheduler();
 

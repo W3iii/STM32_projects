@@ -15,11 +15,12 @@
 /*                          Private constants                                */
 /* ========================================================================= */
 
-/* 目前系統 clock 假設值（HSI 16MHz）
- * USART1 在 APB2，APB2 prescaler = 1 → PCLK2 = HCLK = 16MHz
- * 之後切到 PLL 168MHz 時要改這裡（PCLK2 會變成 84MHz）
+/* 系統 clock = PLL 168MHz（rcc_clock_init_168mhz）。
+ * USART1 在 APB2，APB2 prescaler = 2 → PCLK2 = HCLK/2 = 84MHz。
+ * 注意 16-bit BRR 上限 0xFFFF → 最低 baud ≈ 84e6/16/4095 ≈ 1283，
+ * 1200 以下做不到（升頻前可以、升頻後不行）。
  */
-#define PCLK2_HZ        16000000U
+#define PCLK2_HZ        84000000U
 
 /* Timeout 設定（ms）
  * 與 I2C driver 一樣使用 SysTick 做 timeout，避免 busy-loop 次數
@@ -164,24 +165,24 @@ void USART1_IRQHandler(void)
 void usart1_init(uint32_t baudrate)
 {
     /* --- 開 clock --- */
-    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;    /* GPIOA for PA9/PA10 */
+    /* USART1 用替代腳位 PB6/PB7：Discovery 的 PA9/PA10 被板載 USB-OTG
+     * (CN5 VBUS/ID) 佔用，當 USART1 會亂碼。PB6/PB7 在 Discovery 上是空的。
+     * 注意：I2C1 SCL 已從 PB6 改到 PB8 以讓出 PB6。 */
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOBEN;    /* GPIOB for PB6/PB7 */
     RCC->AHB1ENR |= RCC_AHB1ENR_DMA2EN;     /* DMA2 for TX */
     RCC->APB2ENR |= RCC_APB2ENR_USART1EN;   /* USART1 */
 
-    /* --- 設定 PA9 (TX), PA10 (RX) 為 AF7 --- */
-    /* PA9 MODER */
-    GPIOA->MODER &= ~(0x3U << (9 * 2));
-    GPIOA->MODER |=  (GPIO_MODER_AF << (9 * 2));
-    /* PA10 MODER */
-    GPIOA->MODER &= ~(0x3U << (10 * 2));
-    GPIOA->MODER |=  (GPIO_MODER_AF << (10 * 2));
+    /* --- 設定 PB6 (TX), PB7 (RX) 為 AF7 --- */
+    GPIOB->MODER &= ~(0x3U << (6 * 2));
+    GPIOB->MODER |=  (GPIO_MODER_AF << (6 * 2));
+    GPIOB->MODER &= ~(0x3U << (7 * 2));
+    GPIOB->MODER |=  (GPIO_MODER_AF << (7 * 2));
 
-    /* PA9 AF7 (AFRH[3:0] for pin 9) */
-    GPIOA->AFRH &= ~(0xFU << ((9 - 8) * 4));
-    GPIOA->AFRH |=  (GPIO_AF7_USART1 << ((9 - 8) * 4));
-    /* PA10 AF7 (AFRH[7:4] for pin 10) */
-    GPIOA->AFRH &= ~(0xFU << ((10 - 8) * 4));
-    GPIOA->AFRH |=  (GPIO_AF7_USART1 << ((10 - 8) * 4));
+    /* PB6/PB7 都在 AFRL（pin 0~7）*/
+    GPIOB->AFRL &= ~(0xFU << (6 * 4));
+    GPIOB->AFRL |=  (GPIO_AF7_USART1 << (6 * 4));
+    GPIOB->AFRL &= ~(0xFU << (7 * 4));
+    GPIOB->AFRL |=  (GPIO_AF7_USART1 << (7 * 4));
 
     /* --- 計算並設定 BRR ---
      *
@@ -191,10 +192,10 @@ void usart1_init(uint32_t baudrate)
      * 加 baudrate/2 是讓整數除法做四捨五入而非捨去，
      * 提高 baud rate 精準度。
      *
-     * 例：baud=9600, PCLK=16M
-     *     (16000000 + 4800) / 9600 = 1667 = 0x683
-     *     拆解：MANTISSA=104, FRACTION=3
-     *     實際 baud = 16M / (16 × 104.1875) = 9600.6 ✓
+     * 例：baud=9600, PCLK2=84M
+     *     (84000000 + 4800) / 9600 = 8750 = 0x222E
+     *     拆解：MANTISSA=546, FRACTION=14
+     *     實際 baud = 84M / (16 × 546.875) = 9600 ✓
      */
     USART1->CR1 = 0;    /* 確保 disable 才能改 BRR */
     USART1->BRR = (PCLK2_HZ + baudrate / 2) / baudrate;
