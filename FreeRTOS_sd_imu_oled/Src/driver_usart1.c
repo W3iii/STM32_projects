@@ -10,17 +10,15 @@
 #include "driver_usart1.h"
 #include "stm32f407xx.h"
 #include "systick.h"
+#include "driver_rcc.h"     /* rcc_pclk2_hz()：USART1 在 APB2 */
 
 /* ========================================================================= */
 /*                          Private constants                                */
 /* ========================================================================= */
 
-/* 系統 clock = PLL 168MHz（rcc_clock_init_168mhz）。
- * USART1 在 APB2，APB2 prescaler = 2 → PCLK2 = HCLK/2 = 84MHz。
- * 注意 16-bit BRR 上限 0xFFFF → 最低 baud ≈ 84e6/16/4095 ≈ 1283，
- * 1200 以下做不到（升頻前可以、升頻後不行）。
- */
-#define PCLK2_HZ        84000000U
+/* USART1 在 APB2 → fCK = rcc_pclk2_hz()（目前 84MHz）。BRR 用它即時計算，
+ * 不再寫死頻率：改 PLL 設定後 BRR 會自動正確。
+ * 注意 16-bit BRR 上限 0xFFFF → PCLK2=84MHz 時最低 baud ≈ 1283，1200 以下做不到。 */
 
 /* Timeout 設定（ms）
  * 與 I2C driver 一樣使用 SysTick 做 timeout，避免 busy-loop 次數
@@ -198,7 +196,8 @@ void usart1_init(uint32_t baudrate)
      *     實際 baud = 84M / (16 × 546.875) = 9600 ✓
      */
     USART1->CR1 = 0;    /* 確保 disable 才能改 BRR */
-    USART1->BRR = (PCLK2_HZ + baudrate / 2) / baudrate;
+    uint32_t pclk2 = rcc_pclk2_hz();
+    USART1->BRR = (pclk2 + baudrate / 2) / baudrate;
 
     /* --- 設定 DMA2 Stream7 給 USART1_TX ---
      * 只設定固定參數（PAR、CR 大部分位元），

@@ -26,4 +26,12 @@
  */
 void rcc_clock_init_168mhz(void);
 
+/* 目前實際的匯流排頻率（Hz）。rcc_clock_init_168mhz() 內已從暫存器算好快取，
+ * 之後讀取零成本。driver 算 baud/timing 時用這些，不要再寫死頻率常數：
+ *   USART1/SPI1 在 APB2 → rcc_pclk2_hz()；I2C1 在 APB1 → rcc_pclk1_hz()。
+ * 改了 PLL 設定也不必動 driver——值是從硬體算出來的。 */
+uint32_t rcc_hclk_hz(void);    /* AHB  (HCLK)  */
+uint32_t rcc_pclk1_hz(void);   /* APB1 (PCLK1) */
+uint32_t rcc_pclk2_hz(void);   /* APB2 (PCLK2) */
+
 #endif /* DRIVER_RCC_H_ */

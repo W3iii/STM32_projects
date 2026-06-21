@@ -10,6 +10,7 @@
 #include "driver_i2c1.h"
 #include "stm32f407xx.h"
 #include "systick.h"
+#include "driver_rcc.h"     /* rcc_pclk1_hz()：I2C1 在 APB1 */
 
 /* ========================================================================= */
 /*                       Register bit definitions                            */
@@ -41,9 +42,8 @@
 /*                          Configuration                                    */
 /* ========================================================================= */
 
-/* APB1 clock (I2C1 在 APB1) — PLL 168MHz，APB1 prescaler = 4 → 42MHz。
- * CR2 FREQ / CCR / TRISE 全部從這個值推導，改這裡即可同步。 */
-#define APB1_MHZ            42U
+/* I2C1 在 APB1 → fCK = rcc_pclk1_hz()（目前 42MHz）。CR2 FREQ / CCR / TRISE
+ * 都由它即時推導（見 i2c1_init），改 PLL 設定不用再動這裡。 */
 
 /* 每個 flag 等待的 timeout（ms）
  * 100kHz 下讀 14 byte 約 1.5ms，100ms 綽綽有餘，
@@ -155,16 +155,18 @@ void i2c1_init(void)
     I2C1->CR1 |=  I2C_CR1_SWRST;
     I2C1->CR1 &= ~I2C_CR1_SWRST;
 
-    /* CR2 FREQ：告訴硬體 APB1 頻率（MHz） */
-    I2C1->CR2 = APB1_MHZ;
+    uint32_t pclk1     = rcc_pclk1_hz();           /* APB1 實際頻率（Hz）*/
+    uint32_t pclk1_mhz = pclk1 / 1000000U;         /* = 42 */
+
+    /* CR2 FREQ：告訴硬體 APB1 頻率（MHz），有效範圍 2~50 */
+    I2C1->CR2 = pclk1_mhz;
 
     /* CCR：standard mode 100kHz
-     * CCR = APB1 / (2 × I2C_speed) = 42M / (2 × 100k) = 210
-     */
-    I2C1->CCR = (APB1_MHZ * 1000000U) / (2U * 100000U);   /* = 210 */
+     * CCR = APB1 / (2 × I2C_speed) = 42M / (2 × 100k) = 210 */
+    I2C1->CCR = pclk1 / (2U * 100000U);
 
-    /* TRISE：standard mode = APB1_MHz + 1 */
-    I2C1->TRISE = APB1_MHZ + 1U;
+    /* TRISE：standard mode = APB1(MHz) + 1 */
+    I2C1->TRISE = pclk1_mhz + 1U;
 
     /* 啟用 */
     I2C1->CR1 |= I2C_CR1_PE;
