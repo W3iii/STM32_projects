@@ -145,6 +145,19 @@ usart1_status_t usart1_read_byte(uint8_t *b);
 int usart1_rx_idle_pending(void);
 
 /*
+ * 註冊 RX 通知 callback（事件驅動用）。
+ *   USART IDLE 與 DMA RX(HT/TC) 中斷觸發時，會在 ISR 脈絡呼叫此 callback。
+ *   driver 本身不依賴 RTOS：RTOS 版可在 callback 內呼叫 vTaskNotifyGiveFromISR()
+ *   喚醒 console task，讓 console 不必每 10ms 輪詢 ring buffer。
+ *   傳 NULL 取消註冊。
+ *
+ *   注意：callback 跑在 ISR 內，必須極短；且承載此 callback 的兩個 IRQ
+ *   （USART1 / DMA2_Stream2）優先權已在 usart1_init() 設為 6（>= MAX_SYSCALL），
+ *   callback 內才能安全呼叫 FreeRTOS 的 ...FromISR() API。
+ */
+void usart1_set_rx_callback(void (*cb)(void));
+
+/*
  * 查詢 RX ring buffer 有幾個 byte 可讀
  */
 uint16_t usart1_rx_available(void);

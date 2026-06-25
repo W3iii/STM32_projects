@@ -26,6 +26,7 @@
 #include "device_mpu6050.h"
 #include "FreeRTOS.h"
 #include "semphr.h"
+#include "task.h"       /* TaskHandle_t / xTaskNotifyGive */
 
 static FATFS      s_fs;
 static FIL        s_fil;
@@ -35,6 +36,8 @@ static char       s_filename[16];   /* "log_NNN.csv" + '\0' */
 static uint8_t    s_mounted;
 
 static SemaphoreHandle_t s_state_mtx;   /* 保護 s_state / s_count / s_filename */
+
+static TaskHandle_t s_producer;         /* sensor task handle；start 成功時喚醒它 */
 
 /* 診斷：保留最後一次 f_mount 的 FRESULT，方便 bootstrap 顯示掛載失敗原因
  *   1=FR_DISK_ERR、3=FR_NOT_READY → SPI/卡片硬體；13=FR_NO_FILESYSTEM → 不是 FAT32 */
@@ -117,6 +120,13 @@ int app_datalogger_start(void)
     s_count = 0;
     s_state = DL_LOGGING;
     state_unlock();
+
+    /* 事件驅動：喚醒 sensor 進 100Hz 取樣迴圈。只在 IDLE→LOGGING 成功時發。
+     * 不變量：IDLE ⟺ sensor 卡在 ulTaskNotifyTake()，所以這個通知一定接得到、
+     * 不會掉，也不會在 sensor 跑迴圈時被 latch 成假喚醒。stop 不發通知。 */
+    if (s_producer != NULL) {
+        xTaskNotifyGive(s_producer);
+    }
     return 0;
 }
 
@@ -203,4 +213,98 @@ uint32_t app_datalogger_count(void)
 const char *app_datalogger_filename(void)
 {
     return s_filename;
+}
+
+/* ───────────────── sensor 喚醒注入 ───────────────── */
+void app_datalogger_set_producer(TaskHandle_t producer)
+{
+    s_producer = producer;
+}
+
+/* ───────────────── 檔案層操作（給 CLI 用）─────────────────
+ * 全部 FatFs/SD 存取 + bus_lock 收在這裡，emit callback 在 bus_lock 內被回呼，
+ * callback 內只能碰 UART、不可碰 SD/OLED（同一支 bus_lock）。 */
+
+int dl_list(void (*emit)(const char *name, uint32_t size), uint32_t *free_kb_out)
+{
+    static DIR dir;             /* static：DIR 別放 stack */
+    FILINFO    fno;
+    int        n = 0;
+
+    bus_lock();                 /* 整段目錄掃描 + getfree 與寫卡/OLED 互斥 */
+    if (f_opendir(&dir, "/") != FR_OK) {
+        bus_unlock();
+        return -1;
+    }
+    while (f_readdir(&dir, &fno) == FR_OK && fno.fname[0] != '\0') {
+        if (fno.fattrib & AM_DIR) {
+            continue;           /* 只列檔案 */
+        }
+        if (emit) {
+            emit(fno.fname, (uint32_t)fno.fsize);
+        }
+        n++;
+    }
+    f_closedir(&dir);
+
+    if (free_kb_out) {
+        /* 剩餘空間：free clusters × 每 cluster 幾個 sector × 512 / 1024 = KB */
+        DWORD  fre_clust;
+        FATFS *fsp;
+        if (f_getfree("", &fre_clust, &fsp) == FR_OK) {
+            *free_kb_out = (uint32_t)((uint64_t)fre_clust * fsp->csize / 2);
+        } else {
+            *free_kb_out = 0;
+        }
+    }
+    bus_unlock();
+    return n;
+}
+
+int dl_dump(const char *name, void (*emit_line)(const char *line))
+{
+    static FIL f;               /* static：FIL 很大，別放 stack */
+    char       line[64];
+    int        rc = 0;
+
+    /* 整段 FatFs 讀取包在 bus_lock：和 Logger 寫卡、Display 畫 OLED 互斥
+     * （dump 期間 OLED 會短暫凍結，可接受）。 */
+    bus_lock();
+    if (f_open(&f, name, FA_READ) != FR_OK) {
+        rc = -1;
+    } else {
+        while (f_gets(line, sizeof line, &f) != 0) {
+            if (emit_line) {
+                emit_line(line);
+            }
+        }
+        f_close(&f);
+    }
+    bus_unlock();
+    return rc;
+}
+
+int dl_clear(uint32_t *deleted_out)
+{
+    char name[16];
+    int  n = 0;
+
+    /* 直接掃 000..999 unlink，避免「邊 readdir 邊 unlink」可能漏項的問題。 */
+    bus_lock();
+    for (int i = 0; i < 1000; i++) {
+        name[0] = 'l'; name[1] = 'o'; name[2] = 'g'; name[3] = '_';
+        name[4] = (char)('0' + (i / 100));
+        name[5] = (char)('0' + (i / 10) % 10);
+        name[6] = (char)('0' + (i % 10));
+        name[7] = '.'; name[8] = 'c'; name[9] = 's'; name[10] = 'v';
+        name[11] = '\0';
+        if (f_unlink(name) == FR_OK) {
+            n++;
+        }
+    }
+    bus_unlock();
+    if (deleted_out) {
+        *deleted_out = (uint32_t)n;
+    }
+    return 0;
 }

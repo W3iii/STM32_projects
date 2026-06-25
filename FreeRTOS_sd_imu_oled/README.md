@@ -2,7 +2,7 @@
 
 > STM32F407VGTX · bare-metal register-level driver · **FreeRTOS-Kernel V11.1.0 (LTS)**
 > 把 [`exp13_sd_imu_oled`](../exp13_sd_imu_oled)（co-operative super-loop）移植到 FreeRTOS，
-> 從「一個 `while(1)` 輪流做事」變成 **四個 task 並行**，展示資源競爭與同步機制。
+> 從「一個 `while(1)` 輪流做事」變成 **五個事件驅動 task 並行**，展示資源競爭與同步機制。
 
 硬體接線、SD driver、FatFs 整合與踩坑紀錄都和 exp13 相同 —— 那部分請看
 [exp13 的 README](../exp13_sd_imu_oled/README.md)。本文只談 **RTOS 移植**。
@@ -32,20 +32,26 @@
 ## Task 架構（SPEC §7）
 
 ```
- Sensor (prio4, 100Hz) ──imu_sample_t──> [ qSamples ] ──> Logger (prio3, 事件驅動)
-   I2C 讀 MPU6050                          佇列 64 筆        pop → 寫 CSV/SD (bus_lock)
-   只在 LOGGING 取樣                                          每 1s f_sync
- Display(prio1, 10Hz)   取狀態快照 → bus_lock → 畫 OLED → bus_unlock
- Console(prio2, ~10ms)  UART CLI + PA0 按鈕 → start/stop/ls/dump/clear
- bootstrap(最高, 跑一次) 周邊+掛載初始化 → 建上面四個 task → 自刪
+ Sensor (prio4, 事件驅動+100Hz) ─imu_sample_t─> [ qSamples ] ─> Logger (prio3, 事件驅動)
+   notify 喚醒 → vTaskDelayUntil 100Hz 取樣        佇列 64 筆      pop → 寫 CSV/SD (bus_lock)
+   IDLE 睡死在 ulTaskNotifyTake（0% CPU）                           每 1s f_sync
+ Display(prio1, 10Hz)    取狀態快照 → bus_lock → 畫 OLED → bus_unlock
+ Console(prio2, 事件驅動) UART RX IDLE/DMA 中斷喚醒 → app_cli_poll()：start/stop/status/ls/dump/clear
+ Button (prio2, 事件驅動) PA0 EXTI0 邊緣喚醒 → 去抖（20ms 重讀）→ toggle start/stop
+ bootstrap(最高, 跑一次)  周邊+掛載初始化 → 建上面五個 task + 接 ISR 通知接線 → 自刪
 ```
 
-| Task | 優先 | 週期 | 職責 | 同步 |
+| Task | 優先 | 觸發 | 職責 | 同步 |
 |---|---|---|---|---|
-| **Sensor** | 4（最高）| 100Hz 固定（`vTaskDelayUntil`）| 讀 MPU → 丟 Queue | Queue（生產者）|
+| **Sensor** | 4（最高）| 事件驅動：notify 喚醒後 100Hz（`vTaskDelayUntil`）| 讀 MPU → 丟 Queue | Queue（生產者）+ task notify |
 | **Logger** | 3 | 事件驅動（等 Queue）| Queue → 累積/寫 SD、定期 sync | Queue（消費者）+ bus mutex |
-| **Console** | 2 | ~10ms 輪詢 | UART CLI、按鈕去抖 | bus mutex（FatFs 指令）|
+| **Console** | 2 | 事件驅動（UART RX IDLE/DMA notify）| UART CLI | bus mutex（經 `dl_*` 委派）|
+| **Button** | 2 | 事件驅動（EXTI0 邊緣 notify）| 去抖 → toggle start/stop | 走 `app_datalogger` API |
 | **Display** | 1（最低）| ~10Hz | 狀態快照 → 更新 OLED | bus mutex + state mutex |
+
+> **全系統事件驅動**：除了 Display 固定 10Hz 刷畫面，其餘 task 平時都 block 在通知上、
+> 0% CPU；UART/EXTI 的 ISR 與 `start()` 用 `...NotifyGive` 把對應 task 喚醒。狀態旗標
+> （`DL_IDLE/LOGGING`）只剩「被查詢」職責，沒有任何 task 在輪詢它。
 
 ---
 
@@ -87,11 +93,38 @@ FatFs → SD → SPI1 是同一條路，OLED 也掛在 SPI1 上。**一支 `mBus
   `delay_ms()`→`vTaskDelay()`，上層 driver 一行不用改。
 - 所有初始化移進 task（排程器啟動後 `delay_ms` 才有效）。
 
-**Phase 2 — 拆成四個 task（本版）**
+**Phase 2 — 拆成四個 task**
 - `app_datalogger` 拆「取樣 / 寫入」：刪 `tick()`，加 `write_sample()` / `sync()` / `get_status()`，
   FatFs 操作內建 `bus_lock`、狀態用 `mState`。
 - 新增 `app_tasks.c`：Queue / mutex / 四個 task body + bootstrap。
 - `main.c` 瘦成 `app_tasks_start()` + `vTaskStartScheduler()`。
+
+**Phase 3 — 從輪詢到事件驅動（本版）**
+
+把「定期醒來檢查」改成「有事才被喚醒」，平時 0% CPU。
+
+- **Button 獨立成第 5 個 task + EXTI 外部中斷**（`app_button.c`）：PA0（Discovery B1，
+  active-high）的 rising edge 走 **EXTI0** 中斷。ISR 只做兩件事 —— 清 pending +
+  `vTaskNotifyGiveFromISR` 喚醒 button task。**去抖刻意不放 ISR**：邊緣只當「該去看一下」
+  的觸發，真正去抖（等 ~20ms 接點沉澱後重讀電位，仍按著才採信）放在被喚醒的 task 脈絡，
+  那裡才能安全 `vTaskDelay`、也能呼叫會走 FatFs 的 start/stop。平時 block，0% CPU。
+- **Console 改 UART RX IDLE / DMA 喚醒**：不再每 10ms 輪詢 RX ring buffer。USART **IDLE
+  line 中斷**（一筆傳輸結束）與 DMA RX 半滿/全滿中斷在 ISR 內 `vTaskNotifyGiveFromISR`
+  喚醒 console，醒來一次把 buffer 抽乾、跑完所有完整指令。
+- **Sensor 也改 notify 驅動**：平時 block 在 `ulTaskNotifyTake`（IDLE 0% CPU、0 次取樣）；
+  `app_datalogger_start()` 成功從 IDLE→LOGGING 時 `xTaskNotifyGive` 喚醒它進 100Hz 內層
+  迴圈；stop 翻狀態，內層迴圈下次檢查就退出、回頂端睡死。
+- **ISR→task 通知接線**集中在 bootstrap，且**在 task 建立之後**才註冊 callback；註冊前若有
+  中斷觸發，driver 內 callback 指標還是 NULL，只清旗標/pending，安全。承載 `...FromISR`
+  的三個 IRQ（USART1 / DMA2_Stream2 / EXTI0）優先權都設 **6 ≥ `configMAX_SYSCALL_INTERRUPT_PRIORITY`(5)**，
+  ISR 內才能合法呼叫 FreeRTOS 的 `...FromISR` API。
+- **CLI 與 FatFs 解耦**：`app_cli.c` 不再 include `ff.h`、也不再自己持 `bus_lock`；所有卡片
+  存取改走 `app_datalogger` 的 `dl_dump` / `dl_list` / `dl_clear`（callback 串流輸出），
+  鎖與 FatFs 全收進 datalogger，CLI 只負責「讀哪個檔」與排版。
+- **故障可視化**：`vApplicationMallocFailedHook` / `StackOverflowHook` / `configASSERT`
+  從靜默死迴圈改成**先從 UART 印原因再卡住** —— heap 剩量（`freeNow`/`minEver`，幫你定
+  `configTOTAL_HEAP_SIZE`）、爆 stack 的 task 名、assert 的檔案:行號。輸出只用 polling UART
+  （poll TXE），不靠中斷/DMA/RTOS，所以排程死掉或關中斷後仍送得出去。
 
 ---
 
@@ -99,12 +132,14 @@ FatFs → SD → SPI1 是同一條路，OLED 也掛在 SPI1 上。**一支 `mBus
 
 | 檔案 | 說明 |
 |---|---|
-| `Src/app_tasks.c` · `Inc/app_tasks.h` | **新增**：四 task + Queue + `mBus` + `bus_lock()` |
-| `Src/app_datalogger.c` | 拆取樣/寫入、加鎖、狀態快照（`mState`）|
-| `Src/app_cli.c` | `ls/dump/clear` 包 `bus_lock`；`status` 讀快照、印 `overruns` |
-| `Src/main.c` | 瘦身成建 task + 啟動排程器 |
+| `Src/app_tasks.c` · `Inc/app_tasks.h` | **新增**：五 task + Queue + `mBus` + `bus_lock()` + ISR→task 通知接線 |
+| `Src/app_button.c` · `Inc/app_button.h` | **新增**：PA0 EXTI0 事件驅動按鈕 driver（去抖留給上層 task）|
+| `Src/app_datalogger.c` | 拆取樣/寫入、加鎖、狀態快照（`mState`）；卡片存取 API `dl_dump/dl_list/dl_clear`；`start()` notify 喚醒 sensor |
+| `Src/app_cli.c` | 解耦：不碰 `ff.h`/`bus_lock`，`ls/dump/clear` 委派 `dl_*`；`status` 讀快照、印 `overruns` |
+| `Src/driver_usart1.c` | RX IDLE/DMA 中斷 → callback 喚醒 console（事件驅動）|
+| `Src/main.c` | 建 task + 啟動排程器；panic hook（malloc/stack/assert）從 UART 印故障 |
 | `Src/systick.c` | 時間基準改接 FreeRTOS tick |
-| `Inc/FreeRTOSConfig.h` | **新增**：CM4F 設定、handler alias、heap 20KB |
+| `Inc/FreeRTOSConfig.h` | **新增**：CM4F 設定、handler alias、heap 28KB、`configASSERT`→`vAssertCalled` |
 | `Src/{tasks,queue,list,timers,port,heap_4}.c` 等 | **新增**：vendored FreeRTOS-Kernel V11.1.0 |
 
 ---
@@ -112,13 +147,15 @@ FatFs → SD → SPI1 是同一條路，OLED 也掛在 SPI1 上。**一支 `mBus
 ## 建置 / 執行
 
 1. STM32CubeIDE 開專案 → Build（managed build 自動納入 `Src/` 下所有 `.c`，含 kernel）。
-2. 燒錄，UART 接 1200 baud，會看到：
+2. 燒錄，UART 接 **115200** baud（USART1 = PB6/PB7，接 CP2102），會看到：
    ```
-   === IMU datalogger (FreeRTOS, 4 tasks) ===
+   === IMU datalogger (FreeRTOS, 5 tasks) ===
    [OK]   sensors + FAT32 ready
    CLI ready: start | stop | status | dump [file] | ls | clear
    ```
-3. CLI / 按鈕操作同 exp13；`status` 多一行 `overruns=`（觀察佇列是否掉拍，理想 0）。
+3. CLI 打指令或按 **PA0（B1）** 都能 toggle start/stop；`status` 多一行 `overruns=`
+   （觀察佇列是否掉拍，理想 0）。
+4. 若 heap/stack 不夠，UART 會印 `[PANIC] ...` / `[ASSERT] file:line` 指出原因，不再靜默卡死。
 
 ---
 

@@ -1,18 +1,25 @@
 /*
  * app_tasks.c
  *
- *  FreeRTOS 四 task 架構（SPEC §7）。把 Phase 1 的單一 super-loop 拆成：
+ *  FreeRTOS task 架構。把 Phase 1 的單一 super-loop 拆成事件驅動的多 task：
  *
- *    Sensor (prio4, 100Hz, vTaskDelayUntil)
- *        └ 只在 LOGGING 時讀 MPU6050 → xQueueSend(qSamples)
- *           佇列滿 → 計 overrun（不阻塞，保住取樣節奏，SPEC §7.2-2）
+ *    Sensor (prio4, 事件驅動 + 100Hz cadence)
+ *        └ 平時 block 在 ulTaskNotifyTake；start 喚醒 → 進 vTaskDelayUntil 100Hz
+ *           迴圈讀 MPU6050 → xQueueSend(qSamples)；stop 後退回睡死（IDLE 時 0% CPU）
+ *           佇列滿 → 計 overrun（不阻塞，保住取樣節奏）
  *    Logger (prio3, 事件驅動)
  *        └ xQueueReceive → app_datalogger_write_sample()；每 1s sync
  *           唯一主要寫卡者；FatFs 操作走 bus_lock（SPI1 互斥）
  *    Display(prio1, 10Hz)
  *        └ 取狀態快照 → bus_lock → 畫 OLED → bus_unlock
- *    Console(prio2, ~10ms)
- *        └ app_cli_poll() + app_button_poll()；按鈕 toggle start/stop
+ *    Console(prio2, 事件驅動)
+ *        └ block 在 UART RX 通知（USART IDLE / DMA HT-TC）；醒來 app_cli_poll()
+ *    Button(prio2, 事件驅動)
+ *        └ block 在 EXTI0 邊緣通知；去抖（延遲後重讀）確認 → toggle start/stop
+ *
+ *  事件接線：UART/EXTI 的 ISR 在「優先權 6（>= MAX_SYSCALL）」呼叫 ...FromISR()
+ *  喚醒對應 task；start() 用 xTaskNotifyGive 喚醒 sensor。狀態（DL_IDLE/LOGGING）
+ *  只剩「被查詢」職責（Display/CLI status），不再被任何 task 輪詢。
  *
  *  共用資源與同步：
  *    qSamples : Sensor→Logger 佇列（producer/consumer 解耦，抗 SD stall）
@@ -43,21 +50,23 @@
 /* ---- task 參數 ---- */
 #define SENSOR_PERIOD_MS     10          /* 100Hz */
 #define DISPLAY_PERIOD_MS    100         /* ~10Hz */
-#define CONSOLE_PERIOD_MS    10          /* CLI 取字 + 按鈕去抖輪詢 */
 #define LOGGER_SYNC_MS       1000        /* 每秒 f_sync */
+#define BTN_DEBOUNCE_MS      20          /* EXTI 喚醒後等接點沉澱，再重讀電位確認 */
 
 #define QSAMPLES_LEN         64          /* 64 × 16B ≈ 640ms 緩衝 */
 
 #define PRIO_SENSOR          4
 #define PRIO_LOGGER          3
 #define PRIO_CONSOLE         2
+#define PRIO_BUTTON          2          /* 與 console 同級；按鈕事件不需搶先 sensor/logger */
 #define PRIO_DISPLAY         1
 #define PRIO_BOOTSTRAP       (configMAX_PRIORITIES - 1)   /* 先跑完初始化 */
 
 #define STACK_SENSOR         256
 #define STACK_LOGGER         1024        /* FatFs + f_printf 吃 stack */
 #define STACK_DISPLAY        256
-#define STACK_CONSOLE        1024        /* ls/dump/clear 走 FatFs */
+#define STACK_CONSOLE        1024        /* ls/dump/clear 經 dl_* 走 FatFs */
+#define STACK_BUTTON         768         /* toggle→start/stop 會走 FatFs；保守值，可用 high-water-mark 量測後縮小 */
 #define STACK_BOOTSTRAP      1024        /* f_mount 走 FatFs */
 
 /* ---- 同步原語 ---- */
@@ -70,25 +79,57 @@ void bus_unlock(void) { xSemaphoreGive(s_mBus); }
 
 uint32_t app_tasks_overruns(void) { return s_overruns; }
 
-/* ───────────────── Sensor task ───────────────── */
+/* ---- task handles（ISR 與 datalogger 的通知目標）---- */
+static TaskHandle_t s_sensor;     /* start 成功時被喚醒，進 100Hz 取樣迴圈 */
+static TaskHandle_t s_console;    /* UART RX(IDLE / DMA HT-TC) 事件喚醒 */
+static TaskHandle_t s_button;     /* EXTI0 邊緣喚醒 */
+
+/* ---- ISR → task 通知 callback（跑在 ISR 脈絡）----
+ * 注入給 driver（usart1 / app_button）。承載這些 callback 的 IRQ 優先權已在各自
+ * driver 的 init 設為 6（>= configMAX_SYSCALL_INTERRUPT_PRIORITY），故可安全
+ * 呼叫 ...FromISR()。woken=pdTRUE 時 portYIELD_FROM_ISR 會在離開 ISR 時直接
+ * 切到被喚醒的高優先 task，省掉一次排程延遲。 */
+static void on_uart_rx_isr(void)
+{
+    BaseType_t woken = pdFALSE;
+    vTaskNotifyGiveFromISR(s_console, &woken);
+    portYIELD_FROM_ISR(woken);
+}
+
+static void on_button_isr(void)
+{
+    BaseType_t woken = pdFALSE;
+    vTaskNotifyGiveFromISR(s_button, &woken);
+    portYIELD_FROM_ISR(woken);
+}
+
+/* ───────────────── Sensor task ─────────────────
+ * 事件驅動：平時 block 在 ulTaskNotifyTake（IDLE 時 0% CPU，0 次取樣）。
+ * app_datalogger_start() 成功時 xTaskNotifyGive 把它喚醒 → 進 100Hz 內層迴圈；
+ * stop 把狀態翻回 IDLE，內層迴圈下次檢查就退出、回頂端睡死。
+ * 不變量：IDLE ⟺ sensor 卡在頂端的 ulTaskNotifyTake，所以 start 的通知一定接得到。 */
 static void sensor_task(void *arg)
 {
     (void)arg;
-    TickType_t next = xTaskGetTickCount();
     for (;;) {
-        vTaskDelayUntil(&next, pdMS_TO_TICKS(SENSOR_PERIOD_MS));
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);     /* 等 start 通知；睡死 */
 
-        if (app_datalogger_state() != DL_LOGGING) {
-            continue;                       /* 沒在記錄就不取樣（省 I2C/功耗）*/
+        TickType_t next = xTaskGetTickCount();       /* 進迴圈才取基準 → 節奏乾淨 */
+        while (app_datalogger_state() == DL_LOGGING) {
+            vTaskDelayUntil(&next, pdMS_TO_TICKS(SENSOR_PERIOD_MS));
+            if (app_datalogger_state() != DL_LOGGING) {
+                break;                               /* stop 落在這次等待中：不取這筆 */
+            }
+
+            imu_sample_t s;
+            s.t_ms = systick_get_ms();
+            mpu6050_read_all(&s.acc, &s.gyro);
+
+            if (xQueueSend(s_qSamples, &s, 0) != pdTRUE) {
+                s_overruns++;                        /* 佇列滿：丟一筆，但不拖慢取樣 */
+            }
         }
-
-        imu_sample_t s;
-        s.t_ms = systick_get_ms();
-        mpu6050_read_all(&s.acc, &s.gyro);
-
-        if (xQueueSend(s_qSamples, &s, 0) != pdTRUE) {
-            s_overruns++;                   /* 佇列滿：丟一筆，但不拖慢取樣 */
-        }
+        /* 迴圈退出 = 已 stop，回頂端 ulTaskNotifyTake 睡死 */
     }
 }
 
@@ -135,8 +176,8 @@ static void display_task(void *arg)
     }
 }
 
-/* ───────────────── Console task ───────────────── */
-/* 按鈕按下 → 切換記錄狀態。OLED 由 Display task 反映，這裡補 UART 回饋。 */
+/* ───────────────── Console / Button tasks ───────────────── */
+/* start/stop 切換（CLI 與按鈕共用）。OLED 由 Display task 反映，這裡補 UART 回饋。 */
 static void toggle_logging(void)
 {
     if (app_datalogger_state() == DL_LOGGING) {
@@ -155,25 +196,33 @@ static void console_task(void *arg)
 {
     (void)arg;
     for (;;) {
-        app_cli_poll();                     /* 取 UART、執行指令（內部自鎖 FatFs）*/
-        if (app_button_poll(systick_get_ms())) {
-            toggle_logging();
-        }
-        vTaskDelay(pdMS_TO_TICKS(CONSOLE_PERIOD_MS));
+        /* 事件驅動：睡到有 UART 事件（USART IDLE 或 DMA RX 半滿/全滿）才醒，
+         * 不再每 10ms 輪詢。醒來一次把 ring buffer 抽乾、跑完所有完整指令。 */
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        app_cli_poll();                     /* 內部委派 dl_* 走 FatFs，CLI 不自鎖 */
     }
 }
 
-/* 診斷小工具：把一個 byte 以兩位十六進位印到 UART */
-static void uart_hex(uint8_t b)
+/* ───────────────── Button task ─────────────────
+ * 事件驅動 + 去抖。EXTI0 邊緣（on_button_isr）喚醒；平時 block，0% CPU。
+ * 去抖放在這裡而非 ISR：等接點沉澱後重讀電位，仍按著才採信 → 同時濾掉按下
+ * 與放開的彈跳。toggle_logging 會走 FatFs（start/stop），在 task 脈絡才安全。 */
+static void button_task(void *arg)
 {
-    static const char H[] = "0123456789ABCDEF";
-    char s[2] = { H[(b >> 4) & 0xF], H[b & 0xF] };
-    usart1_send((const uint8_t *)s, 2);
+    (void)arg;
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);     /* 等 EXTI 邊緣 */
+        vTaskDelay(pdMS_TO_TICKS(BTN_DEBOUNCE_MS));  /* 讓接點彈跳沉澱 */
+        if (app_button_is_down()) {                  /* 沉澱後仍按著才是真的按下 */
+            toggle_logging();
+        }
+        ulTaskNotifyTake(pdTRUE, 0);                 /* 清掉彈跳/放開期間累積的通知 */
+    }
 }
 
 /* ───────────────── Bootstrap task ─────────────────
  * 初始化集中在這裡：跑在排程器啟動後（delay_ms = vTaskDelay 才有效），
- * 完成後建立四個工作 task，再把自己刪掉。 */
+ * 完成後建立五個工作 task、接好通知接線，再把自己刪掉。 */
 static void bootstrap_task(void *arg)
 {
     (void)arg;
@@ -186,7 +235,7 @@ static void bootstrap_task(void *arg)
     ssd1306_init();               // OLED
     delay_ms(10);
 
-    usart1_send_string("\r\n=== IMU datalogger (FreeRTOS, 4 tasks) ===\r\n");
+    usart1_send_string("\r\n=== IMU datalogger (FreeRTOS, 5 tasks) ===\r\n");
 
     /* ---- Application 初始化（MPU6050 + 掛載 FAT32）---- */
     int rc = app_datalogger_init();
@@ -201,12 +250,6 @@ static void bootstrap_task(void *arg)
         usart1_send_string("[FATAL] FAT32 mount failed, FRESULT=");
         char num[4] = { (char)('0' + (mr / 10) % 10), (char)('0' + mr % 10), '\r', '\n' };
         usart1_send((const uint8_t *)num, 4);
-        /* ---- SD 原始回應 dump（v2.5 韌體標記）---- */
-        usart1_send_string("[SD] init_rc="); uart_hex(sd_last_init_rc);
-        usart1_send_string(" CMD8 r1="); uart_hex(sd_last_r1);
-        usart1_send_string(" r7=");
-        uart_hex(sd_r7[0]); uart_hex(sd_r7[1]); uart_hex(sd_r7[2]); uart_hex(sd_r7[3]);
-        usart1_send_string("  (good: r1=01 r7=000001AA)\r\n");
         ssd1306_clear();
         ssd1306_draw_string(0, 0, "FS FAIL");
         ssd1306_draw_string(0, 16, "FRES:");
@@ -222,13 +265,23 @@ static void bootstrap_task(void *arg)
     usart1_send_string("[OK]   sensors + FAT32 ready\r\n");
 
     app_cli_init();
-    app_button_init();            // PA0 user button：按一下切換 start/stop
+    app_button_init();            // PA0 user button → EXTI0（rising edge）：按一下切換 start/stop
 
-    /* ---- 建立四個工作 task ---- */
-    xTaskCreate(sensor_task,  "sensor",  STACK_SENSOR,  NULL, PRIO_SENSOR,  NULL);
+    /* ---- 建立工作 task（接出 handle 給 ISR / datalogger 當通知目標）---- */
+    xTaskCreate(sensor_task,  "sensor",  STACK_SENSOR,  NULL, PRIO_SENSOR,  &s_sensor);
     xTaskCreate(logger_task,  "logger",  STACK_LOGGER,  NULL, PRIO_LOGGER,  NULL);
     xTaskCreate(display_task, "display", STACK_DISPLAY, NULL, PRIO_DISPLAY, NULL);
-    xTaskCreate(console_task, "console", STACK_CONSOLE, NULL, PRIO_CONSOLE, NULL);
+    xTaskCreate(console_task, "console", STACK_CONSOLE, NULL, PRIO_CONSOLE, &s_console);
+    xTaskCreate(button_task,  "button",  STACK_BUTTON,  NULL, PRIO_BUTTON,  &s_button);
+
+    /* ---- 接上 ISR / 狀態機的通知接線（必須在 task 建立後）----
+     * bootstrap 跑在最高優先權，會一路執行到 vTaskDelete 才讓出 CPU；因此在這裡
+     * 完成註冊前，console/button/sensor 都還沒機會跑、也沒有人能觸發 start，
+     * 不會發生「通知一個還沒接好的目標」。註冊前若有 UART/EXTI 中斷觸發，
+     * driver 內的 callback 指標還是 NULL，只會清旗標/pending，安全。 */
+    usart1_set_rx_callback(on_uart_rx_isr);   // UART RX 事件（IDLE / DMA HT-TC）→ 喚醒 console
+    app_button_set_callback(on_button_isr);   // EXTI0 邊緣 → 喚醒 button
+    app_datalogger_set_producer(s_sensor);    // start 成功 → 喚醒 sensor 進取樣迴圈
 
     vTaskDelete(NULL);            // 初始化完成，bootstrap 退場
 }

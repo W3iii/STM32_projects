@@ -18,6 +18,8 @@
 
 #include <stdint.h>
 #include "device_mpu6050.h"
+#include "FreeRTOS.h"
+#include "task.h"       /* TaskHandle_t（sensor 喚醒用）*/
 
 typedef enum {
     DL_IDLE = 0,   /* 待命，沒在記錄 */
@@ -62,5 +64,31 @@ uint32_t    app_datalogger_count(void);
 /* 目前/上一個檔名。只有 Console（start）會寫，Console 自己讀安全；
  * 跨 task 讀請改用 app_datalogger_get_status()。 */
 const char *app_datalogger_filename(void);
+
+/* ── sensor 喚醒注入 ──
+ * 把 sensor task 的 handle 交給本模組。app_datalogger_start() 成功從 IDLE
+ * 轉成 LOGGING 時，會用它 xTaskNotifyGive() 喚醒 sensor 進取樣迴圈；
+ * sensor 平時 block 在 ulTaskNotifyTake()，不再輪詢狀態旗標。
+ * stop 不需通知：sensor 內層迴圈下次檢查狀態就自行退出。 */
+void app_datalogger_set_producer(TaskHandle_t producer);
+
+/* ── 檔案層操作（給 CLI / console 用）──
+ * 把所有 FatFs/SD 存取與 bus_lock 收進本模組，CLI 不再直接碰 ff.h / bus_lock。
+ *
+ * 重要：emit 類 callback 會在「本模組持有 bus_lock 期間」被回呼。callback 內
+ *       只能做 UART（usart1_*）等「不在 SPI bus 上」的事，絕對不可再碰 SD 或
+ *       OLED（共用同一支 bus_lock）→ 會重入死鎖。
+ */
+
+/* 列出根目錄所有檔案，每個檔呼叫一次 emit(name,size)；free_kb_out 取回剩餘 KB
+ * （傳 NULL 可不取）。回傳檔案數 / <0=opendir 失敗。 */
+int dl_list(void (*emit)(const char *name, uint32_t size), uint32_t *free_kb_out);
+
+/* 把 name 這個檔讀回來，每一行呼叫一次 emit_line(line)。回傳 0=OK / <0=open 失敗。
+ * 注意：記錄中的 session 檔正開著寫，dump 它請先 stop（呼叫端自行判斷）。 */
+int dl_dump(const char *name, void (*emit_line)(const char *line));
+
+/* 刪掉所有 log_NNN.csv（NNN=000..999）。deleted_out 取回刪除數（可 NULL）。回傳 0。 */
+int dl_clear(uint32_t *deleted_out);
 
 #endif /* APP_DATALOGGER_H_ */

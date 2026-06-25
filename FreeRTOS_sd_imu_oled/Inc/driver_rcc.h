@@ -19,6 +19,8 @@
 #ifndef DRIVER_RCC_H_
 #define DRIVER_RCC_H_
 
+#include <stdint.h>     /* rcc_*_hz() 回傳 uint32_t */
+
 /*
  * HSE 8MHz → 168MHz。內含：HSE 起振、PWR VOS scale1、flash 5WS + cache、
  * bus 分頻（APB1/4、APB2/2）、PLL(M=8,N=336,P=2,Q=7) 起振、切 SYSCLK 到 PLL。

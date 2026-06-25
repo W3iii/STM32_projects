@@ -12,10 +12,11 @@
 
 #include "app_cli.h"
 #include "app_datalogger.h"
-#include "app_tasks.h"          /* bus_lock / bus_unlock、overrun 計數 */
+#include "app_tasks.h"          /* app_tasks_overruns（status 用）*/
 #include "driver_usart1.h"
-#include "ff.h"
 #include <string.h>
+/* 注意：本檔不再 #include "ff.h"、也不再呼叫 bus_lock —— 所有 FatFs/SD 存取
+ * 都委派給 app_datalogger 的 dl_list/dl_dump/dl_clear，CLI 只負責解析與印字。 */
 
 static char    s_line[32];
 static uint8_t s_idx;
@@ -56,14 +57,26 @@ static void cli_status(void)
     usart1_send_string("\r\n");
 }
 
+/* dl_dump 的 per-line 回呼：把一行印到 UART，行尾 \n 補 \r 才不會階梯。
+ * 注意：此函式由 dl_dump() 在「持有 bus_lock 期間」回呼 → 只能碰 UART，
+ * 不可碰 SD/OLED（同一支 bus_lock）。 */
+static void cli_emit_line(const char *line)
+{
+    for (const char *p = line; *p; p++) {
+        if (*p == '\n') {
+            usart1_send_byte('\r');
+        }
+        usart1_send_byte((uint8_t)*p);
+    }
+}
+
 /* 把一個 CSV 從卡讀回來印到 UART（沒讀卡機也能驗證）。
  *   dump        → 本次 session 剛錄/上一個檔（app_datalogger_filename()）
  *   dump <file> → 指定檔名（配 ls 用，可印上一輪開機留下的 log）
- * 無參數版需要先 stop（記錄中檔案被開著寫，不重複開）。 */
+ * 無參數版需要先 stop（記錄中檔案被開著寫，不重複開）。
+ * 實際 FatFs 讀取在 app_datalogger 的 dl_dump() 內、包在 bus_lock 裡。 */
 static void cli_dump(const char *arg)
 {
-    static FIL f;            /* static：FIL 很大，別放 stack */
-    char line[64];
     const char *fn;
 
     if (arg[0] != '\0') {
@@ -79,96 +92,56 @@ static void cli_dump(const char *arg)
             return;
         }
     }
-    /* 整段 FatFs 讀取包在 bus_lock：和 Logger 寫卡、Display 畫 OLED 互斥
-     * （dump 期間 OLED 會短暫凍結，可接受）。 */
-    bus_lock();
-    if (f_open(&f, fn, FA_READ) != FR_OK) {
-        bus_unlock();
-        usart1_send_string("open failed\r\n");
-        return;
-    }
+
     usart1_send_string("--- ");
     usart1_send_string(fn);
     usart1_send_string(" ---\r\n");
-    while (f_gets(line, sizeof line, &f) != 0) {
-        for (char *p = line; *p; p++) {     /* 行尾 \n 補 \r 才不會階梯 */
-            if (*p == '\n') {
-                usart1_send_byte('\r');
-            }
-            usart1_send_byte((uint8_t)*p);
-        }
+    if (dl_dump(fn, cli_emit_line) != 0) {
+        usart1_send_string("open failed\r\n");
+        return;
     }
-    f_close(&f);
-    bus_unlock();
     usart1_send_string("--- end ---\r\n");
 }
 
-/* 列出根目錄的檔案 + 大小，再印剩餘空間。像真的設備 console。 */
+/* dl_list 的 per-file 回呼：印檔名 + 大小。同樣在 bus_lock 期間被回呼，只碰 UART。 */
+static void cli_emit_file(const char *name, uint32_t size)
+{
+    usart1_send_string("  ");
+    usart1_send_string(name);
+    usart1_send_string("  ");
+    cli_print_u32(size);
+    usart1_send_string(" B\r\n");
+}
+
+/* 列出根目錄的檔案 + 大小，再印剩餘空間。像真的設備 console。
+ * 目錄掃描 + getfree 都在 dl_list() 內、包在 bus_lock 裡。 */
 static void cli_ls(void)
 {
-    static DIR  dir;            /* static：別放 stack */
-    FILINFO     fno;
-    int         n = 0;
-
-    bus_lock();                 /* 整段目錄掃描 + getfree 與寫卡/OLED 互斥 */
-    if (f_opendir(&dir, "/") != FR_OK) {
-        bus_unlock();
+    uint32_t free_kb = 0;
+    int n = dl_list(cli_emit_file, &free_kb);
+    if (n < 0) {
         usart1_send_string("opendir failed\r\n");
         return;
     }
-    while (f_readdir(&dir, &fno) == FR_OK && fno.fname[0] != '\0') {
-        if (fno.fattrib & AM_DIR) {
-            continue;           /* 只列檔案 */
-        }
-        usart1_send_string("  ");
-        usart1_send_string(fno.fname);
-        usart1_send_string("  ");
-        cli_print_u32((uint32_t)fno.fsize);
-        usart1_send_string(" B\r\n");
-        n++;
-    }
-    f_closedir(&dir);
     if (n == 0) {
         usart1_send_string("  (no files)\r\n");
     }
-
-    /* 剩餘空間：free clusters × 每 cluster 幾個 sector × 512 / 1024 = KB */
-    DWORD   fre_clust;
-    FATFS  *fsp;
-    if (f_getfree("", &fre_clust, &fsp) == FR_OK) {
-        usart1_send_string("free: ");
-        cli_print_u32((uint32_t)((uint64_t)fre_clust * fsp->csize / 2));
-        usart1_send_string(" KB\r\n");
-    }
-    bus_unlock();
+    usart1_send_string("free: ");
+    cli_print_u32(free_kb);
+    usart1_send_string(" KB\r\n");
 }
 
-/* 刪掉所有 log_NNN.csv（重複 demo 前清場用）。直接掃 000..999 unlink，
- * 避免「邊 readdir 邊 unlink」可能漏項的問題。 */
+/* 刪掉所有 log_NNN.csv（重複 demo 前清場用）。實際 unlink 迴圈在 dl_clear()。 */
 static void cli_clear(void)
 {
-    char name[16];
-    int  n = 0;
-
     if (app_datalogger_state() == DL_LOGGING) {
         usart1_send_string("stop first\r\n");
         return;
     }
-    bus_lock();                 /* 一連串 f_unlink 與寫卡/OLED 互斥 */
-    for (int i = 0; i < 1000; i++) {
-        name[0] = 'l'; name[1] = 'o'; name[2] = 'g'; name[3] = '_';
-        name[4] = (char)('0' + (i / 100));
-        name[5] = (char)('0' + (i / 10) % 10);
-        name[6] = (char)('0' + (i % 10));
-        name[7] = '.'; name[8] = 'c'; name[9] = 's'; name[10] = 'v';
-        name[11] = '\0';
-        if (f_unlink(name) == FR_OK) {
-            n++;
-        }
-    }
-    bus_unlock();
+    uint32_t deleted = 0;
+    dl_clear(&deleted);
     usart1_send_string("deleted ");
-    cli_print_u32((uint32_t)n);
+    cli_print_u32(deleted);
     usart1_send_string(" files\r\n");
 }
 

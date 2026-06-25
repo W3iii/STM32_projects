@@ -10,15 +10,17 @@
 #include "driver_usart1.h"
 #include "stm32f407xx.h"
 #include "systick.h"
-#include "driver_rcc.h"     /* rcc_pclk2_hz()：USART1 在 APB2 */
 
 /* ========================================================================= */
 /*                          Private constants                                */
 /* ========================================================================= */
 
-/* USART1 在 APB2 → fCK = rcc_pclk2_hz()（目前 84MHz）。BRR 用它即時計算，
- * 不再寫死頻率：改 PLL 設定後 BRR 會自動正確。
- * 注意 16-bit BRR 上限 0xFFFF → PCLK2=84MHz 時最低 baud ≈ 1283，1200 以下做不到。 */
+/* 系統 clock = PLL 168MHz（rcc_clock_init_168mhz）。
+ * USART1 在 APB2，APB2 prescaler = 2 → PCLK2 = HCLK/2 = 84MHz。
+ * 注意 16-bit BRR 上限 0xFFFF → 最低 baud ≈ 84e6/16/4095 ≈ 1283，
+ * 1200 以下做不到（升頻前可以、升頻後不行）。
+ */
+#define PCLK2_HZ        84000000U
 
 /* Timeout 設定（ms）
  * 與 I2C driver 一樣使用 SysTick 做 timeout，避免 busy-loop 次數
@@ -63,6 +65,10 @@ static          uint8_t rx_tail = 0;   /* main reads, only main advances */
  * 而不是不斷 polling rx_available()。
  */
 static volatile int rx_idle_flag = 0;
+
+/* RX 通知 callback：USART IDLE / DMA RX(HT/TC) ISR 觸發時呼叫（ISR 脈絡）。
+ * 由 app 層用 usart1_set_rx_callback() 注入，driver 不認識 RTOS。 */
+static void (*s_rx_cb)(void) = 0;
 
 /* 計算 DMA 目前寫到哪（= ring buffer head）
  * NDTR counts down: 128 → 127 → ... → 1 → 128（circular reload）
@@ -136,6 +142,7 @@ void DMA2_Stream2_IRQHandler(void)
     if (lisr & (DMA_HTIF_STREAM2 | DMA_TCIF_STREAM2)) {
         DMA2->LIFCR = DMA_HTIF_STREAM2 | DMA_TCIF_STREAM2;  /* 清除已觸發的 flag */
         rx_idle_flag = 1;  /* 與 USART IDLE ISR 共用同一個通知機制 */
+        if (s_rx_cb) s_rx_cb();   /* 事件驅動：喚醒 console task（連續流、IDLE 還沒到時也能醒）*/
     }
 }
 
@@ -152,6 +159,7 @@ void USART1_IRQHandler(void)
     if (sr & USART_SR_IDLE) {
         (void)USART1->DR;   /* 讀 DR 清除 IDLE flag（必須先讀 SR 再讀 DR）*/
         rx_idle_flag = 1;   /* 通知 main loop：有新資料可以 parse */
+        if (s_rx_cb) s_rx_cb();   /* 事件驅動：一段輸入結束就喚醒 console task */
     }
 }
 
@@ -196,8 +204,7 @@ void usart1_init(uint32_t baudrate)
      *     實際 baud = 84M / (16 × 546.875) = 9600 ✓
      */
     USART1->CR1 = 0;    /* 確保 disable 才能改 BRR */
-    uint32_t pclk2 = rcc_pclk2_hz();
-    USART1->BRR = (pclk2 + baudrate / 2) / baudrate;
+    USART1->BRR = (PCLK2_HZ + baudrate / 2) / baudrate;
 
     /* --- 設定 DMA2 Stream7 給 USART1_TX ---
      * 只設定固定參數（PAR、CR 大部分位元），
@@ -240,13 +247,27 @@ void usart1_init(uint32_t baudrate)
     USART1->CR3 = USART_CR3_DMAT | USART_CR3_DMAR;
     USART1->CR1 = USART_CR1_UE | USART_CR1_TE | USART_CR1_RE | USART_CR1_IDLEIE;
 
-    /* --- 開 NVIC --- */
+    /* --- 開 NVIC ---
+     * USART1(IDLE) 與 DMA2_Stream2(RX HT/TC) 現在會在 ISR 內呼叫 s_rx_cb
+     * → 可能呼叫 FreeRTOS ...FromISR()。依 FreeRTOSConfig.h 規定，這兩個 IRQ
+     * 的優先權數值必須 >= configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY(=5)，
+     * 否則在 ISR 內呼叫核心 API 會踩 configASSERT。設為 6（邏輯上較低優先）。
+     * DMA2_Stream7(TX) 只設 dma_idle、不碰 RTOS，沿用預設 priority 0 即可。 */
+    NVIC_SetPriority(IRQ_DMA2_Stream2, 6);
+    NVIC_SetPriority(IRQ_USART1,       6);
+
     NVIC_EnableIRQ(IRQ_DMA2_Stream2);  /* USART1 RX DMA half/full，IRQ 58 */
     NVIC_EnableIRQ(IRQ_DMA2_Stream7);  /* USART1 TX DMA complete，IRQ 70  */
     NVIC_EnableIRQ(IRQ_USART1);        /* USART1 IDLE line，IRQ 37        */
 
     /* 初始狀態：DMA 沒在傳 */
     dma_idle = 1;
+}
+
+/* 註冊/取消 RX 通知 callback（見 header 說明）。 */
+void usart1_set_rx_callback(void (*cb)(void))
+{
+    s_rx_cb = cb;
 }
 
 

@@ -26,7 +26,7 @@
 /* ---- 記憶體 ---- */
 #define configMINIMAL_STACK_SIZE                ( 128 )         /* words (idle task) */
 #define configMAX_PRIORITIES                    ( 5 )
-#define configTOTAL_HEAP_SIZE                   ( 20 * 1024 )   /* heap_4：4 task 堆疊 + qSamples，F407 有 128KB RAM */
+#define configTOTAL_HEAP_SIZE                   ( 28 * 1024 )   /* heap_4：5 task 堆疊 + qSamples（含建立期尖峰）*/
 #define configSUPPORT_STATIC_ALLOCATION         0
 #define configSUPPORT_DYNAMIC_ALLOCATION        1
 
@@ -76,8 +76,10 @@
 #define configMAX_SYSCALL_INTERRUPT_PRIORITY \
         ( configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY << (8 - configPRIO_BITS) )
 
-/* ---- assert：抓 priority / heap 設定錯誤，bring-up 期直接卡住好定位 ---- */
-#define configASSERT( x )   if( ( x ) == 0 ) { taskDISABLE_INTERRUPTS(); for( ;; ); }
+/* ---- assert：抓 priority / heap 設定錯誤。失敗時 vAssertCalled() 會把
+ * 觸發的檔案:行號從 UART 印出來再卡住（定義在 main.c），不再靜默死迴圈。 ---- */
+extern void vAssertCalled(const char *file, unsigned long line);
+#define configASSERT( x )   if( ( x ) == 0 ) vAssertCalled( __FILE__, __LINE__ )
 
 /* ---- 讓 port 接管 startup .s 裡的 weak handler ---- */
 #define vPortSVCHandler         SVC_Handler
