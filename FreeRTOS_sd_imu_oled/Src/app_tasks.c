@@ -23,7 +23,8 @@
  *
  *  共用資源與同步：
  *    qSamples : Sensor→Logger 佇列（producer/consumer 解耦，抗 SD stall）
- *    mBus     : SPI1 匯流排互斥鎖（OLED 與 SD/FatFs 共用，SPEC §7.2-1）
+ *    匯流排鎖 : SPI1 互斥（OLED 與 SD/FatFs 共用，SPEC §7.2-1）—— 實作在
+ *               bus_port_freertos.c，本檔只呼叫 bus_port_init()/bus_lock()
  *    （狀態 mutex 在 app_datalogger.c，保護 state/count/filename）
  *
  *  Created on: Jun 20, 2026
@@ -34,7 +35,7 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include "queue.h"
-#include "semphr.h"
+#include "bus_port.h"      /* bus_lock / bus_unlock / bus_port_init */
 
 #include "systick.h"
 #include "driver_spi1.h"
@@ -71,11 +72,10 @@
 
 /* ---- 同步原語 ---- */
 static QueueHandle_t     s_qSamples;
-static SemaphoreHandle_t s_mBus;
 static volatile uint32_t s_overruns;
 
-void bus_lock(void)   { xSemaphoreTake(s_mBus, portMAX_DELAY); }
-void bus_unlock(void) { xSemaphoreGive(s_mBus); }
+/* bus_lock()/bus_unlock() 的實作已搬到 bus_port_freertos.c（匯流排鎖屬於
+ * bus 自己，見 bus_port.h）；這裡只在 app_tasks_start() 呼叫 bus_port_init()。 */
 
 uint32_t app_tasks_overruns(void) { return s_overruns; }
 
@@ -289,8 +289,8 @@ static void bootstrap_task(void *arg)
 void app_tasks_start(void)
 {
     s_qSamples = xQueueCreate(QSAMPLES_LEN, sizeof(imu_sample_t));
-    s_mBus     = xSemaphoreCreateMutex();
-    configASSERT(s_qSamples != NULL && s_mBus != NULL);
+    int bus_rc = bus_port_init();   /* 獨立敘述：configASSERT 被停用時仍會建立 mutex */
+    configASSERT(s_qSamples != NULL && bus_rc == 0);
 
     xTaskCreate(bootstrap_task, "boot", STACK_BOOTSTRAP, NULL, PRIO_BOOTSTRAP, NULL);
 }

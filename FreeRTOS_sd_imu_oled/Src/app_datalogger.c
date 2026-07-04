@@ -6,7 +6,7 @@
  *  與 bare-metal 版的差別：
  *    - 取樣（讀 MPU）移到 Sensor task；本模組只負責「寫入 + 狀態」。
  *    - 所有 FatFs/SD 操作包在 bus_lock()/bus_unlock()（SPI1 匯流排互斥，
- *      和 OLED 共用同一支 mBus，見 app_tasks.c）。
+ *      和 OLED 共用同一支鎖，見 bus_port.h / bus_port_freertos.c）。
  *    - 狀態（state/count/filename）由自有的 s_state_mtx 保護，給 Display /
  *      CLI status 用 get_status() 一次取走。
  *
@@ -21,7 +21,7 @@
  */
 
 #include "app_datalogger.h"
-#include "app_tasks.h"      /* bus_lock / bus_unlock */
+#include "bus_port.h"       /* bus_lock / bus_unlock */
 #include "ff.h"
 #include "device_mpu6050.h"
 #include "FreeRTOS.h"

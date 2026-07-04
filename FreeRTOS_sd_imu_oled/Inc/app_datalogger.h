@@ -6,7 +6,7 @@
  *    - Sensor task 讀 MPU6050 → 丟 queue
  *    - Logger task 從 queue 取 → app_datalogger_write_sample() 寫 CSV/SD
  *  本模組負責 FIL/狀態的擁有權與鎖：
- *    - 所有 FatFs/SD 操作包在 bus_lock()（SPI1 匯流排互斥，見 app_tasks.h）
+ *    - 所有 FatFs/SD 操作包在 bus_lock()（SPI1 匯流排互斥，見 bus_port.h）
  *    - 狀態快照（state/count/filename）由自有的 mState 保護
  *
  *  Created on: Jun 18, 2026
