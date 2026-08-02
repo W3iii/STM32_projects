@@ -327,23 +327,70 @@ int dl_dump(const char *name, void (*emit_line)(const char *line))
     return rc;
 }
 
+/* 名字是不是 log_*.csv（不分大小寫）。FF_USE_LFN=0 → f_readdir 回大寫 8.3 名。 */
+static int is_log_csv(const char *nm)
+{
+    static const char pfx[4] = { 'l', 'o', 'g', '_' };
+    for (int i = 0; i < 4; i++) {
+        char c = nm[i];
+        if (c >= 'A' && c <= 'Z') {
+            c = (char)(c - 'A' + 'a');
+        }
+        if (c != pfx[i]) {
+            return 0;
+        }
+    }
+    int len = 0;
+    while (nm[len]) {
+        len++;
+    }
+    if (len < 5 || nm[len - 4] != '.') {
+        return 0;
+    }
+    char e1 = nm[len - 3], e2 = nm[len - 2], e3 = nm[len - 1];
+    if (e1 >= 'A' && e1 <= 'Z') e1 = (char)(e1 + 32);
+    if (e2 >= 'A' && e2 <= 'Z') e2 = (char)(e2 + 32);
+    if (e3 >= 'A' && e3 <= 'Z') e3 = (char)(e3 + 32);
+    return (e1 == 'c' && e2 == 's' && e3 == 'v');
+}
+
 int dl_clear(uint32_t *deleted_out)
 {
-    char name[16];
-    int  n = 0;
+    static DIR dir;             /* static：DIR 別放 stack */
+    FILINFO    fno;
+    char       name[16];
+    int        n = 0;
 
-    /* 直接掃 000..999 unlink，避免「邊 readdir 邊 unlink」可能漏項的問題。 */
+    /* 只掃「真的存在」的檔：每輪重開目錄找第一個 log_*.csv 就刪、再重掃，
+     * 直到掃不到為止。空目錄一次掃完即回 —— 不再盲目對 000..999 跑 1000 次
+     * f_unlink（那會抱著 bus_lock 掃目錄上千遍，看起來像當機）。
+     * 刪不掉就停手，避免同一檔一直被重掃造成無限迴圈。 */
     bus_lock();
-    for (int i = 0; i < 1000; i++) {
-        name[0] = 'l'; name[1] = 'o'; name[2] = 'g'; name[3] = '_';
-        name[4] = (char)('0' + (i / 100));
-        name[5] = (char)('0' + (i / 10) % 10);
-        name[6] = (char)('0' + (i % 10));
-        name[7] = '.'; name[8] = 'c'; name[9] = 's'; name[10] = 'v';
-        name[11] = '\0';
-        if (f_unlink(name) == FR_OK) {
-            n++;
+    for (;;) {
+        if (f_opendir(&dir, "/") != FR_OK) {
+            break;
         }
+        int found = 0;
+        while (f_readdir(&dir, &fno) == FR_OK && fno.fname[0] != '\0') {
+            if (fno.fattrib & AM_DIR) {
+                continue;
+            }
+            if (is_log_csv(fno.fname)) {
+                int k = 0;
+                while (fno.fname[k] && k < (int)sizeof(name) - 1) {
+                    name[k] = fno.fname[k];
+                    k++;
+                }
+                name[k] = '\0';
+                found = 1;
+                break;
+            }
+        }
+        f_closedir(&dir);
+        if (!found || f_unlink(name) != FR_OK) {
+            break;
+        }
+        n++;
     }
     bus_unlock();
     if (deleted_out) {
