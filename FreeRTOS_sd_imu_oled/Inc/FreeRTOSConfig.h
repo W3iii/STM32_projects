@@ -32,9 +32,19 @@
 
 /* ---- 命名 / debug ---- */
 #define configMAX_TASK_NAME_LEN                 ( 12 )
-#define configUSE_TRACE_FACILITY                0
+#define configUSE_TRACE_FACILITY                1               /* tasks CLI：uxTaskGetSystemState / run-time stats 依賴此項 */
 #define configCHECK_FOR_STACK_OVERFLOW          2               /* pattern check（bring-up 期保險）*/
 #define configUSE_MALLOC_FAILED_HOOK            1
+
+/* ---- Run-time stats（tasks CLI：算每個 task 的 CPU%）----
+ * 需要一個比 tick(1ms) 更細的計時源。用 TIM2 自由跑（app_runtime_stats.c），
+ * 頻率 ~100kHz（= tick 的 100 倍），port 每次量測就讀 TIM2->CNT。 */
+#define configGENERATE_RUN_TIME_STATS           1
+#define configUSE_STATS_FORMATTING_FUNCTIONS    1
+extern void vConfigureTimerForRunTimeStats(void);
+extern unsigned long ulGetRunTimeCounterValue(void);
+#define portCONFIGURE_TIMER_FOR_RUN_TIME_STATS()  vConfigureTimerForRunTimeStats()
+#define portGET_RUN_TIME_COUNTER_VALUE()          ulGetRunTimeCounterValue()
 
 /* ---- hook ---- */
 #define configUSE_IDLE_HOOK                     0
@@ -47,11 +57,15 @@
 #define configUSE_COUNTING_SEMAPHORES           1
 #define configQUEUE_REGISTRY_SIZE               4
 
-/* ---- software timer（timers.c 已納入編譯）---- */
-#define configUSE_TIMERS                        1
-#define configTIMER_TASK_PRIORITY               ( 3 )
-#define configTIMER_QUEUE_LENGTH                8
-#define configTIMER_TASK_STACK_DEPTH            ( 256 )
+/* ---- software timer ----
+ * 關閉：整個 app 沒用到軟體計時器（xTimerCreate 那套）、event group、
+ * 也沒有 xTimerPendFunctionCall，所以不需要 Timer Service(daemon) task。
+ * 關掉可省下它的堆疊 + timer 命令佇列（給 heap 多點餘裕），`tasks` 也不再列它。
+ * 之後若要用軟體計時器，把這裡改回 1 即可（timers.c 已在編譯清單，內部靠此旗標啟用）。 */
+#define configUSE_TIMERS                        0
+#define configTIMER_TASK_PRIORITY               ( 3 )   /* configUSE_TIMERS=0 時未使用 */
+#define configTIMER_QUEUE_LENGTH                8       /* 同上 */
+#define configTIMER_TASK_STACK_DEPTH            ( 256 ) /* 同上 */
 
 /* ---- 選用 API ---- */
 #define INCLUDE_vTaskPrioritySet                1
