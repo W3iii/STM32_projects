@@ -17,6 +17,12 @@ typedef struct {
     int16_t z;
 } mpu6050_axes_t;
 
+/* ---- 預設量程靈敏度（重置後 ±2g / ±250°/s）----
+ * raw int16 → 物理單位：g = raw / LSB_PER_G、°/s = raw / LSB_PER_DPS。
+ * 若之後改寫 ACCEL_CONFIG / GYRO_CONFIG 量程，這兩個值要一起改。 */
+#define MPU6050_ACC_LSB_PER_G      16384.0f   /* ±2g   量程 */
+#define MPU6050_GYRO_LSB_PER_DPS   131.0f     /* ±250°/s 量程 */
+
 /* ---- 初始化 ----
  *  回傳值：0 = OK, -1 = WHO_AM_I 不對（沒接好 / 模組壞了）
  */

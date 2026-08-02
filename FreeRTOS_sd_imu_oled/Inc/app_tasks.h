@@ -21,11 +21,12 @@
 #include <stdint.h>
 #include "device_mpu6050.h"
 
-/* Sensor → Logger 佇列的元素：一筆 IMU 樣本（含時間戳）。 */
+/* Sensor → Logger 佇列的元素：一筆 IMU 樣本（含時間戳 + 晶片溫度）。 */
 typedef struct {
     uint32_t       t_ms;
     mpu6050_axes_t acc;
     mpu6050_axes_t gyro;
+    float          temp_c;     /* 晶片內建溫度感測器（°C），與同時間點 IMU 一起記錄 */
 } imu_sample_t;
 
 /* 建立 queue/mutex 與 bootstrap task，再由 caller 啟動排程器。

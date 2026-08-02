@@ -108,7 +108,7 @@ int app_datalogger_start(void)
     if (f_open(&s_fil, s_filename, FA_WRITE | FA_CREATE_ALWAYS) != FR_OK) {
         rc = -2;
     } else {
-        f_puts("t_ms,ax,ay,az,gx,gy,gz\n", &s_fil);
+        f_puts("t_ms,ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps,temp_c\n", &s_fil);
     }
     bus_unlock();
 
@@ -148,19 +148,62 @@ int app_datalogger_stop(void)
     return 0;
 }
 
+/* 把 float 格式成固定小數位字串，例如 fmt_fixed(buf,-1.0012f,3) → "-1.001"。
+ * FatFs 的 f_printf 沒開 %f（ffconf FF_PRINT_FLOAT=0），所以自己轉、再用 %s
+ * 塞進 CSV，避免拉進整個 float printf。四捨五入；buf 需 >= 3+整數位+decimals。 */
+static void fmt_fixed(char *buf, float v, int decimals)
+{
+    int32_t scale = 1;
+    for (int i = 0; i < decimals; i++) {
+        scale *= 10;
+    }
+    int   neg = (v < 0.0f);
+    float mag = neg ? -v : v;
+    int32_t scaled = (int32_t)(mag * (float)scale + 0.5f);   /* 四捨五入 */
+    int32_t whole  = scaled / scale;
+    int32_t frac   = scaled % scale;
+
+    int n = 0;
+    if (neg && scaled != 0) {                 /* 避免印出 "-0.000" */
+        buf[n++] = '-';
+    }
+    /* 整數位：先反轉再倒回。 */
+    char rev[10];
+    int  r = 0;
+    do { rev[r++] = (char)('0' + whole % 10); whole /= 10; } while (whole && r < (int)sizeof(rev));
+    while (r > 0) {
+        buf[n++] = rev[--r];
+    }
+    if (decimals > 0) {
+        buf[n++] = '.';
+        for (int32_t p = scale / 10; p >= 1; p /= 10) {   /* 補足前導零 */
+            buf[n++] = (char)('0' + (frac / p) % 10);
+        }
+    }
+    buf[n] = '\0';
+}
+
 int app_datalogger_write_sample(uint32_t t_ms,
                                 const mpu6050_axes_t *acc,
-                                const mpu6050_axes_t *gyro)
+                                const mpu6050_axes_t *gyro,
+                                float temp_c)
 {
     int rc = 0;
 
     bus_lock();
     if (s_state == DL_LOGGING) {
-        /* 先記 raw int16（scaling 留待下一步，避免開 float printf）*/
-        rc = f_printf(&s_fil, "%u,%d,%d,%d,%d,%d,%d\n",
+        /* raw int16 → 物理單位再寫入：加速度 g（3 位）、角速度 °/s（2 位）、溫度 °C（1 位）。 */
+        char ax[12], ay[12], az[12], gx[12], gy[12], gz[12], tc[12];
+        fmt_fixed(ax, acc->x  / MPU6050_ACC_LSB_PER_G,    3);
+        fmt_fixed(ay, acc->y  / MPU6050_ACC_LSB_PER_G,    3);
+        fmt_fixed(az, acc->z  / MPU6050_ACC_LSB_PER_G,    3);
+        fmt_fixed(gx, gyro->x / MPU6050_GYRO_LSB_PER_DPS, 2);
+        fmt_fixed(gy, gyro->y / MPU6050_GYRO_LSB_PER_DPS, 2);
+        fmt_fixed(gz, gyro->z / MPU6050_GYRO_LSB_PER_DPS, 2);
+        fmt_fixed(tc, temp_c, 1);
+        rc = f_printf(&s_fil, "%u,%s,%s,%s,%s,%s,%s,%s\n",
                       (unsigned)t_ms,
-                      acc->x, acc->y, acc->z,
-                      gyro->x, gyro->y, gyro->z);
+                      ax, ay, az, gx, gy, gz, tc);
         if (rc >= 0) {
             state_lock();
             s_count++;

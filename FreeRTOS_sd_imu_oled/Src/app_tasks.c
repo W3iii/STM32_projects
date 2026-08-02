@@ -44,6 +44,7 @@
 #include "device_ssd1306.h"
 #include "device_sdcard.h"
 #include "device_mpu6050.h"
+#include "device_tempsensor.h"
 #include "app_datalogger.h"
 #include "app_cli.h"
 #include "app_button.h"
@@ -78,6 +79,11 @@ static volatile uint32_t s_overruns;
  * bus 自己，見 bus_port.h）；這裡只在 app_tasks_start() 呼叫 bus_port_init()。 */
 
 uint32_t app_tasks_overruns(void) { return s_overruns; }
+
+/* Sensor 每輪更新的最新晶片溫度（×10，整數）。給 Display task 顯示用。
+ * 單一 writer(Sensor) / 單一 reader(Display)、32-bit 對齊存取，讀到舊值無害，
+ * 不需 mutex。DL_IDLE 時 Sensor 不跑，值停在最後一次量測。 */
+static volatile int32_t s_last_temp_c10;
 
 /* ---- task handles（ISR 與 datalogger 的通知目標）---- */
 static TaskHandle_t s_sensor;     /* start 成功時被喚醒，進 100Hz 取樣迴圈 */
@@ -124,6 +130,8 @@ static void sensor_task(void *arg)
             imu_sample_t s;
             s.t_ms = systick_get_ms();
             mpu6050_read_all(&s.acc, &s.gyro);
+            s.temp_c = tempsensor_read_c();          /* 同一時間點的晶片溫度 */
+            s_last_temp_c10 = (int32_t)(s.temp_c * 10.0f);   /* 給 Display 顯示 */
 
             if (xQueueSend(s_qSamples, &s, 0) != pdTRUE) {
                 s_overruns++;                        /* 佇列滿：丟一筆，但不拖慢取樣 */
@@ -142,7 +150,7 @@ static void logger_task(void *arg)
         imu_sample_t s;
         /* 等樣本；timeout 讓我們也能定期 sync、不會永遠卡住 */
         if (xQueueReceive(s_qSamples, &s, pdMS_TO_TICKS(100)) == pdTRUE) {
-            app_datalogger_write_sample(s.t_ms, &s.acc, &s.gyro);
+            app_datalogger_write_sample(s.t_ms, &s.acc, &s.gyro, s.temp_c);
         }
 
         if ((xTaskGetTickCount() - last_sync) >= pdMS_TO_TICKS(LOGGER_SYNC_MS)) {
@@ -169,6 +177,22 @@ static void display_task(void *arg)
         } else {
             ssd1306_draw_string(0, 16, "READY");
         }
+        /* 第 4 行：晶片溫度 "T:35.0C"（整數位 + 一位小數，自組字串）。 */
+        int32_t t10 = s_last_temp_c10;
+        char    tline[10];
+        int     ti = 0;
+        tline[ti++] = 'T';
+        tline[ti++] = ':';
+        if (t10 < 0) { tline[ti++] = '-'; t10 = -t10; }
+        int32_t whole = t10 / 10;
+        if (whole >= 100) { tline[ti++] = (char)('0' + (whole / 100) % 10); }
+        if (whole >= 10)  { tline[ti++] = (char)('0' + (whole / 10)  % 10); }
+        tline[ti++] = (char)('0' + whole % 10);
+        tline[ti++] = '.';
+        tline[ti++] = (char)('0' + t10 % 10);
+        tline[ti++] = 'C';
+        tline[ti]   = '\0';
+        ssd1306_draw_string(0, 48, tline);
         ssd1306_update_screen();            /* 同步更新，鎖內完成 */
         bus_unlock();
 
@@ -233,9 +257,16 @@ static void bootstrap_task(void *arg)
     i2c1_init();                  // I2C1（MPU6050）
     sd_cs_init();                 // SD CS = PB10
     ssd1306_init();               // OLED
+    tempsensor_init();            // ADC1 內部 ch16：晶片內建溫度感測器
     delay_ms(10);
 
-    usart1_send_string("\r\n=== IMU datalogger (FreeRTOS, 5 tasks) ===\r\n");
+    usart1_send_string(
+        "\r\n"
+        "  +--------------------------------------------+\r\n"
+        "  |  IMU Datalogger   STM32F407 / FreeRTOS     |\r\n"
+        "  |  MPU6050 100Hz -> CSV/SD   OLED   UART CLI  |\r\n"
+        "  +--------------------------------------------+\r\n"
+        "\r\n");
 
     /* ---- Application 初始化（MPU6050 + 掛載 FAT32）---- */
     int rc = app_datalogger_init();
@@ -262,7 +293,7 @@ static void bootstrap_task(void *arg)
         usart1_send_string("[FATAL] init error\r\n");
         vTaskSuspend(NULL);
     }
-    usart1_send_string("[OK]   sensors + FAT32 ready\r\n");
+    usart1_send_string("  [ok] sensors + FAT32 ready\r\n\r\n");
 
     app_cli_init();
     app_button_init();            // PA0 user button → EXTI0（rising edge）：按一下切換 start/stop

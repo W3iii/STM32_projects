@@ -48,10 +48,12 @@ int app_datalogger_start(void);
 /* f_sync + f_close、回 IDLE。回傳 0。 */
 int app_datalogger_stop(void);
 
-/* 寫一筆樣本（Logger task 呼叫）。LOGGING 時才真的寫；回傳 FatFs rc（0=OK）。 */
+/* 寫一筆樣本（Logger task 呼叫）。LOGGING 時才真的寫；回傳 FatFs rc（0=OK）。
+ * temp_c：同一時間點的晶片溫度（°C），與 IMU 一起寫進 CSV 最後一欄。 */
 int app_datalogger_write_sample(uint32_t t_ms,
                                 const mpu6050_axes_t *acc,
-                                const mpu6050_axes_t *gyro);
+                                const mpu6050_axes_t *gyro,
+                                float temp_c);
 
 /* 週期性把 FAT/目錄落地（Logger task 每秒呼叫）。LOGGING 時才做。 */
 void app_datalogger_sync(void);
