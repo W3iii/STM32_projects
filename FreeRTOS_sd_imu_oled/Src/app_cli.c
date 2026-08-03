@@ -13,7 +13,9 @@
 #include "app_cli.h"
 #include "app_datalogger.h"
 #include "app_tasks.h"          /* app_tasks_overruns（status 用）*/
+#include "bus_port.h"           /* i2cscan 指令：i2c1_lock / i2c1_unlock */
 #include "device_tempsensor.h"  /* status：晶片溫度 raw / 換算除錯讀數 */
+#include "driver_i2c1.h"        /* i2cscan 指令：i2c1_bus_scan / i2c1_bus_recovery */
 #include "driver_usart1.h"
 #include "FreeRTOS.h"           /* tasks 指令：run-time stats */
 #include "task.h"              /* uxTaskGetSystemState */
@@ -39,6 +41,15 @@ static void cli_print_u32(uint32_t v)
         v /= 10;
     }
     usart1_send_string(&b[i]);
+}
+
+/* 印 "0xNN"（i2cscan 用）。 */
+static void cli_print_hex8(uint8_t v)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    usart1_send_string("0x");
+    usart1_send_byte((uint8_t)hex[(v >> 4) & 0xF]);
+    usart1_send_byte((uint8_t)hex[v & 0xF]);
 }
 
 /* 送字串後補空白到欄寬 width（左對齊）。表格 / key-value 對齊共用。 */
@@ -346,6 +357,105 @@ static void cli_cmd_tasks(void)
     s_have_base  = 1;
 }
 
+/* ───────────────── power：INA219 讀數 ─────────────────
+ * 不自己碰 I2C —— 量測由 Display task 以 10Hz 做，這裡只取它存下的快照
+ * （app_tasks_get_power 內用 critical section 複製，四個值同一時刻）。
+ * 好處：CLI 不必上 I2C 鎖、不會和 Sensor 搶 bus，指令回應也是瞬間的。
+ * 代價：讀數最舊可能落後 100ms —— 對看電源狀態完全夠用。 */
+static void cli_power(void)
+{
+    ina219_data_t p;
+    if (!app_tasks_get_power(&p)) {
+        usart1_send_string("INA219 not available (check wiring, try: i2cscan)\r\n");
+        return;
+    }
+
+    cli_label("bus");
+    cli_print_fixed(p.bus_v, 3);
+    usart1_send_string(" V\r\n");
+
+    cli_label("shunt");
+    cli_print_fixed(p.shunt_mv, 2);
+    usart1_send_string(" mV\r\n");
+
+    cli_label("current");
+    cli_print_fixed(p.current_ma, 1);
+    usart1_send_string(" mA\r\n");
+
+    cli_label("power");
+    cli_print_fixed(p.power_mw, 1);
+    usart1_send_string(" mW\r\n");
+}
+
+/* ───────────────── i2cscan：I2C1 匯流排掃描 ─────────────────
+ * 掃 0x08~0x77，對每個位址送 START + addr+W，回 ACK 就代表線上有這顆。
+ * 用途：新裝置（INA219）並上 PB8/PB9 後，先確認「位址真的出現、原有的
+ * MPU6050 也還在」，再去寫 driver —— 位址衝突 / 沒接好在這裡就看得出來。
+ *
+ * 整段掃描包在 i2c1_lock 內：和 Sensor task 的 mpu6050_read_all() 互斥，
+ * 不會有兩個 task 在同一條 bus 上互相插 START 把狀態機弄亂。
+ *
+ * 為什麼仍要求先 stop（這是延遲考量，不是正確性）：
+ *   掃描 112 個位址期間一直抱著 I2C1 鎖，而且 driver 是 busy-wait 不讓出 CPU。
+ *   正常情況約 15ms → Sensor 掉 1~2 筆樣本；但只要有一條線被拉死，每次探測
+ *   都會吃滿 I2C_TIMEOUT_MS(100ms)，最慢 11s，100Hz 取樣等於整段停擺。
+ *   i2cscan 本來就是「接線階段」用的，要求先 stop 最省事。
+ *   （若之後想在記錄中也能掃，把這個 guard 拿掉即可，鎖已經保證安全。）*/
+
+#define CLI_I2C_MAX_FOUND   16
+
+/* 已知位址的猜測標籤，純粹方便看（不代表真的驗過 WHO_AM_I）。 */
+static const char *cli_i2c_guess(uint8_t addr)
+{
+    if (addr == 0x68 || addr == 0x69) return "MPU6050 (AD0 low/high)";
+    if (addr >= 0x40 && addr <= 0x4F) return "INA219 (A1/A0 straps)";
+    if (addr == 0x3C || addr == 0x3D) return "SSD1306 (I2C ver.)";
+    return "?";
+}
+
+static void cli_cmd_i2cscan(void)
+{
+    if (app_datalogger_state() == DL_LOGGING) {
+        usart1_send_string("stop first (scan would stall 100Hz sampling)\r\n");
+        return;
+    }
+
+    usart1_send_string("scanning I2C1 (PB8=SCL PB9=SDA) 0x08..0x77 ...\r\n");
+
+    uint8_t found[CLI_I2C_MAX_FOUND];
+    i2c1_lock();
+    int n = i2c1_bus_scan(found, CLI_I2C_MAX_FOUND);
+    i2c1_unlock();
+
+    for (int i = 0; i < n; i++) {
+        usart1_send_string("  ");
+        cli_print_hex8(found[i]);
+        usart1_send_string("  ");
+        usart1_send_string(cli_i2c_guess(found[i]));
+        usart1_send_string("\r\n");
+    }
+
+    if (n == 0) {
+        /* 一顆都沒有 → 多半是沒供電 / SDA-SCL 接反 / 缺 pull-up；
+         * 順手試一次 recovery（slave 把 SDA 卡在 low 的話能救回來）。 */
+        usart1_send_string("  (none) check VCC/GND, SDA-SCL swap, pull-ups\r\n");
+        usart1_send_string("  bus recovery: ");
+        i2c1_lock();                    /* recovery 會 disable I2C1、手動搖 SCL，同樣要獨佔 */
+        i2c_status_t rc = i2c1_bus_recovery();
+        i2c1_unlock();
+        usart1_send_string(rc == I2C_OK ? "ok\r\n" : "SDA still low\r\n");
+        return;
+    }
+
+    usart1_send_string("found ");
+    cli_print_u32((uint32_t)n);
+    usart1_send_string(" device(s)");
+    if (n == CLI_I2C_MAX_FOUND) {
+        usart1_send_string(" (list full, raise CLI_I2C_MAX_FOUND)");
+    }
+    usart1_send_string("\r\n");
+}
+
 /* 對齊的指令清單（開機、help、打錯指令都印這個）。 */
 static void cli_print_help(void)
 {
@@ -358,6 +468,8 @@ static void cli_print_help(void)
         "  ls             list files + free space\r\n"
         "  clear          delete all logs\r\n"
         "  tasks          FreeRTOS task monitor\r\n"
+        "  power          INA219 voltage / current / power\r\n"
+        "  i2cscan        scan I2C1 bus (0x08..0x77)\r\n"
         "  help           this list\r\n");
 }
 
@@ -395,6 +507,10 @@ static void cli_dispatch(char *line)
         cli_clear();
     } else if (strcmp(cmd, "tasks") == 0) {
         cli_cmd_tasks();
+    } else if (strcmp(cmd, "power") == 0) {
+        cli_power();
+    } else if (strcmp(cmd, "i2cscan") == 0) {
+        cli_cmd_i2cscan();
     } else if (strcmp(cmd, "help") == 0) {
         cli_print_help();
     } else {
