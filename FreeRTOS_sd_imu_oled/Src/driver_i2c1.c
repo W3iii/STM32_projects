@@ -216,6 +216,49 @@ i2c_status_t i2c1_write_reg(uint8_t slave_addr, uint8_t reg_addr, uint8_t data)
 }
 
 
+i2c_status_t i2c1_write_reg16(uint8_t slave_addr, uint8_t reg_addr, uint16_t data)
+{
+    i2c_status_t st;
+
+    /* 1. START */
+    I2C1->CR1 |= I2C_CR1_START;
+    st = wait_flag(I2C_SR1_SB);
+    if (st != I2C_OK) return st;
+
+    /* 2. 送 slave + W */
+    I2C1->DR = (slave_addr << 1) | 0;
+    st = wait_addr();
+    if (st != I2C_OK) return st;
+
+    /* 3. 清 ADDR */
+    (void)I2C1->SR1;
+    (void)I2C1->SR2;
+
+    /* 4. 送 reg_addr */
+    st = wait_flag(I2C_SR1_TXE);
+    if (st != I2C_OK) return st;
+    I2C1->DR = reg_addr;
+
+    /* 5. 送 data 高位元組 → 低位元組（I2C 慣例：MSB first）*/
+    st = wait_flag(I2C_SR1_TXE);
+    if (st != I2C_OK) return st;
+    I2C1->DR = (uint8_t)(data >> 8);
+
+    st = wait_flag(I2C_SR1_TXE);
+    if (st != I2C_OK) return st;
+    I2C1->DR = (uint8_t)(data & 0xFF);
+
+    /* 6. 等傳輸完成 */
+    st = wait_flag(I2C_SR1_BTF);
+    if (st != I2C_OK) return st;
+
+    /* 7. STOP */
+    I2C1->CR1 |= I2C_CR1_STOP;
+
+    return I2C_OK;
+}
+
+
 /* ========================================================================= */
 /*                          Read registers                                   */
 /* ========================================================================= */

@@ -59,6 +59,15 @@ void i2c1_init(void);
 i2c_status_t i2c1_write_reg(uint8_t slave_addr, uint8_t reg_addr, uint8_t data);
 
 /*
+ * 寫 16-bit register（MSB first）
+ *   流程：START → addr+W → reg → data[15:8] → data[7:0] → STOP
+ *
+ * 給暫存器寬度是 16-bit 的晶片用（INA219 的 config / calibration）。
+ * MPU6050 那種 8-bit 暫存器用上面的 i2c1_write_reg() 即可。
+ */
+i2c_status_t i2c1_write_reg16(uint8_t slave_addr, uint8_t reg_addr, uint16_t data);
+
+/*
  * 讀多個連續 register（burst read）
  *   流程：START → addr+W → reg → RESTART → addr+R → read N → STOP
  *
