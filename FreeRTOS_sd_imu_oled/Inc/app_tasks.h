@@ -37,6 +37,10 @@ void app_tasks_start(void);
 /* Sensor 因佇列滿而丟棄的樣本數（理想為 0；給 CLI status 觀察用）。 */
 uint32_t app_tasks_overruns(void);
 
+/* IDLE task 要不要用 WFI 睡覺（1 = 睡，0 = 空轉）。CLI 的 wfi 指令直接改它，
+ * 實作與完整說明在 app_tasks.c 的 vApplicationIdleHook。 */
+extern volatile uint8_t g_wfi_enabled;
+
 /* 最近一次 INA219 量測的快照（由 Display task 以 10Hz 更新）。
  * INA219 不獨立開 task：它只是「被顯示 / 被查詢」的慢速資料，掛在既有的
  * Display task 上量就好，省一個 task 的 stack 與排程成本。

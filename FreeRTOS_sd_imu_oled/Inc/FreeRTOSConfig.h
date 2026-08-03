@@ -47,7 +47,7 @@ extern unsigned long ulGetRunTimeCounterValue(void);
 #define portGET_RUN_TIME_COUNTER_VALUE()          ulGetRunTimeCounterValue()
 
 /* ---- hook ---- */
-#define configUSE_IDLE_HOOK                     0
+#define configUSE_IDLE_HOOK                     1   /* vApplicationIdleHook：閒置時 WFI 睡覺（見 app_tasks.c）*/
 #define configUSE_TICK_HOOK                     0
 #define configUSE_DAEMON_TASK_STARTUP_HOOK      0
 

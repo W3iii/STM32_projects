@@ -357,6 +357,27 @@ static void cli_cmd_tasks(void)
     s_have_base  = 1;
 }
 
+/* ───────────────── wfi：IDLE 省電開關 ─────────────────
+ *   wfi        看目前狀態
+ *   wfi on     IDLE 沒事做時 WFI 睡覺（預設）
+ *   wfi off    IDLE 全速空轉，當對照組
+ *
+ * 配 power 指令就是一組現成的省電量測：wfi off → power → wfi on → power，
+ * 兩次電流差就是「核心空轉」燒掉的部分。開關與說明在 app_tasks.c。 */
+static void cli_wfi(const char *arg)
+{
+    if (strcmp(arg, "on") == 0) {
+        g_wfi_enabled = 1;
+    } else if (strcmp(arg, "off") == 0) {
+        g_wfi_enabled = 0;
+    } else if (arg[0] != '\0') {
+        usart1_send_string("usage: wfi [on|off]\r\n");
+        return;
+    }
+    usart1_send_string("wfi: ");
+    usart1_send_string(g_wfi_enabled ? "on (idle sleeps)\r\n" : "off (idle spins)\r\n");
+}
+
 /* ───────────────── power：INA219 讀數 ─────────────────
  * 不自己碰 I2C —— 量測由 Display task 以 10Hz 做，這裡只取它存下的快照
  * （app_tasks_get_power 內用 critical section 複製，四個值同一時刻）。
@@ -469,6 +490,7 @@ static void cli_print_help(void)
         "  clear          delete all logs\r\n"
         "  tasks          FreeRTOS task monitor\r\n"
         "  power          INA219 voltage / current / power\r\n"
+        "  wfi [on|off]   idle WFI sleep (power saving)\r\n"
         "  i2cscan        scan I2C1 bus (0x08..0x77)\r\n"
         "  help           this list\r\n");
 }
@@ -509,6 +531,8 @@ static void cli_dispatch(char *line)
         cli_cmd_tasks();
     } else if (strcmp(cmd, "power") == 0) {
         cli_power();
+    } else if (strcmp(cmd, "wfi") == 0) {
+        cli_wfi(arg);
     } else if (strcmp(cmd, "i2cscan") == 0) {
         cli_cmd_i2cscan();
     } else if (strcmp(cmd, "help") == 0) {

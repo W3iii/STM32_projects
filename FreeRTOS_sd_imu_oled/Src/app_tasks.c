@@ -107,6 +107,31 @@ int app_tasks_get_power(ina219_data_t *out)
     return valid;
 }
 
+/* ───────────────── Idle 省電：WFI 開關 ─────────────────
+ * 1 = IDLE task 沒事做時執行 WFI，讓核心停在 sleep 直到下一個中斷；
+ * 0 = 維持原本的空轉（IDLE 迴圈全速跑），純粹當對照組用。
+ *
+ * 全域可寫（CLI 的 wfi 指令直接改它）。單一 byte、單一 writer，
+ * idle hook 每圈重讀，不需要任何同步。
+ *
+ * 為什麼安全：Cortex-M 的 WFI 若在執行當下已有 pending 中斷會立刻返回，
+ * 所以「ISR 剛喚醒某個 task」和「進入 WFI」之間沒有會睡死的競態。
+ *
+ * 能省多少：tick 是 1kHz，所以核心每 1ms 還是會被 SysTick 叫醒一次，
+ * 省下的是兩個 tick 之間的空轉。要再往下壓就得開 tickless idle
+ * （configUSE_TICKLESS_IDLE），那是另一個題目。
+ *
+ * 注意：WFI 只停核心時脈，周邊（TIM2 run-time 計時器、DMA、UART）照跑，
+ * 所以 tasks 指令的 CPU% 仍然準確 —— IDLE 的百分比就是「睡著的時間」。 */
+volatile uint8_t g_wfi_enabled = 1;
+
+void vApplicationIdleHook(void)
+{
+    if (g_wfi_enabled) {
+        __asm volatile ("wfi");
+    }
+}
+
 /* ---- task handles（ISR 與 datalogger 的通知目標）---- */
 static TaskHandle_t s_sensor;     /* start 成功時被喚醒，進 100Hz 取樣迴圈 */
 static TaskHandle_t s_console;    /* UART RX(IDLE / DMA HT-TC) 事件喚醒 */
