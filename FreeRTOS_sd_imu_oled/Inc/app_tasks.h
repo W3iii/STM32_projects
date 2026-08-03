@@ -20,6 +20,7 @@
 
 #include <stdint.h>
 #include "device_mpu6050.h"
+#include "device_ina219.h"
 
 /* Sensor → Logger 佇列的元素：一筆 IMU 樣本（含時間戳 + 晶片溫度）。 */
 typedef struct {
@@ -35,5 +36,13 @@ void app_tasks_start(void);
 
 /* Sensor 因佇列滿而丟棄的樣本數（理想為 0；給 CLI status 觀察用）。 */
 uint32_t app_tasks_overruns(void);
+
+/* 最近一次 INA219 量測的快照（由 Display task 以 10Hz 更新）。
+ * INA219 不獨立開 task：它只是「被顯示 / 被查詢」的慢速資料，掛在既有的
+ * Display task 上量就好，省一個 task 的 stack 與排程成本。
+ *
+ * out 可為 NULL（只想問在不在線時）。
+ * 回傳：1 = 資料有效，0 = INA219 不在線或還沒量到（out 不會被寫）。 */
+int app_tasks_get_power(ina219_data_t *out);
 
 #endif /* APP_TASKS_H_ */

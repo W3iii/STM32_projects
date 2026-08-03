@@ -44,6 +44,7 @@
 #include "device_ssd1306.h"
 #include "device_sdcard.h"
 #include "device_mpu6050.h"
+#include "device_ina219.h"
 #include "device_tempsensor.h"
 #include "app_datalogger.h"
 #include "app_cli.h"
@@ -84,6 +85,27 @@ uint32_t app_tasks_overruns(void) { return s_overruns; }
  * 單一 writer(Sensor) / 單一 reader(Display)、32-bit 對齊存取，讀到舊值無害，
  * 不需 mutex。DL_IDLE 時 Sensor 不跑，值停在最後一次量測。 */
 static volatile int32_t s_last_temp_c10;
+
+/* ---- INA219 最新量測（Display task 每 100ms 更新，CLI power 讀）----
+ * 這裡不能照 s_last_temp_c10 那樣「裸 volatile 直接讀」：四個 float 是一組
+ * 有關聯的值，讀者若在 writer 寫到一半時插進來，會拿到 V 是新的、I 是舊的
+ * 這種前後不一致的組合。用 critical section 包住結構複製即可（16 bytes，
+ * 關中斷時間可忽略），比為此再開一支 mutex 便宜。 */
+static ina219_data_t s_power;
+static uint8_t       s_power_valid;     /* 0 = INA219 不在線或還沒量到 */
+static uint8_t       s_ina_present;     /* init 成功才在 Display 迴圈裡讀它 */
+
+int app_tasks_get_power(ina219_data_t *out)
+{
+    int valid;
+    taskENTER_CRITICAL();
+    valid = s_power_valid;
+    if (valid && out != NULL) {
+        *out = s_power;
+    }
+    taskEXIT_CRITICAL();
+    return valid;
+}
 
 /* ---- task handles（ISR 與 datalogger 的通知目標）---- */
 static TaskHandle_t s_sensor;     /* start 成功時被喚醒，進 100Hz 取樣迴圈 */
@@ -162,7 +184,51 @@ static void logger_task(void *arg)
     }
 }
 
-/* ───────────────── Display task ───────────────── */
+/* ───────────────── Display task ─────────────────
+ * 版面（5x8 字型，字距 6px → 一行 21 字）：
+ *   y=0   IMU LOGGER
+ *   y=16  * REC  1234        ← 筆數不再獨佔一行，接在 REC 後空兩格
+ *         READY              ← IDLE 時沒有筆數
+ *   y=32  P:5.02V 118mA      ← INA219；不在線時 "P: --"
+ *   y=48  T:35.0C
+ *
+ * 這個 task 同時負責「量 INA219」：它是慢速、只給人看的資料，掛在既有的
+ * 10Hz 迴圈上量即可，不值得為它多開一個 task。 */
+
+/* 把 scaled（已乘以 10^decimals 的整數）寫成定點字串，回傳寫入長度。
+ * OLED 沒有 printf，原本溫度那行是手工攤開的 digit-poking，現在電壓/電流
+ * 也要同樣的格式，抽成一支共用（temp 與 power 三處都走這裡）。 */
+static int fmt_fixed(char *buf, int32_t scaled, int decimals)
+{
+    int32_t scale = 1;
+    for (int i = 0; i < decimals; i++) {
+        scale *= 10;
+    }
+    int i = 0;
+    if (scaled < 0) {
+        buf[i++] = '-';
+        scaled = -scaled;
+    }
+    int32_t whole = scaled / scale;
+    /* 整數部分：最多到萬位（電流 mA 可能四位數）*/
+    int started = 0;
+    for (int32_t p = 10000; p >= 1; p /= 10) {
+        int32_t d = (whole / p) % 10;
+        if (d != 0 || started || p == 1) {
+            buf[i++] = (char)('0' + d);
+            started = 1;
+        }
+    }
+    if (decimals > 0) {
+        buf[i++] = '.';
+        for (int32_t p = scale / 10; p >= 1; p /= 10) {
+            buf[i++] = (char)('0' + (scaled / p) % 10);
+        }
+    }
+    buf[i] = '\0';
+    return i;
+}
+
 static void display_task(void *arg)
 {
     (void)arg;
@@ -170,31 +236,65 @@ static void display_task(void *arg)
         dl_status_t st;
         app_datalogger_get_status(&st);
 
+        /* ---- 量 INA219（I2C1，和 Sensor task 互斥）----
+         * 只在 init 成功時才讀：沒接的話每輪都會吃 NACK，白花 bus 時間，
+         * 線真的斷掉時更會每輪吃滿 timeout 把 10Hz 更新拖垮。 */
+        if (s_ina_present) {
+            ina219_data_t p;
+            i2c1_lock();
+            int rc = ina219_read(&p);       /* 兩筆交易，整段包在鎖內才同時刻 */
+            i2c1_unlock();
+            taskENTER_CRITICAL();
+            if (rc == 0) {
+                s_power = p;
+                s_power_valid = 1;
+            } else {
+                s_power_valid = 0;          /* 讀失敗：標記過期，別讓 CLI 印舊值 */
+            }
+            taskEXIT_CRITICAL();
+        }
+
+        char line[22];
+
         spi1_lock();
         ssd1306_clear();
         ssd1306_draw_string(0, 0, "IMU LOGGER");
+
+        /* 第 2 行：狀態 + 筆數（同一行，"* REC" 佔 5 字 = 30px，空兩格 → x=42）*/
         if (st.state == DL_LOGGING) {
             ssd1306_draw_string(0, 16, "* REC");
-            ssd1306_draw_int(0, 32, (int32_t)st.count);
+            ssd1306_draw_int(42, 16, (int32_t)st.count);
         } else {
             ssd1306_draw_string(0, 16, "READY");
         }
-        /* 第 4 行：晶片溫度 "T:35.0C"（整數位 + 一位小數，自組字串）。 */
-        int32_t t10 = s_last_temp_c10;
-        char    tline[10];
-        int     ti = 0;
-        tline[ti++] = 'T';
-        tline[ti++] = ':';
-        if (t10 < 0) { tline[ti++] = '-'; t10 = -t10; }
-        int32_t whole = t10 / 10;
-        if (whole >= 100) { tline[ti++] = (char)('0' + (whole / 100) % 10); }
-        if (whole >= 10)  { tline[ti++] = (char)('0' + (whole / 10)  % 10); }
-        tline[ti++] = (char)('0' + whole % 10);
-        tline[ti++] = '.';
-        tline[ti++] = (char)('0' + t10 % 10);
-        tline[ti++] = 'C';
-        tline[ti]   = '\0';
-        ssd1306_draw_string(0, 48, tline);
+
+        /* 第 3 行：INA219 電壓 / 電流 */
+        ina219_data_t pw;
+        if (app_tasks_get_power(&pw)) {
+            int n = 0;
+            line[n++] = 'P';
+            line[n++] = ':';
+            n += fmt_fixed(&line[n], (int32_t)(pw.bus_v * 100.0f), 2);
+            line[n++] = 'V';
+            line[n++] = ' ';
+            n += fmt_fixed(&line[n], (int32_t)pw.current_ma, 0);
+            line[n++] = 'm';
+            line[n++] = 'A';
+            line[n]   = '\0';
+        } else {
+            line[0] = 'P'; line[1] = ':'; line[2] = ' ';
+            line[3] = '-'; line[4] = '-'; line[5] = '\0';
+        }
+        ssd1306_draw_string(0, 32, line);
+
+        /* 第 4 行：晶片溫度 "T:35.0C" */
+        line[0] = 'T';
+        line[1] = ':';
+        int tn = 2 + fmt_fixed(&line[2], s_last_temp_c10, 1);
+        line[tn++] = 'C';
+        line[tn]   = '\0';
+        ssd1306_draw_string(0, 48, line);
+
         ssd1306_update_screen();            /* 同步更新，鎖內完成 */
         spi1_unlock();
 
@@ -295,7 +395,17 @@ static void bootstrap_task(void *arg)
         usart1_send_string("[FATAL] init error\r\n");
         vTaskSuspend(NULL);
     }
-    usart1_send_string("  [ok] sensors + FAT32 ready\r\n\r\n");
+    usart1_send_string("  [ok] sensors + FAT32 ready\r\n");
+
+    /* ---- INA219（選配）----
+     * 沒接不算致命：只是 OLED 第 3 行與 CLI power 顯示 "--"，其餘照跑。
+     * 這個旗標決定 Display task 之後要不要每輪去讀它。 */
+    i2c1_lock();
+    s_ina_present = (ina219_init() == 0) ? 1 : 0;
+    i2c1_unlock();
+    usart1_send_string(s_ina_present
+        ? "  [ok] INA219 @0x40\r\n\r\n"
+        : "  [--] INA219 not found (try: i2cscan)\r\n\r\n");
 
     app_cli_init();
     app_button_init();            // PA0 user button → EXTI0（rising edge）：按一下切換 start/stop
