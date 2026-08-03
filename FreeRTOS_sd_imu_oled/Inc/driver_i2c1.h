@@ -103,10 +103,10 @@ i2c_status_t i2c1_bus_recovery(void);
  *
  * 用法：
  *   uint8_t addrs[8];
- *   int n = i2c1_scan(addrs, 8);
+ *   int n = i2c1_bus_scan(addrs, 8);
  *   for (int i = 0; i < n; i++) { ... addrs[i] ... }
  */
-int i2c1_scan(uint8_t *found, int max);
+int i2c1_bus_scan(uint8_t *found, int max);
 
 
 #endif /* DRIVER_I2C1_H_ */

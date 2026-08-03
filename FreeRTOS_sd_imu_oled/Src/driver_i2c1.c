@@ -394,7 +394,7 @@ i2c_status_t i2c1_bus_recovery(void)
  *       會自動送 STOP。掃描時我們也要送 STOP，邏輯剛好可重用，
  *       但 ACK 的情況要自己補 STOP。
  */
-static int i2c1_probe(uint8_t addr)
+static int i2c1_bus_probe(uint8_t addr)
 {
     /* START */
     I2C1->CR1 |= I2C_CR1_START;
@@ -432,7 +432,7 @@ static int i2c1_probe(uint8_t addr)
     return found;
 }
 
-int i2c1_scan(uint8_t *found, int max)
+int i2c1_bus_scan(uint8_t *found, int max)
 {
     int count = 0;
 
@@ -441,7 +441,7 @@ int i2c1_scan(uint8_t *found, int max)
         if (count >= max) {
             break;
         }
-        if (i2c1_probe(addr)) {
+        if (i2c1_bus_probe(addr)) {
             found[count++] = addr;
         }
     }
