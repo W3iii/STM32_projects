@@ -220,10 +220,32 @@ static void cli_clear(void)
 /* ───────────────── tasks：FreeRTOS 執行期監控 ─────────────────
  * 一次快照全部 task（含 IDLE / Timer service）的狀態、優先權、堆疊剩餘水位、
  * CPU 佔用％。資料源是 uxTaskGetSystemState()（需 configUSE_TRACE_FACILITY=1），
- * CPU% 靠 run-time stats 計時器（TIM2，見 app_runtime_stats.c）。
- * 純唯讀 FreeRTOS 內部狀態，不碰 SD/OLED、不需 spi1_lock、不新增 task/mutex。 */
+ * 計時源是 run-time stats 計時器（TIM2 @100kHz，見 app_runtime_stats.c）。
+ * 純唯讀 FreeRTOS 內部狀態，不碰 SD/OLED、不需 spi1_lock、不新增 task/mutex。
+ *
+ * CPU% 有兩欄，差別很重要：
+ *   Avg%   開機到現在的累積佔用 = ulRunTimeCounter / total。開機後大部分時間
+ *          在 IDLE，所以錄製中的負載會被前面那段閒置稀釋掉，看不出真實負荷。
+ *   CPU%   距離「上一次執行 tasks」這段區間的佔用，也就是兩次快照的差值：
+ *              (累積@t1 - 累積@t0) / (total@t1 - total@t0)
+ *          要量「錄製中 Sensor 吃多少 CPU」就看這欄：start 後打一次 tasks
+ *          當基準，跑個幾秒再打一次，第二次的 CPU% 就是那段區間的實際值。
+ *
+ * 每次呼叫都會把基準換成這次的快照，所以連打兩次 tasks 得到的是「這兩次之間」。
+ *
+ * 計數器繞回（TIM2 32-bit @100kHz 約 11.9 小時）不影響：uint32 減法本身
+ * 就是模 2^32 運算，只要兩次呼叫間隔不超過一整圈，差值仍然正確。 */
 
 #define CLI_MAX_TASKS   12      /* 5 app task + IDLE，留餘裕（cli_field / cli_uint_field 定義在檔案上方）*/
+
+/* 上一次快照（算差值用）。用 xHandle 當識別，不用名字或索引：
+ * task 在列表裡的順序會變，同名也不保證是同一支。 */
+static TaskHandle_t s_prev_handle[CLI_MAX_TASKS];
+static uint32_t     s_prev_rt[CLI_MAX_TASKS];
+static UBaseType_t  s_prev_n;
+static uint32_t     s_prev_total;
+static TickType_t   s_prev_tick;
+static uint8_t      s_have_base;        /* 0 = 還沒有基準，CPU% 印 "-" */
 
 static const char *cli_state_str(eTaskState st)
 {
@@ -237,6 +259,33 @@ static const char *cli_state_str(eTaskState st)
     }
 }
 
+/* 印「百分比 ×10」成 "12.3" 並補空白到欄寬（一位小數：Sensor 這種短命 task
+ * 的佔用常在個位數，整數欄位會全部擠成 0 或 1，看不出變化）。 */
+static void cli_pct10_field(uint32_t p10, int width)
+{
+    char b[8];
+    int  i = 0;
+    uint32_t w = p10 / 10U;
+    if (w >= 100U) { b[i++] = (char)('0' + (w / 100U) % 10U); }
+    if (w >= 10U)  { b[i++] = (char)('0' + (w / 10U)  % 10U); }
+    b[i++] = (char)('0' + w % 10U);
+    b[i++] = '.';
+    b[i++] = (char)('0' + p10 % 10U);
+    b[i]   = '\0';
+    cli_field(b, width);
+}
+
+/* 在上一次快照裡找同一支 task；找到回索引，沒有回 -1（這次才新建的 task）。 */
+static int cli_prev_index(TaskHandle_t h)
+{
+    for (UBaseType_t i = 0; i < s_prev_n; i++) {
+        if (s_prev_handle[i] == h) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
 static void cli_cmd_tasks(void)
 {
     static TaskStatus_t st[CLI_MAX_TASKS];   /* static：TaskStatus_t 陣列別放 stack */
@@ -248,18 +297,53 @@ static void cli_cmd_tasks(void)
         return;
     }
 
-    uint32_t div = total_run / 100U;         /* 1% 對應的 counter 量（避免溢位）*/
+    TickType_t now = xTaskGetTickCount();
 
-    usart1_send_string("Task         State Pri Stack CPU%\r\n");
+    /* 兩個分母。除以 1000 = 「0.1% 對應多少 counter」，先除再除避免
+     * delta*1000 溢位（區間夠長時 delta 會很大）。 */
+    uint32_t delta_total = total_run - s_prev_total;      /* uint32 減法自帶繞回處理 */
+    uint32_t div_int     = delta_total / 1000U;           /* 區間用 */
+    uint32_t div_avg     = total_run   / 1000U;           /* 累積用 */
+
+    /* 表頭前先講清楚這次的 CPU% 涵蓋多長的區間，不然數字沒有意義。 */
+    if (!s_have_base) {
+        usart1_send_string("baseline captured - run 'tasks' again for interval CPU%\r\n");
+    } else {
+        usart1_send_string("interval: ");
+        cli_print_fixed((float)(now - s_prev_tick) / 1000.0f, 1);
+        usart1_send_string(" s\r\n");
+    }
+
+    usart1_send_string("Task         State Pri Stack CPU%  Avg%\r\n");
     for (UBaseType_t i = 0; i < n; i++) {
         cli_field(st[i].pcTaskName, 13);
         cli_field(cli_state_str(st[i].eCurrentState), 6);
         cli_uint_field((uint32_t)st[i].uxCurrentPriority, 4);
         cli_uint_field((uint32_t)st[i].usStackHighWaterMark, 6);   /* 剩餘堆疊（words），越小越接近爆 */
-        uint32_t pct = (div != 0U) ? (st[i].ulRunTimeCounter / div) : 0U;
-        cli_uint_field(pct, 3);
-        usart1_send_string("%\r\n");
+
+        /* 區間佔用：這支 task 在上一次快照裡的累積值找得到才算得出來。 */
+        int p = s_have_base ? cli_prev_index(st[i].xHandle) : -1;
+        if (p < 0 || div_int == 0U) {
+            cli_field("-", 6);              /* 沒基準 / 新 task / 區間太短 */
+        } else {
+            uint32_t d = st[i].ulRunTimeCounter - s_prev_rt[p];
+            cli_pct10_field(d / div_int, 6);
+        }
+
+        /* 累積佔用（原本的行為）。 */
+        cli_pct10_field((div_avg != 0U) ? (st[i].ulRunTimeCounter / div_avg) : 0U, 5);
+        usart1_send_string("\r\n");
     }
+
+    /* 這次的快照變成下次的基準。 */
+    for (UBaseType_t i = 0; i < n; i++) {
+        s_prev_handle[i] = st[i].xHandle;
+        s_prev_rt[i]     = st[i].ulRunTimeCounter;
+    }
+    s_prev_n     = n;
+    s_prev_total = total_run;
+    s_prev_tick  = now;
+    s_have_base  = 1;
 }
 
 /* 對齊的指令清單（開機、help、打錯指令都印這個）。 */
