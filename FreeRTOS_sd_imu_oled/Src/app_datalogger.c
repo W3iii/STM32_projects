@@ -5,12 +5,12 @@
  *  ─────────────────────────────────────────────
  *  與 bare-metal 版的差別：
  *    - 取樣（讀 MPU）移到 Sensor task；本模組只負責「寫入 + 狀態」。
- *    - 所有 FatFs/SD 操作包在 bus_lock()/bus_unlock()（SPI1 匯流排互斥，
+ *    - 所有 FatFs/SD 操作包在 spi1_lock()/spi1_unlock()（SPI1 匯流排互斥，
  *      和 OLED 共用同一支鎖，見 bus_port.h / bus_port_freertos.c）。
  *    - 狀態（state/count/filename）由自有的 s_state_mtx 保護，給 Display /
  *      CLI status 用 get_status() 一次取走。
  *
- *  鎖序：需要時 bus_lock 在外、s_state_mtx 在內（只有 writer 會巢狀），
+ *  鎖序：需要時 spi1_lock 在外、s_state_mtx 在內（只有 writer 會巢狀），
  *  讀者只取 s_state_mtx，故不會死鎖。
  *
  *  緩衝策略不變：FatFs 的 FIL 內建 512B sector 緩衝，f_printf 先累積，
@@ -21,7 +21,7 @@
  */
 
 #include "app_datalogger.h"
-#include "bus_port.h"       /* bus_lock / bus_unlock */
+#include "bus_port.h"       /* spi1_lock（FatFs/SD）/ i2c1_lock（MPU6050 init）*/
 #include "ff.h"
 #include "device_mpu6050.h"
 #include "FreeRTOS.h"
@@ -76,7 +76,13 @@ int app_datalogger_init(void)
     if (s_state_mtx == NULL) {
         return -3;
     }
-    if (mpu6050_init() != 0) {
+    /* mpu6050_init() 是「讀 WHO_AM_I → 寫 PWR_MGMT_1」兩筆交易，整段包在
+     * i2c1_lock 內才是原子的。此刻只有 bootstrap task 在跑，但照規矩上鎖，
+     * 免得日後有人把初始化搬到別處就踩到。 */
+    i2c1_lock();
+    int mpu_rc = mpu6050_init();
+    i2c1_unlock();
+    if (mpu_rc != 0) {
         return -1;                  /* WHO_AM_I 不對 */
     }
     s_mount_res = f_mount(&s_fs, "", 1);
@@ -103,14 +109,14 @@ int app_datalogger_start(void)
     }
 
     int rc = 0;
-    bus_lock();
+    spi1_lock();
     dl_make_filename();             /* 寫 s_filename（在 bus 內、稍後 state 內公布）*/
     if (f_open(&s_fil, s_filename, FA_WRITE | FA_CREATE_ALWAYS) != FR_OK) {
         rc = -2;
     } else {
         f_puts("t_ms,ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps,temp_c\n", &s_fil);
     }
-    bus_unlock();
+    spi1_unlock();
 
     if (rc != 0) {
         return rc;
@@ -141,10 +147,10 @@ int app_datalogger_stop(void)
     s_state = DL_IDLE;
     state_unlock();
 
-    bus_lock();
+    spi1_lock();
     f_sync(&s_fil);
     f_close(&s_fil);
-    bus_unlock();
+    spi1_unlock();
     return 0;
 }
 
@@ -190,7 +196,7 @@ int app_datalogger_write_sample(uint32_t t_ms,
 {
     int rc = 0;
 
-    bus_lock();
+    spi1_lock();
     if (s_state == DL_LOGGING) {
         /* raw int16 → 物理單位再寫入：加速度 g（3 位）、角速度 °/s（2 位）、溫度 °C（1 位）。 */
         char ax[12], ay[12], az[12], gx[12], gy[12], gz[12], tc[12];
@@ -211,17 +217,17 @@ int app_datalogger_write_sample(uint32_t t_ms,
             rc = 0;
         }
     }
-    bus_unlock();
+    spi1_unlock();
     return rc;
 }
 
 void app_datalogger_sync(void)
 {
-    bus_lock();
+    spi1_lock();
     if (s_state == DL_LOGGING) {
         f_sync(&s_fil);
     }
-    bus_unlock();
+    spi1_unlock();
 }
 
 void app_datalogger_get_status(dl_status_t *out)
@@ -265,8 +271,8 @@ void app_datalogger_set_producer(TaskHandle_t producer)
 }
 
 /* ───────────────── 檔案層操作（給 CLI 用）─────────────────
- * 全部 FatFs/SD 存取 + bus_lock 收在這裡，emit callback 在 bus_lock 內被回呼，
- * callback 內只能碰 UART、不可碰 SD/OLED（同一支 bus_lock）。 */
+ * 全部 FatFs/SD 存取 + spi1_lock 收在這裡，emit callback 在 spi1_lock 內被回呼，
+ * callback 內只能碰 UART、不可碰 SD/OLED（同一支 spi1_lock）。 */
 
 int dl_list(void (*emit)(const char *name, uint32_t size), uint32_t *free_kb_out)
 {
@@ -274,9 +280,9 @@ int dl_list(void (*emit)(const char *name, uint32_t size), uint32_t *free_kb_out
     FILINFO    fno;
     int        n = 0;
 
-    bus_lock();                 /* 整段目錄掃描 + getfree 與寫卡/OLED 互斥 */
+    spi1_lock();                 /* 整段目錄掃描 + getfree 與寫卡/OLED 互斥 */
     if (f_opendir(&dir, "/") != FR_OK) {
-        bus_unlock();
+        spi1_unlock();
         return -1;
     }
     while (f_readdir(&dir, &fno) == FR_OK && fno.fname[0] != '\0') {
@@ -300,7 +306,7 @@ int dl_list(void (*emit)(const char *name, uint32_t size), uint32_t *free_kb_out
             *free_kb_out = 0;
         }
     }
-    bus_unlock();
+    spi1_unlock();
     return n;
 }
 
@@ -310,9 +316,9 @@ int dl_dump(const char *name, void (*emit_line)(const char *line))
     char       line[64];
     int        rc = 0;
 
-    /* 整段 FatFs 讀取包在 bus_lock：和 Logger 寫卡、Display 畫 OLED 互斥
+    /* 整段 FatFs 讀取包在 spi1_lock：和 Logger 寫卡、Display 畫 OLED 互斥
      * （dump 期間 OLED 會短暫凍結，可接受）。 */
-    bus_lock();
+    spi1_lock();
     if (f_open(&f, name, FA_READ) != FR_OK) {
         rc = -1;
     } else {
@@ -323,7 +329,7 @@ int dl_dump(const char *name, void (*emit_line)(const char *line))
         }
         f_close(&f);
     }
-    bus_unlock();
+    spi1_unlock();
     return rc;
 }
 
@@ -363,9 +369,9 @@ int dl_clear(uint32_t *deleted_out)
 
     /* 只掃「真的存在」的檔：每輪重開目錄找第一個 log_*.csv 就刪、再重掃，
      * 直到掃不到為止。空目錄一次掃完即回 —— 不再盲目對 000..999 跑 1000 次
-     * f_unlink（那會抱著 bus_lock 掃目錄上千遍，看起來像當機）。
+     * f_unlink（那會抱著 spi1_lock 掃目錄上千遍，看起來像當機）。
      * 刪不掉就停手，避免同一檔一直被重掃造成無限迴圈。 */
-    bus_lock();
+    spi1_lock();
     for (;;) {
         if (f_opendir(&dir, "/") != FR_OK) {
             break;
@@ -392,7 +398,7 @@ int dl_clear(uint32_t *deleted_out)
         }
         n++;
     }
-    bus_unlock();
+    spi1_unlock();
     if (deleted_out) {
         *deleted_out = (uint32_t)n;
     }

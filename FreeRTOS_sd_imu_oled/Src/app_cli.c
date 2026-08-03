@@ -18,7 +18,7 @@
 #include "FreeRTOS.h"           /* tasks 指令：run-time stats */
 #include "task.h"              /* uxTaskGetSystemState */
 #include <string.h>
-/* 注意：本檔不再 #include "ff.h"、也不再呼叫 bus_lock —— 所有 FatFs/SD 存取
+/* 注意：本檔不再 #include "ff.h"、也不再呼叫 spi1_lock —— 所有 FatFs/SD 存取
  * 都委派給 app_datalogger 的 dl_list/dl_dump/dl_clear，CLI 只負責解析與印字。 */
 
 static char    s_line[32];
@@ -130,8 +130,8 @@ static void cli_status(void)
 }
 
 /* dl_dump 的 per-line 回呼：把一行印到 UART，行尾 \n 補 \r 才不會階梯。
- * 注意：此函式由 dl_dump() 在「持有 bus_lock 期間」回呼 → 只能碰 UART，
- * 不可碰 SD/OLED（同一支 bus_lock）。 */
+ * 注意：此函式由 dl_dump() 在「持有 spi1_lock 期間」回呼 → 只能碰 UART，
+ * 不可碰 SD/OLED（同一支 spi1_lock）。 */
 static void cli_emit_line(const char *line)
 {
     for (const char *p = line; *p; p++) {
@@ -146,7 +146,7 @@ static void cli_emit_line(const char *line)
  *   dump        → 本次 session 剛錄/上一個檔（app_datalogger_filename()）
  *   dump <file> → 指定檔名（配 ls 用，可印上一輪開機留下的 log）
  * 無參數版需要先 stop（記錄中檔案被開著寫，不重複開）。
- * 實際 FatFs 讀取在 app_datalogger 的 dl_dump() 內、包在 bus_lock 裡。 */
+ * 實際 FatFs 讀取在 app_datalogger 的 dl_dump() 內、包在 spi1_lock 裡。 */
 static void cli_dump(const char *arg)
 {
     const char *fn;
@@ -175,7 +175,7 @@ static void cli_dump(const char *arg)
     usart1_send_string("--- end ---\r\n");
 }
 
-/* dl_list 的 per-file 回呼：印檔名 + 大小。同樣在 bus_lock 期間被回呼，只碰 UART。 */
+/* dl_list 的 per-file 回呼：印檔名 + 大小。同樣在 spi1_lock 期間被回呼，只碰 UART。 */
 static void cli_emit_file(const char *name, uint32_t size)
 {
     usart1_send_string("  ");
@@ -186,7 +186,7 @@ static void cli_emit_file(const char *name, uint32_t size)
 }
 
 /* 列出根目錄的檔案 + 大小，再印剩餘空間。像真的設備 console。
- * 目錄掃描 + getfree 都在 dl_list() 內、包在 bus_lock 裡。 */
+ * 目錄掃描 + getfree 都在 dl_list() 內、包在 spi1_lock 裡。 */
 static void cli_ls(void)
 {
     uint32_t free_kb = 0;
@@ -221,7 +221,7 @@ static void cli_clear(void)
  * 一次快照全部 task（含 IDLE / Timer service）的狀態、優先權、堆疊剩餘水位、
  * CPU 佔用％。資料源是 uxTaskGetSystemState()（需 configUSE_TRACE_FACILITY=1），
  * CPU% 靠 run-time stats 計時器（TIM2，見 app_runtime_stats.c）。
- * 純唯讀 FreeRTOS 內部狀態，不碰 SD/OLED、不需 bus_lock、不新增 task/mutex。 */
+ * 純唯讀 FreeRTOS 內部狀態，不碰 SD/OLED、不需 spi1_lock、不新增 task/mutex。 */
 
 #define CLI_MAX_TASKS   12      /* 5 app task + IDLE，留餘裕（cli_field / cli_uint_field 定義在檔案上方）*/
 

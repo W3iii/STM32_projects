@@ -9,9 +9,9 @@
  *           佇列滿 → 計 overrun（不阻塞，保住取樣節奏）
  *    Logger (prio3, 事件驅動)
  *        └ xQueueReceive → app_datalogger_write_sample()；每 1s sync
- *           唯一主要寫卡者；FatFs 操作走 bus_lock（SPI1 互斥）
+ *           唯一主要寫卡者；FatFs 操作走 spi1_lock（SPI1 互斥）
  *    Display(prio1, 10Hz)
- *        └ 取狀態快照 → bus_lock → 畫 OLED → bus_unlock
+ *        └ 取狀態快照 → spi1_lock → 畫 OLED → spi1_unlock
  *    Console(prio2, 事件驅動)
  *        └ block 在 UART RX 通知（USART IDLE / DMA HT-TC）；醒來 app_cli_poll()
  *    Button(prio2, 事件驅動)
@@ -24,7 +24,7 @@
  *  共用資源與同步：
  *    qSamples : Sensor→Logger 佇列（producer/consumer 解耦，抗 SD stall）
  *    匯流排鎖 : SPI1 互斥（OLED 與 SD/FatFs 共用，SPEC §7.2-1）—— 實作在
- *               bus_port_freertos.c，本檔只呼叫 bus_port_init()/bus_lock()
+ *               bus_port_freertos.c，本檔只呼叫 bus_port_init()/spi1_lock()
  *    （狀態 mutex 在 app_datalogger.c，保護 state/count/filename）
  *
  *  Created on: Jun 20, 2026
@@ -35,7 +35,7 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include "queue.h"
-#include "bus_port.h"      /* bus_lock / bus_unlock / bus_port_init */
+#include "bus_port.h"      /* spi1_lock / spi1_unlock / bus_port_init */
 
 #include "systick.h"
 #include "driver_spi1.h"
@@ -75,7 +75,7 @@
 static QueueHandle_t     s_qSamples;
 static volatile uint32_t s_overruns;
 
-/* bus_lock()/bus_unlock() 的實作已搬到 bus_port_freertos.c（匯流排鎖屬於
+/* spi1_lock()/spi1_unlock() 的實作已搬到 bus_port_freertos.c（匯流排鎖屬於
  * bus 自己，見 bus_port.h）；這裡只在 app_tasks_start() 呼叫 bus_port_init()。 */
 
 uint32_t app_tasks_overruns(void) { return s_overruns; }
@@ -129,8 +129,10 @@ static void sensor_task(void *arg)
 
             imu_sample_t s;
             s.t_ms = systick_get_ms();
-            mpu6050_read_all(&s.acc, &s.gyro);
-            s.temp_c = tempsensor_read_c();          /* 同一時間點的晶片溫度 */
+            i2c1_lock();                             /* I2C1 互斥：CLI 的 i2cscan / 之後的 INA219 也會上這條 bus */
+            mpu6050_read_all(&s.acc, &s.gyro);       /* 單次 14-byte burst，鎖住的時間 ~1.5ms */
+            i2c1_unlock();
+            s.temp_c = tempsensor_read_c();          /* 同一時間點的晶片溫度（ADC，不走 I2C）*/
             s_last_temp_c10 = (int32_t)(s.temp_c * 10.0f);   /* 給 Display 顯示 */
 
             if (xQueueSend(s_qSamples, &s, 0) != pdTRUE) {
@@ -168,7 +170,7 @@ static void display_task(void *arg)
         dl_status_t st;
         app_datalogger_get_status(&st);
 
-        bus_lock();
+        spi1_lock();
         ssd1306_clear();
         ssd1306_draw_string(0, 0, "IMU LOGGER");
         if (st.state == DL_LOGGING) {
@@ -194,7 +196,7 @@ static void display_task(void *arg)
         tline[ti]   = '\0';
         ssd1306_draw_string(0, 48, tline);
         ssd1306_update_screen();            /* 同步更新，鎖內完成 */
-        bus_unlock();
+        spi1_unlock();
 
         vTaskDelay(pdMS_TO_TICKS(DISPLAY_PERIOD_MS));
     }

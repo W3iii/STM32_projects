@@ -8,7 +8,7 @@
  *    Console(prio2,~10ms) UART CLI + 按鈕
  *
  *  對外只暴露啟動進入點 app_tasks_start()。共用的 SPI1 匯流排鎖
- *  bus_lock()/bus_unlock() 已移到 bus_port.h（RTOS 中立的 porting 介面，
+ *  spi1_lock()/spi1_unlock() 已移到 bus_port.h（RTOS 中立的 porting 介面，
  *  OLED 與 SD/FatFs 共用同一支鎖）。
  *
  *  Created on: Jun 20, 2026

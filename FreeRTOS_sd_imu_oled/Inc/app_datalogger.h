@@ -6,7 +6,7 @@
  *    - Sensor task 讀 MPU6050 → 丟 queue
  *    - Logger task 從 queue 取 → app_datalogger_write_sample() 寫 CSV/SD
  *  本模組負責 FIL/狀態的擁有權與鎖：
- *    - 所有 FatFs/SD 操作包在 bus_lock()（SPI1 匯流排互斥，見 bus_port.h）
+ *    - 所有 FatFs/SD 操作包在 spi1_lock()（SPI1 匯流排互斥，見 bus_port.h）
  *    - 狀態快照（state/count/filename）由自有的 mState 保護
  *
  *  Created on: Jun 18, 2026
@@ -75,11 +75,11 @@ const char *app_datalogger_filename(void);
 void app_datalogger_set_producer(TaskHandle_t producer);
 
 /* ── 檔案層操作（給 CLI / console 用）──
- * 把所有 FatFs/SD 存取與 bus_lock 收進本模組，CLI 不再直接碰 ff.h / bus_lock。
+ * 把所有 FatFs/SD 存取與 spi1_lock 收進本模組，CLI 不再直接碰 ff.h / spi1_lock。
  *
- * 重要：emit 類 callback 會在「本模組持有 bus_lock 期間」被回呼。callback 內
+ * 重要：emit 類 callback 會在「本模組持有 spi1_lock 期間」被回呼。callback 內
  *       只能做 UART（usart1_*）等「不在 SPI bus 上」的事，絕對不可再碰 SD 或
- *       OLED（共用同一支 bus_lock）→ 會重入死鎖。
+ *       OLED（共用同一支 spi1_lock）→ 會重入死鎖。
  */
 
 /* 列出根目錄所有檔案，每個檔呼叫一次 emit(name,size)；free_kb_out 取回剩餘 KB
