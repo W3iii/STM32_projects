@@ -35,11 +35,21 @@
 #define SHUNT_LSB_MV    0.01f       /* shunt LSB = 10µV = 0.01mV */
 #define BUS_LSB_V       0.004f      /* bus   LSB = 4mV           */
 
-/* 讀一個 16-bit 暫存器（MSB first）。 */
+/* 讀一個 16-bit 暫存器（MSB first）。
+ *
+ * 用非同步版有兩個理由：
+ *   1) Display task 每 100ms 讀兩次（shunt + bus），400kHz 下每筆交易約 250µs，
+ *      polling 的話這 0.5ms 全算成 display 的 CPU 時間。
+ *   2) len==2 會走 I2C 的 POS 路徑 —— 那是 F4 這顆周邊最容易出錯的地方，
+ *      而專案裡原本只有 mpu6050 的 len=14 在跑 async，POS 那條只有 host
+ *      測試驗過、真機上從沒執行。掛在 10Hz 的 Display 上等於持續驗證。
+ *
+ * 呼叫端（bootstrap 的 ina219_init、Display 的 ina219_read）都已持有
+ * i2c1_lock，且都在排程器啟動後才跑，符合 async 版的前提。 */
 static int ina219_read16(uint8_t reg, uint16_t *out)
 {
     uint8_t buf[2];
-    if (i2c1_read_regs(INA219_ADDR, reg, buf, 2) != I2C_OK) {
+    if (i2c1_read_regs_async(INA219_ADDR, reg, buf, 2) != I2C_OK) {
         return -1;
     }
     *out = (uint16_t)((uint16_t)buf[0] << 8 | buf[1]);
