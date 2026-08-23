@@ -614,10 +614,26 @@ i2c_status_t i2c1_read_regs_async(uint8_t slave, uint8_t reg, uint8_t *buf, uint
     s_a.done   = 0;
     s_a.state  = AST_SB_W;
 
+    /* 清掉上一筆交易可能留下的錯誤旗標。
+     *
+     * SR1 的錯誤位元是準位觸發的：只要 AF/BERR/ARLO/OVR 還留著，下面那行
+     * 一開 ITERREN，ER 中斷就會在 START 之前當場觸發 —— i2c_async_finish()
+     * 會關掉中斷、give 號誌，於是這筆交易「還沒開始就結束了」，
+     * i2c1_xfer_wait() 立刻返回並回報 NACK，而那個沒人收拾的 START 留在
+     * 匯流排上，讓下一筆更容易產生 BERR。是會自我延續的失敗迴圈。
+     *
+     * 殘留從哪來：polling 路徑的 wait_flag()（等 SB/TXE/BTF/RXNE）不會清 AF，
+     * 資料階段一旦 NACK 旗標就留著了。 */
+    I2C1->SR1 &= ~(I2C_SR1_AF | I2C_SR1_BERR | I2C_SR1_ARLO | I2C_SR1_OVR);
+
     I2C1->CR1 |= I2C_CR1_ACK;
-    /* 寫入階段不開 ITBUFEN（見上方陷阱 1），讀取階段才依長度打開 */
-    I2C1->CR2 |= (I2C_CR2_ITEVTEN | I2C_CR2_ITERREN);
+
+    /* 先發 START，再開中斷。SB 同樣是準位觸發，所以就算 START 很快完成、
+     * SB 在開中斷之前就置位，ITEVTEN 一開仍會立刻進 ISR，不會漏事件。
+     * 反過來（先開中斷）就有上面說的空窗。
+     * 寫入階段不開 ITBUFEN（見上方陷阱 1），讀取階段才依長度打開。 */
     I2C1->CR1 |= I2C_CR1_START;
+    I2C1->CR2 |= (I2C_CR2_ITEVTEN | I2C_CR2_ITERREN);
 
     if (i2c1_xfer_wait() != 0) {
         /* 狀態機沒把交易推完（bus stuck、中斷沒來）。把周邊收乾淨再回報，
