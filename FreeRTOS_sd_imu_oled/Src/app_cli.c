@@ -119,6 +119,20 @@ static void cli_status(void)
     dl_status_t st;
     app_datalogger_get_status(&st);     /* 一次取走快照（mState 保護）*/
 
+    /* SD 沒掛上時系統會進降級模式：CLI/OLED/i2cscan 都還在，只是 start 會失敗。
+     * 這一行要放最前面 —— 掛載失敗時它才是你第一個該看到的東西。 */
+    if (!app_datalogger_mounted()) {
+        cli_label("SD");
+        usart1_send_string("NOT MOUNTED (logging disabled, FRESULT ");
+        cli_print_u32((uint32_t)app_datalogger_mount_result());
+        usart1_send_string(")\r\n");
+    } else if (app_datalogger_mount_retries() > 0) {
+        cli_label("SD");
+        usart1_send_string("mounted after ");
+        cli_print_u32((uint32_t)app_datalogger_mount_retries());
+        usart1_send_string(" retry (power margin?)\r\n");
+    }
+
     cli_label("state");
     usart1_send_string(st.state == DL_LOGGING ? "LOGGING\r\n"
                      : st.state == DL_ERROR   ? "ERROR (write failed)\r\n"
@@ -154,6 +168,22 @@ static void cli_status(void)
     cli_label("i2c recov");
     cli_print_u32(app_tasks_i2c_recovers());
     usart1_send_string("\r\n");
+
+    /* 非同步 I2C 的失敗次數，依類型分開 —— 三者指向完全不同的方向，
+     * 混成一個數字就沒辦法對症下藥。理想全 0；偶爾跳 nack 在麵包板上
+     * 算正常（Display 對 INA219 有一次重試，所以畫面不一定會閃 "--"）。 */
+    {
+        uint32_t nack = 0, bus = 0, tmo = 0;
+        i2c1_async_err_counts(&nack, &bus, &tmo);
+        cli_label("i2c err");
+        usart1_send_string("nack ");
+        cli_print_u32(nack);
+        usart1_send_string("  bus ");
+        cli_print_u32(bus);
+        usart1_send_string("  timeout ");
+        cli_print_u32(tmo);
+        usart1_send_string("\r\n");
+    }
 
     /* 晶片溫度（VREFINT 補償後）＋ 反推的實際 VDDA。die 溫，非室溫。 */
     cli_label("chip");

@@ -464,12 +464,33 @@ static struct {
     uint8_t               len;
 } s_a;
 
+/* 非同步交易的失敗統計。三種失敗指向完全不同的方向，混在一起就沒辦法
+ * 對症下藥：
+ *   nack    slave 沒回應 —— 供電、接觸、位址
+ *   bus     BERR/ARLO/OVR —— 電氣雜訊，或 ISR 被延遲太久（400kHz 下
+ *           每 22.5µs 就來一個 byte，來不及服務就 overrun）
+ *   timeout 狀態機根本沒被推動 —— 匯流排卡住
+ * 只統計 async 路徑；polling 路徑的錯誤由各呼叫端自己處理。 */
+static volatile uint32_t s_err_nack;
+static volatile uint32_t s_err_bus;
+static volatile uint32_t s_err_timeout;
+
+void i2c1_async_err_counts(uint32_t *nack, uint32_t *bus, uint32_t *timeout)
+{
+    if (nack)    { *nack    = s_err_nack;    }
+    if (bus)     { *bus     = s_err_bus;     }
+    if (timeout) { *timeout = s_err_timeout; }
+}
+
 /* 收尾：關中斷、把 ACK/POS 復原成下一筆交易的預設值，喚醒等待者。 */
 static void i2c_async_finish(i2c_status_t st)
 {
     I2C1->CR2 &= ~(I2C_CR2_ITEVTEN | I2C_CR2_ITBUFEN | I2C_CR2_ITERREN);
     I2C1->CR1 &= ~I2C_CR1_POS;
     I2C1->CR1 |=  I2C_CR1_ACK;
+
+    if (st == I2C_ERR_NACK) { s_err_nack++; }
+    else if (st != I2C_OK)  { s_err_bus++;  }
 
     s_a.state  = AST_IDLE;
     s_a.status = st;
@@ -628,6 +649,18 @@ i2c_status_t i2c1_read_regs_async(uint8_t slave, uint8_t reg, uint8_t *buf, uint
 
     I2C1->CR1 |= I2C_CR1_ACK;
 
+    /* 等匯流排空下來再發 START。RM0090 要求 START 只能在 BUSY=0 時發起，
+     * 否則可能產生不了正確的 START。ina219_read() 連續兩筆交易背靠背，
+     * 第一筆的 STOP 在線上還要約一個 SCL 週期（400kHz 下 2.5µs）才成形，
+     * 而 task 被喚醒後可能更快就發下一個 START —— 這是偶發失敗的合理來源。
+     * 上限抓短（幾百µs）：真的卡住由後面的 50ms 逾時處理，這裡不該久等。 */
+    {
+        uint32_t spin = 20000U;      /* @168MHz 約數百µs */
+        while ((I2C1->SR2 & I2C_SR2_BUSY) && spin) {
+            spin--;
+        }
+    }
+
     /* 先發 START，再開中斷。SB 同樣是準位觸發，所以就算 START 很快完成、
      * SB 在開中斷之前就置位，ITEVTEN 一開仍會立刻進 ISR，不會漏事件。
      * 反過來（先開中斷）就有上面說的空窗。
@@ -644,6 +677,7 @@ i2c_status_t i2c1_read_regs_async(uint8_t slave, uint8_t reg, uint8_t *buf, uint
         I2C1->CR1 |=  I2C_CR1_ACK;
         s_a.state  = AST_IDLE;
         s_a.done   = 1;
+        s_err_timeout++;
         return I2C_ERR_TIMEOUT;
     }
 

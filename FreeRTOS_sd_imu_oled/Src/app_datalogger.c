@@ -38,6 +38,7 @@ static uint8_t    s_mounted;
 static SemaphoreHandle_t s_state_mtx;   /* 保護 s_state / s_count / s_filename */
 static uint8_t    s_fres;               /* 最後一次寫入失敗的 FatFs FRESULT */
 static uint32_t   s_err_count;          /* 累計寫入失敗次數 */
+static uint8_t    s_mount_retries;      /* 開機掛載重試了幾次（0 = 一次就過）*/
 
 static TaskHandle_t s_producer;         /* sensor task handle；start 成功時喚醒它 */
 
@@ -87,7 +88,26 @@ int app_datalogger_init(void)
     if (mpu_rc != 0) {
         return -1;                  /* WHO_AM_I 不對 */
     }
-    s_mount_res = f_mount(&s_fs, "", 1);
+    /* 掛載重試：f_mount(opt=1) 會呼叫 disk_initialize() → sd_init()，而
+     * diskio 沒有快取狀態，每次都真的重跑一次初始化，所以重試是有意義的。
+     *
+     * 為什麼需要：實測會「偶爾」掛不起來，FRESULT=3 (FR_NOT_READY) 代表
+     * CMD0/ACMD41 沒走完 —— SD 卡在初始化期間對供電最敏感，而板子目前是
+     * ST-LINK USB 供電，3.3V LDO 的餘裕本來就很小。這是邊界狀態，不是
+     * 確定性失敗，所以重試很有效。
+     *
+     * 每次之間隔 200ms 讓電源與卡片內部穩定；三次都失敗才真的放棄。
+     * 跑在 bootstrap task 脈絡，vTaskDelay 合法。 */
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (attempt > 0) {
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
+        s_mount_res = f_mount(&s_fs, "", 1);
+        if (s_mount_res == FR_OK) {
+            break;
+        }
+        s_mount_retries++;
+    }
     if (s_mount_res != FR_OK) {
         return -2;                  /* 掛載失敗：FRESULT 存在 s_mount_res */
     }
@@ -288,6 +308,20 @@ dl_state_t app_datalogger_state(void)
     s = s_state;
     state_unlock();
     return s;
+}
+
+/* 開機掛載重試次數。非 0 代表 SD 卡第一次沒起來 —— 通常是供電邊界，
+ * 值得在硬體上處理（獨立 3.3V、加大電容），別等到寫入時才炸。 */
+int app_datalogger_mount_retries(void)
+{
+    return (int)s_mount_retries;
+}
+
+/* SD 卡目前有沒有掛上。掛不起來時系統會進降級模式：CLI/OLED 照常，
+ * 只是 start 會失敗。 */
+int app_datalogger_mounted(void)
+{
+    return (int)s_mounted;
 }
 
 uint32_t app_datalogger_count(void)

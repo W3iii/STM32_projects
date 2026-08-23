@@ -119,6 +119,14 @@ i2c_status_t i2c1_read_regs_async(uint8_t slave, uint8_t reg, uint8_t *buf, uint
  * （退化成 busy-wait），一般應用不需要呼叫。 */
 int i2c1_async_busy(void);
 
+/* 非同步交易的累計失敗次數，依類型分開（任一指標可為 NULL）。
+ * 三種失敗指向完全不同的方向：
+ *   nack     slave 沒回應 —— 供電、接觸、位址
+ *   bus      BERR/ARLO/OVR —— 電氣雜訊，或 ISR 被延遲太久
+ *   timeout  狀態機沒被推動 —— 匯流排卡住
+ * 理想全為 0；偶爾跳 nack 在麵包板上算正常，持續累積就要查硬體。 */
+void i2c1_async_err_counts(uint32_t *nack, uint32_t *bus, uint32_t *timeout);
+
 i2c_status_t i2c1_bus_recovery(void);
 
 /*

@@ -308,6 +308,16 @@ static void display_task(void *arg)
             ina219_data_t p;
             i2c1_lock();
             int rc = ina219_read(&p);       /* 兩筆交易，整段包在鎖內才同時刻 */
+            if (rc != 0) {
+                /* 重試一次。ina219_read 是兩筆交易，任一筆遇到暫時性的
+                 * NACK / 雜訊整個讀取就作廢，而原本沒有任何重試 —— 於是
+                 * 偶發一次 glitch 就讓這一幀顯示 "--"。麵包板上的 I2C 偶爾
+                 * 出錯是常態，一次重試就能把絕大多數蓋掉。
+                 * 代價：失敗時多花約 500µs（10Hz 下可忽略）。
+                 * 真正的失敗率仍然看得到 —— status 的 i2c err 是在 driver
+                 * 層計數的，重試不會把它藏起來。 */
+                rc = ina219_read(&p);
+            }
             i2c1_unlock();
             taskENTER_CRITICAL();
             if (rc == 0) {
@@ -448,18 +458,29 @@ static void bootstrap_task(void *arg)
         "\r\n");
 
     /* ---- Application 初始化（MPU6050 + 掛載 FAT32）---- */
+    /* ---- 初始化失敗不再 vTaskSuspend ----
+     * 原本任何一項失敗就把 bootstrap 掛起，但建立工作 task 是在這之後 ——
+     * 結果是「SD 掛不起來 → console task 從沒被建立 → 連 CLI 都沒有」，
+     * 正好在最需要 i2cscan / status 診斷的時候把工具弄丟了。
+     *
+     * 改成降級模式：照樣把所有 task 建起來，只是 app_datalogger_start()
+     * 會因為 s_mounted == 0 而失敗。CLI、OLED、i2cscan、power、tasks 全部可用。
+     * 這在供電邊界的板子上很重要 —— 失敗時你需要一台還能跟你對話的機器。 */
     int rc = app_datalogger_init();
     if (rc == -1) {
-        usart1_send_string("[FATAL] MPU6050 not found\r\n");
+        usart1_send_string("[WARN] MPU6050 not found -> logging disabled\r\n"
+                           "       CLI still up; try: i2cscan\r\n");
         ssd1306_clear();
         ssd1306_draw_string(0, 0, "MPU FAIL");
+        ssd1306_draw_string(0, 16, "CLI OK");
         ssd1306_update_screen();
-        vTaskSuspend(NULL);
     } else if (rc == -2) {
         int mr = app_datalogger_mount_result();   /* FRESULT: 13=非FAT32, 1/3=SPI/卡片 */
-        usart1_send_string("[FATAL] FAT32 mount failed, FRESULT=");
+        usart1_send_string("[WARN] FAT32 mount failed after 3 tries, FRESULT=");
         char num[4] = { (char)('0' + (mr / 10) % 10), (char)('0' + mr % 10), '\r', '\n' };
         usart1_send((const uint8_t *)num, 4);
+        usart1_send_string("       3=NOT_READY(card/power)  1=DISK_ERR  13=not FAT32\r\n"
+                           "       logging disabled; CLI still up\r\n");
         ssd1306_clear();
         ssd1306_draw_string(0, 0, "FS FAIL");
         ssd1306_draw_string(0, 16, "FRES:");
@@ -467,12 +488,19 @@ static void bootstrap_task(void *arg)
         ssd1306_draw_string(0, 32, "SDINIT:");      /* 卡在哪一步：1=CMD0 3=ACMD41 */
         ssd1306_draw_int(64, 32, sd_last_init_rc);
         ssd1306_update_screen();
-        vTaskSuspend(NULL);
     } else if (rc != 0) {
-        usart1_send_string("[FATAL] init error\r\n");
+        /* -3 = state mutex 建不出來，那是 heap 不夠，沒得降級。 */
+        usart1_send_string("[FATAL] init error (out of heap?)\r\n");
         vTaskSuspend(NULL);
+    } else {
+        usart1_send_string("  [ok] sensors + FAT32 ready");
+        if (app_datalogger_mount_retries() > 0) {
+            /* 一次就過才是健康的。需要重試代表 SD 在初始化期間電壓不夠穩 ——
+             * 這次被重試救回來了，但它是供電邊界的早期警訊，值得在硬體上處理。 */
+            usart1_send_string("  (mount retried)");
+        }
+        usart1_send_string("\r\n");
     }
-    usart1_send_string("  [ok] sensors + FAT32 ready\r\n");
 
     /* ---- INA219（選配）----
      * 沒接不算致命：只是 OLED 第 3 行與 CLI power 顯示 "--"，其餘照跑。

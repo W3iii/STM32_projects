@@ -54,6 +54,12 @@ int app_datalogger_init(void);
  *   1=FR_DISK_ERR / 3=FR_NOT_READY → SPI/卡片；13=FR_NO_FILESYSTEM → 不是 FAT32。 */
 int app_datalogger_mount_result(void);
 
+/* 開機掛載重試了幾次（0 = 一次就過）。非 0 是供電邊界的早期警訊。 */
+int app_datalogger_mount_retries(void);
+
+/* SD 是否已掛載。0 = 降級模式（CLI/OLED 可用，start 會失敗）。 */
+int app_datalogger_mounted(void);
+
 /* 開新檔 log_NNN.csv、寫表頭、進 LOGGING。回傳 0=OK / <0=失敗。 */
 int app_datalogger_start(void);
 
