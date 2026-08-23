@@ -37,6 +37,10 @@ void app_tasks_start(void);
 /* Sensor 因佇列滿而丟棄的樣本數（理想為 0；給 CLI status 觀察用）。 */
 uint32_t app_tasks_overruns(void);
 
+/* Sensor 因連續 I2C 讀取失敗而觸發 bus recovery 的累計次數（理想為 0）。
+ * 非 0 代表 I2C 匯流排曾經卡住 —— 通常是供電、接觸或拉電阻的問題。 */
+uint32_t app_tasks_i2c_recovers(void);
+
 /* IDLE task 要不要用 WFI 睡覺（1 = 睡，0 = 空轉）。CLI 的 wfi 指令直接改它，
  * 實作與完整說明在 app_tasks.c 的 vApplicationIdleHook。 */
 extern volatile uint8_t g_wfi_enabled;

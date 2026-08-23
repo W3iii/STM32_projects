@@ -36,6 +36,7 @@
 #define I2C_SR1_AF          (1U << 10)   /* Acknowledge failure (= NACK) */
 #define I2C_SR1_ARLO        (1U << 9)    /* Arbitration lost */
 #define I2C_SR1_BERR        (1U << 8)    /* Bus error */
+#define I2C_SR1_OVR         (1U << 11)   /* Overrun/underrun */
 
 /* SR2 */
 #define I2C_SR2_BUSY        (1U << 1)    /* Bus busy */
@@ -583,6 +584,10 @@ void I2C1_ER_IRQHandler(void)
         }
         if (sr1 & I2C_SR1_BERR) { I2C1->SR1 &= ~I2C_SR1_BERR; }
         if (sr1 & I2C_SR1_ARLO) { I2C1->SR1 &= ~I2C_SR1_ARLO; }
+        /* OVR 也在 ITERREN 的致能範圍內，必須清掉 —— 留著的話旗標會
+         * 髒在 SR1 裡帶進下一筆交易。400kHz 下每 22.5us 就來一個 byte，
+         * ISR 被延遲就可能 overrun。 */
+        if (sr1 & I2C_SR1_OVR)  { I2C1->SR1 &= ~I2C_SR1_OVR; }
 
         I2C1->CR1 |= I2C_CR1_STOP;          /* 收尾，釋放 bus */
         i2c_async_finish(st);

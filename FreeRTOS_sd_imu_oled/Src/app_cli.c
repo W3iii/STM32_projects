@@ -120,8 +120,10 @@ static void cli_status(void)
     app_datalogger_get_status(&st);     /* 一次取走快照（mState 保護）*/
 
     cli_label("state");
-    usart1_send_string(st.state == DL_LOGGING ? "LOGGING\r\n" : "IDLE\r\n");
-    if (st.state == DL_LOGGING) {
+    usart1_send_string(st.state == DL_LOGGING ? "LOGGING\r\n"
+                     : st.state == DL_ERROR   ? "ERROR (write failed)\r\n"
+                                              : "IDLE\r\n");
+    if (st.state == DL_LOGGING || st.state == DL_ERROR) {
         cli_label("file");
         usart1_send_string(st.filename);
         usart1_send_string("\r\n");
@@ -129,8 +131,28 @@ static void cli_status(void)
         cli_print_u32(st.count);
         usart1_send_string("\r\n");
     }
+
+    /* 寫入錯誤。非 0 就代表有樣本沒被寫進卡片 —— 以前這件事完全沒有出口，
+     * state 停在 LOGGING、計數不動，看起來像「還在錄」。
+     * fres 是 FatFs 的 FRESULT（1=FR_DISK_ERR、2=FR_INT_ERR、9=FR_INVALID_OBJECT…），
+     * FR_DISK_ERR 多半是供電/接觸不良，或卡片忙碌超過 SD_WRITE_TIMEOUT_MS。 */
+    cli_label("write err");
+    cli_print_u32(st.err_count);
+    if (st.fres != 0) {
+        usart1_send_string(" (FRESULT ");
+        cli_print_u32(st.fres);
+        usart1_send_string(")");
+    }
+    usart1_send_string("\r\n");
+
     cli_label("overruns");
     cli_print_u32(app_tasks_overruns());    /* Sensor 因佇列滿丟棄數，理想 0 */
+    usart1_send_string("\r\n");
+
+    /* Sensor 連續 I2C 讀取失敗而觸發 bus recovery 的次數，理想 0。
+     * 非 0 代表匯流排曾經卡住 —— 通常是供電、接觸或拉電阻的問題。 */
+    cli_label("i2c recov");
+    cli_print_u32(app_tasks_i2c_recovers());
     usart1_send_string("\r\n");
 
     /* 晶片溫度（VREFINT 補償後）＋ 反推的實際 VDDA。die 溫，非室溫。 */

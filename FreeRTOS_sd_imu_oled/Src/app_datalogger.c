@@ -36,6 +36,8 @@ static char       s_filename[16];   /* "log_NNN.csv" + '\0' */
 static uint8_t    s_mounted;
 
 static SemaphoreHandle_t s_state_mtx;   /* 保護 s_state / s_count / s_filename */
+static uint8_t    s_fres;               /* 最後一次寫入失敗的 FatFs FRESULT */
+static uint32_t   s_err_count;          /* 累計寫入失敗次數 */
 
 static TaskHandle_t s_producer;         /* sensor task handle；start 成功時喚醒它 */
 
@@ -108,6 +110,18 @@ int app_datalogger_start(void)
         return 0;                   /* 已在記錄 */
     }
 
+    /* 從 DL_ERROR 直接 start：上一個檔案還開著（write_sample 失敗時刻意不關，
+     * 把已寫入的部分留給 stop 收尾）。這裡要先把它關掉再開新檔，否則
+     * f_open 會蓋掉 s_fil，舊檔的 FAT/目錄項永遠寫不回去 —— 那一段資料就沒了。 */
+    if (app_datalogger_state() == DL_ERROR) {
+        spi1_lock();
+        f_close(&s_fil);            /* 已經壞掉了，f_close 的結果不必再看 */
+        spi1_unlock();
+        state_lock();
+        s_state = DL_IDLE;
+        state_unlock();
+    }
+
     int rc = 0;
     spi1_lock();
     dl_make_filename();             /* 寫 s_filename（在 bus 內、稍後 state 內公布）*/
@@ -124,6 +138,7 @@ int app_datalogger_start(void)
 
     state_lock();
     s_count = 0;
+    s_fres  = 0;            /* 新 session：清掉上一次的錯誤碼（err_count 累計保留）*/
     s_state = DL_LOGGING;
     state_unlock();
 
@@ -138,7 +153,11 @@ int app_datalogger_start(void)
 
 int app_datalogger_stop(void)
 {
-    if (app_datalogger_state() != DL_LOGGING) {
+    dl_state_t st = app_datalogger_state();
+
+    /* DL_ERROR 也要能 stop：檔案還開著，要 f_close 把已寫入的部分
+     * 收尾到 FAT，否則整個 session 的資料都拿不回來。 */
+    if (st != DL_LOGGING && st != DL_ERROR) {
         return 0;
     }
 
@@ -215,6 +234,16 @@ int app_datalogger_write_sample(uint32_t t_ms,
             s_count++;
             state_unlock();
             rc = 0;
+        } else {
+            /* FatFs 已經把錯誤鎖進 s_fil.err，之後每次 f_write 都會在
+             * 開頭直接返回。所以這次 session 到此為止，翻成 DL_ERROR：
+             * Sensor 會停止取樣、Logger 不再嘗試寫，使用者看得到。
+             * 檔案先不關 —— 留給 stop 去 f_close，已寫進去的資料保住。 */
+            state_lock();
+            s_fres = (uint8_t)s_fil.err;
+            s_err_count++;
+            s_state = DL_ERROR;
+            state_unlock();
         }
     }
     spi1_unlock();
@@ -225,7 +254,16 @@ void app_datalogger_sync(void)
 {
     spi1_lock();
     if (s_state == DL_LOGGING) {
-        f_sync(&s_fil);
+        /* f_sync 失敗代表 FAT/目錄項沒寫回去，跟寫樣本失敗一樣嚴重，
+         * 同樣要翻狀態，不能再默默丟掉回傳值。 */
+        FRESULT fr = f_sync(&s_fil);
+        if (fr != FR_OK) {
+            state_lock();
+            s_fres = (uint8_t)fr;
+            s_err_count++;
+            s_state = DL_ERROR;
+            state_unlock();
+        }
     }
     spi1_unlock();
 }
@@ -235,6 +273,8 @@ void app_datalogger_get_status(dl_status_t *out)
     state_lock();
     out->state = s_state;
     out->count = s_count;
+    out->fres      = s_fres;
+    out->err_count = s_err_count;
     for (int i = 0; i < (int)sizeof(s_filename); i++) {
         out->filename[i] = s_filename[i];
     }

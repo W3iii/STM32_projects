@@ -244,7 +244,9 @@ void ssd1306_update_screen(void)
     OLED_DC_HIGH();
     OLED_CS_LOW();
 
-    spi1_send_buffer(framebuffer, 1024);     // ← 同步 DMA，內部會等到 SPI 完全傳完
+    /* 逾時時回 -1，但 OLED 少畫一幀不影響記錄，刻意忽略；
+     * 重點是 spi1_wait_done 現在有上限，不會抱著 spi1_lock 空轉。 */
+    (void)spi1_send_buffer(framebuffer, 1024);
 
     OLED_CS_HIGH();
 }
@@ -269,7 +271,7 @@ void ssd1306_update_screen_async(void)
 
 void ssd1306_wait_update_done(void)
 {
-    spi1_wait_done();        // 等 DMA + SPI 完成
+    (void)spi1_wait_done();  // 等 DMA + SPI 完成（逾時回 -1，同上刻意忽略）
     OLED_CS_HIGH();          // 才拉高 CS
 }
 

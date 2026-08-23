@@ -23,14 +23,26 @@
 
 typedef enum {
     DL_IDLE = 0,   /* 待命，沒在記錄 */
-    DL_LOGGING     /* 記錄中 */
+    DL_LOGGING,    /* 記錄中 */
+    DL_ERROR       /* 寫入失敗，本次 session 已作廢（見下方說明）*/
 } dl_state_t;
+
+/* 為什麼要有 DL_ERROR：FatFs 在任何一次寫入失敗時會把錯誤鎖進
+ * fp->err（ff.c 的 ABORT 巨集），之後每一次 f_write 都在函式開頭直接
+ * 返回、連 SD 卡都不碰。原本的程式碼只是「成功才 count++」，失敗時
+ * 什麼都不做，於是 state 停在 LOGGING、CLI 說在錄、OLED 有畫面、
+ * CPU 用量完全正常，但一筆都沒寫進去 —— 實際踩過一次（供電不穩導致
+ * SD 寫入逾時）。既然錯誤是鎖住的，第一次失敗就等於整個 session 作廢，
+ * 所以直接翻到 DL_ERROR：Sensor 會停止取樣、Logger 不再嘗試寫入，
+ * 使用者從 status / OLED 立刻看得到。 */
 
 /* 狀態快照：給 Display / CLI status 一次取走，避免讀到半更新的欄位。 */
 typedef struct {
     dl_state_t state;
     uint32_t   count;        /* 本次 session 已記錄筆數 */
     char       filename[16]; /* 目前/上一個檔名 */
+    uint8_t    fres;         /* 失敗時的 FatFs FRESULT（fp->err）；0 = 沒錯 */
+    uint32_t   err_count;    /* 累計寫入失敗次數（跨 session 不清）*/
 } dl_status_t;
 
 /* 初始化：建立狀態 mutex、初始化 MPU6050 + 掛載 FAT32。

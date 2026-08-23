@@ -15,7 +15,7 @@ void spi1_init(void);
 
 /* 同步：等到完成才 return */
 void spi1_send_byte  (uint8_t b);
-void spi1_send_buffer(const uint8_t *buf, uint32_t len);
+int  spi1_send_buffer(const uint8_t *buf, uint32_t len);
 
 /* 全雙工：送一個 byte 同時收回 MISO（SD 卡用） */
 uint8_t spi1_transfer_byte(uint8_t b);
@@ -28,6 +28,9 @@ void spi1_send_buffer_async(const uint8_t *buf, uint32_t len);
 
 /* 狀態查詢 */
 int  spi1_is_busy(void);
-void spi1_wait_done(void);
+/* 等 DMA + SPI 傳完。回傳 0 = 正常，-1 = 逾時。
+ * 逾時時 DMA stream 已被關掉、busy 旗標已放掉，SPI1 可以交給下一個使用者 ——
+ * 呼叫端就算忽略回傳值，也不會像以前那樣抱著 spi1_lock 永久空轉。 */
+int spi1_wait_done(void);
 
 #endif /* SPI_DRIVER_H_ */

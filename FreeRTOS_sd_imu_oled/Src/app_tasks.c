@@ -57,6 +57,10 @@
 #define LOGGER_SYNC_MS       1000        /* 每秒 f_sync */
 #define BTN_DEBOUNCE_MS      20          /* EXTI 喚醒後等接點沉澱，再重讀電位確認 */
 
+/* 連續幾次 I2C 讀取失敗才觸發 bus recovery。偶發一次（雜訊、暫時性 NACK）
+ * 重試就好；設 5 表示 50ms 內都讀不到才動手，避免小抖動就去搖匯流排。 */
+#define SENSOR_I2C_FAIL_LIMIT  5
+
 #define QSAMPLES_LEN         64          /* 64 × 16B ≈ 640ms 緩衝 */
 
 #define PRIO_SENSOR          4
@@ -87,7 +91,13 @@ static volatile uint32_t s_overruns;
 /* spi1_lock()/spi1_unlock() 的實作已搬到 bus_port_freertos.c（匯流排鎖屬於
  * bus 自己，見 bus_port.h）；這裡只在 app_tasks_start() 呼叫 bus_port_init()。 */
 
+/* Sensor 的 I2C 健康度：連續失敗計數（成功即歸零）與累計 recovery 次數。
+ * 單一 writer(Sensor) / 單一 reader(CLI)，32-bit 對齊，讀到舊值無害。 */
+static uint32_t          s_i2c_fails;
+static volatile uint32_t s_i2c_recovers;
+
 uint32_t app_tasks_overruns(void) { return s_overruns; }
+uint32_t app_tasks_i2c_recovers(void) { return s_i2c_recovers; }
 
 /* Sensor 每輪更新的最新晶片溫度（×10，整數）。給 Display task 顯示用。
  * 單一 writer(Sensor) / 單一 reader(Display)、32-bit 對齊存取，讀到舊值無害，
@@ -184,9 +194,31 @@ static void sensor_task(void *arg)
 
             imu_sample_t s;
             s.t_ms = systick_get_ms();
-            i2c1_lock();                             /* I2C1 互斥：CLI 的 i2cscan / 之後的 INA219 也會上這條 bus */
-            mpu6050_read_all(&s.acc, &s.gyro);       /* 單次 14-byte burst，鎖住的時間 ~1.5ms */
+            i2c1_lock();                             /* I2C1 互斥：CLI 的 i2cscan / INA219 也會上這條 bus */
+            int rc = mpu6050_read_all(&s.acc, &s.gyro);  /* 14-byte burst，400kHz 約 0.4ms */
+
+            if (rc != 0) {
+                /* 讀失敗。以前這裡把回傳值丟掉，於是 acc/gyro 保留上一次的
+                 * 殘值被當成新樣本寫進 CSV —— 看起來像「sensor 不動了」而不是
+                 * 「壞掉了」。現在這筆直接不送進佇列。
+                 *
+                 * 連續失敗才做 recovery：偶發一次（雜訊、NACK）重試就好，
+                 * 但 slave 把 SDA 拉住不放這種情況不會自己好，得手動搖 SCL
+                 * 把它從半途的交易踢出來。recovery 會關掉 I2C1、把腳位切成
+                 * GPIO bit-bang 九個 clock 再重新初始化，幾十微秒等級，只能
+                 * 在 task 脈絡做（所以不放在 ISR 的錯誤處理裡）。 */
+                if (++s_i2c_fails >= SENSOR_I2C_FAIL_LIMIT) {
+                    i2c1_bus_recovery();
+                    mpu6050_init();                  /* recovery 會重設周邊，要重新喚醒 sensor */
+                    s_i2c_fails    = 0;
+                    s_i2c_recovers++;
+                }
+                i2c1_unlock();
+                continue;                            /* 這筆作廢，等下一個週期 */
+            }
+            s_i2c_fails = 0;                         /* 成功就把連續失敗計數歸零 */
             i2c1_unlock();
+
             s.temp_c = tempsensor_read_c();          /* 同一時間點的晶片溫度（ADC，不走 I2C）*/
             s_last_temp_c10 = (int32_t)(s.temp_c * 10.0f);   /* 給 Display 顯示 */
 
@@ -297,6 +329,11 @@ static void display_task(void *arg)
         if (st.state == DL_LOGGING) {
             ssd1306_draw_string(0, 16, "* REC");
             ssd1306_draw_int(42, 16, (int32_t)st.count);
+        } else if (st.state == DL_ERROR) {
+            /* 寫入失敗。停在這個畫面比「* REC 但計數不動」誠實太多 ——
+             * 後面接 FatFs 的 FRESULT，方便直接對照原因。 */
+            ssd1306_draw_string(0, 16, "!ERR");
+            ssd1306_draw_int(36, 16, (int32_t)st.fres);
         } else {
             ssd1306_draw_string(0, 16, "READY");
         }

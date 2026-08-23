@@ -100,7 +100,7 @@ void mpu6050_read_gyro(mpu6050_axes_t *gyro)
     parse_axes(buf, gyro);
 }
 
-void mpu6050_read_all(mpu6050_axes_t *acc, mpu6050_axes_t *gyro)
+int mpu6050_read_all(mpu6050_axes_t *acc, mpu6050_axes_t *gyro)
 {
     uint8_t buf[14];
 
@@ -114,8 +114,12 @@ void mpu6050_read_all(mpu6050_axes_t *acc, mpu6050_axes_t *gyro)
      * 約 400µs。polling 版會讓 prio 4 的 Sensor 空轉整整 400µs，期間
      * Logger/Display/Console 全部被鎖在外面；async 版把那段時間讓出去。
      * 其餘 mpu6050_* 函式（WHO_AM_I、init）不在熱路徑，繼續用 polling。 */
-    i2c1_read_regs_async(MPU6050_ADDR, REG_ACCEL_XOUT_H, buf, 14);
+    i2c_status_t st = i2c1_read_regs_async(MPU6050_ADDR, REG_ACCEL_XOUT_H, buf, 14);
+    if (st != I2C_OK) {
+        return (int)st;           /* acc/gyro 保持不動，交給呼叫端處理 */
+    }
 
     parse_axes(&buf[0], acc);     // buf[0~5]
     parse_axes(&buf[8], gyro);    // buf[8~13]（跳過 buf[6~7] 的溫度）
+    return 0;
 }

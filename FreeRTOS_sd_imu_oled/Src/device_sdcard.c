@@ -38,9 +38,16 @@
 /* ACMD41 等卡完成 init 的逾時（ms）。規格上限約 1 秒，留點餘裕。 */
 #define SD_ACMD41_TIMEOUT_MS  1500
 
-/* 讀：等 data token 的逾時；寫：等卡 busy 結束的逾時（ms） */
+/* 讀：等 data token 的逾時；寫：等卡 busy 結束的逾時（ms）
+ *
+ * 寫入逾時從 500ms 提高到 1000ms：實測遇過一次寫入失敗，logger 的
+ * Peak% 從 2.5% 跳到 90.8%（就是這個忙等把 CPU 燒滿），逾時後回
+ * SD_ERR_WRITE → FatFs ABORT 把錯誤鎖進 fp->err → 之後每筆樣本都在
+ * f_write 開頭被打回票。當次的根因是供電不穩，但 500ms 本來就偏緊：
+ * SD 卡內部的 wear-leveling / block erase 停上幾百毫秒是正常行為，
+ * 而逾時的代價是「整個 session 從此寫不進去」，寧可等久一點。 */
 #define SD_READ_TIMEOUT_MS    200
-#define SD_WRITE_TIMEOUT_MS   500
+#define SD_WRITE_TIMEOUT_MS   1000
 
 /* 資料 token */
 #define SD_TOKEN_START        0xFE   /* 單 block 讀/寫的起始 token */

@@ -23,6 +23,7 @@
 #include "driver_spi1.h"
 #include "stm32f407xx.h"
 #include "isr_port.h"          /* ISR 計時掛勾；沒有 isr_port_config.h 時展開成空 */
+#include "systick.h"           /* systick_get_ms()：DMA 等待的逾時上限 */
 
 /* DMA2 Stream3 的 LISR/LIFCR bit 位置（RM0090 §10.5.5）
  *   bit 27: TCIF3     bit 22: FEIF3
@@ -30,6 +31,9 @@
  *   bit 25: TEIF3
  *   bit 24: DMEIF3
  */
+/* DMA/SPI 等待的逾時上限（ms）。見 spi1_wait_done 的說明。 */
+#define SPI1_DMA_TIMEOUT_MS   100U
+
 #define DMA_FLAG_TCIF3   (1 << 27)
 #define DMA_FLAG_HTIF3   (1 << 26)
 #define DMA_FLAG_TEIF3   (1 << 25)
@@ -97,8 +101,17 @@ void spi1_init(void)
     /* SPI 啟用 DMA TX 請求 */
     SPI1->CR2 |= (1 << 1);                          // TXDMAEN
 
-    /* NVIC 開啟 DMA2 Stream3 IRQ (#59) */
-    NVIC->ISER[59 / 32] |= (1U << (59 % 32));
+    /* --- NVIC：DMA2 Stream3 (#59) ---
+     * 優先權必須設 6（>= configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY = 5）。
+     * 原本沒設，吃 NVIC 預設值 0 —— 數值比 MAX_SYSCALL 小代表邏輯優先權更高，
+     * 這種 ISR 能打斷 taskENTER_CRITICAL() 與其他 prio-6 的 ISR。本 handler
+     * 加了 ISR_PORT_ENTER/EXIT 之後就不能再這樣：cpustats 的
+     * s_acc[ISR] += d 是 read-modify-write，被打斷會 lost update；也會讓
+     * I2C1 的 ISR 延遲而觸發 OVR。
+     * 用 NVIC_SetPriority/EnableIRQ 取代原本手寫的 ISER 位元運算，與
+     * driver_usart1 / app_button 的寫法一致。 */
+    NVIC_SetPriority(IRQ_DMA2_Stream3, 6);
+    NVIC_EnableIRQ(IRQ_DMA2_Stream3);
 }
 
 /* ============================================================================
@@ -166,11 +179,11 @@ void spi1_set_baud(uint8_t br)
     SPI1->CR1 |= (1U << 6);              // 開 SPE
 }
 
-void spi1_send_buffer(const uint8_t *buf, uint32_t len)
+int spi1_send_buffer(const uint8_t *buf, uint32_t len)
 {
     spi1_dma_configure(buf, len);
     spi1_dma_start();
-    spi1_wait_done();                                // 內部呼叫 wait_done
+    return spi1_wait_done();          /* 逾時時回 -1；呼叫端可忽略 */
 }
 
 void spi1_send_buffer_async(const uint8_t *buf, uint32_t len)
@@ -185,10 +198,43 @@ int spi1_is_busy(void)
     return !s_dma_done;
 }
 
-void spi1_wait_done(void)
+/*
+ * 等 DMA + SPI 傳完。
+ *
+ * 兩個等待都必須有上限：這支是在「握著 spi1_lock」的情況下被呼叫的
+ * （OLED 更新在鎖內），只要其中一個永遠不返回，抱著鎖的那支 task 就會
+ * 永久空轉，所有需要 SPI1 的人（logger 寫 SD）跟著一起死，而且外觀上
+ * 系統還「活著」—— CLI 照樣回應，只是資料再也不會被寫出去。
+ *
+ * 逾時上限抓 100ms：正常一次 1024-byte 傳輸在 5.25MHz 下約 1.6ms，
+ * SD 降速到 2.6MHz 時約 3.1ms，100ms 有 30 倍餘裕。
+ *
+ * 回傳 0 = 正常完成，-1 = 逾時（DMA 已被關掉，SPI1 可以交給下一個使用者）。
+ */
+int spi1_wait_done(void)
 {
-    while (!s_dma_done);                             // ← 你問的那個 polling
-    while (SPI1->SR & (1 << 7));                     // 確保 SPI 真的空了
+    uint32_t start   = systick_get_ms();
+    int      timeout = 0;
+
+    while (!s_dma_done) {
+        if (systick_get_ms() - start >= SPI1_DMA_TIMEOUT_MS) {
+            /* DMA TC 中斷沒來。關掉 stream 免得它之後才醒過來動到 buffer，
+             * 並把 busy 旗標放掉，讓下一次傳輸還能發起。 */
+            DMA2_Stream3->CR &= ~(1U << 0);          // EN = 0
+            spi1_dma_clear_flags();
+            s_dma_done = 1;
+            timeout    = 1;
+            break;
+        }
+    }
+
+    start = systick_get_ms();
+    while (SPI1->SR & (1 << 7)) {                    // 確保 SPI 真的空了
+        if (systick_get_ms() - start >= SPI1_DMA_TIMEOUT_MS) {
+            timeout = 1;
+            break;
+        }
+    }
 
     /* TX-only DMA 全程沒讀 RX → 結束時 RXNE/OVR 是髒的。
      * 不清掉的話，下一個共用 SPI1 的裝置（SD 卡的 spi1_transfer_byte）
@@ -196,6 +242,8 @@ void spi1_wait_done(void)
      * 清 OVR 的標準順序：先讀 DR、再讀 SR。 */
     (void)SPI1->DR;
     (void)SPI1->SR;
+
+    return timeout ? -1 : 0;
 }
 
 /* ============================================================================

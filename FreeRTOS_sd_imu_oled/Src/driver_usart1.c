@@ -265,8 +265,13 @@ void usart1_init(uint32_t baudrate)
      * → 可能呼叫 FreeRTOS ...FromISR()。依 FreeRTOSConfig.h 規定，這兩個 IRQ
      * 的優先權數值必須 >= configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY(=5)，
      * 否則在 ISR 內呼叫核心 API 會踩 configASSERT。設為 6（邏輯上較低優先）。
-     * DMA2_Stream7(TX) 只設 dma_idle、不碰 RTOS，沿用預設 priority 0 即可。 */
+     *
+     * DMA2_Stream7(TX) 雖然只設 dma_idle、不碰 RTOS API，但也必須設 6：
+     * 它加了 ISR_PORT_ENTER/EXIT 之後會去改 cpustats 的累加表，而預設的
+     * priority 0 能打斷 taskENTER_CRITICAL() 與其他 prio-6 的 ISR ——
+     * s_acc[ISR] += d 是 read-modify-write，被打斷就會 lost update。 */
     NVIC_SetPriority(IRQ_DMA2_Stream2, 6);
+    NVIC_SetPriority(IRQ_DMA2_Stream7, 6);
     NVIC_SetPriority(IRQ_USART1,       6);
 
     NVIC_EnableIRQ(IRQ_DMA2_Stream2);  /* USART1 RX DMA half/full，IRQ 58 */
