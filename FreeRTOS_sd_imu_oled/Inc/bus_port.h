@@ -36,6 +36,31 @@ void spi1_unlock(void);
  * write_reg 固然要包，但「寫 reg 再讀回來」這種多筆組合更是要整段包起來，
  * 中間被別的 task 插進一次 START 就會讀到別人的資料。
  * Sensor task（MPU6050）/ CLI（i2cscan）/ 之後的 INA219 共用。non-recursive。 */
+/* ── SPI1 DMA 傳輸的等待 / 喚醒 ──────────────────────────────
+ * spi1_send_buffer() 的 DMA 傳輸從 busy-wait 換成阻塞：啟動 DMA 後 task
+ * 睡覺，DMA 的 TC/TE 中斷來了才喚醒。
+ *
+ * 為什麼值得：OLED 一次更新是 1024 bytes，5.25MHz 下約 1.6ms，而一次
+ * 睡眠/喚醒來回約 3~8µs，比例 300:1。這裡跟 I2C 那組的動機不同 ——
+ * Display 是 prio 1（最低），它空轉並不會擋住任何人，所以省下來的是
+ * 「流回 IDLE 去 WFI」的電流，不是吞吐量。真正不能忍的是它**握著
+ * spi1_lock 空轉**：logger 要寫 SD 就得排在後面。
+ *
+ * 注意粒度：只有「整個 buffer」這個層級才值得睡。SPI 一個 byte 在
+ * 5.25MHz 下只要 1.52µs，比切換成本還短，所以逐 byte 的
+ * spi1_transfer_byte() 維持 busy-wait 是對的。
+ *
+ * spi1_xfer_reset()   啟動 DMA 之前呼叫，清掉上一筆殘留的完成通知。
+ * spi1_xfer_wait()    阻塞直到 ISR 呼叫 signal；有 timeout。
+ *                     回傳 0 = 正常被喚醒，非 0 = 逾時。
+ * spi1_xfer_signal()  由 DMA2_Stream3 的 ISR 呼叫（中斷脈絡）。
+ *
+ * bare-metal 版：reset/signal 寫成空，wait 寫成 while (spi1_is_busy());
+ * 行為就退回原本的忙等。 */
+void spi1_xfer_reset(void);
+int  spi1_xfer_wait(void);
+void spi1_xfer_signal(void);
+
 void i2c1_lock(void);
 void i2c1_unlock(void);
 

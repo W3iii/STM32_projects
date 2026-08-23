@@ -24,6 +24,7 @@
 #include "stm32f407xx.h"
 #include "isr_port.h"          /* ISR 計時掛勾；沒有 isr_port_config.h 時展開成空 */
 #include "systick.h"           /* systick_get_ms()：DMA 等待的逾時上限 */
+#include "bus_port.h"          /* DMA 傳輸的等待/喚醒（RTOS 中立）*/
 
 /* DMA2 Stream3 的 LISR/LIFCR bit 位置（RM0090 §10.5.5）
  *   bit 27: TCIF3     bit 22: FEIF3
@@ -45,6 +46,7 @@
 /* DMA 完成 flag：DMA ISR 設、wait_done() 讀
  * volatile 是因為一個寫（ISR）一個讀（main），編譯器不能優化掉 */
 static volatile uint8_t s_dma_done = 1;   // 初始 = 1（沒在傳）
+static volatile uint8_t s_dma_err;        // 1 = 這次傳輸 DMA 回報 TEIF
 
 /* ============================================================================
  *                              初始化
@@ -93,7 +95,10 @@ void spi1_init(void)
     DMA2_Stream3->CR |= (0 << 9);                   // PINC = 0
     DMA2_Stream3->CR |= (0 << 8);                   // CIRC = 0
     DMA2_Stream3->CR |= (1 << 6);                   // DIR = M2P
-    DMA2_Stream3->CR |= (1 << 4);                   // TCIE = 1
+    DMA2_Stream3->CR |= (1 << 4);                   // TCIE = 1（傳輸完成）
+    /* TEIE：傳輸錯誤也要進 ISR。沒開的話錯誤發生時 TC 永遠不來，
+     * 等待端只能耗完 50ms 逾時才發現，白等 50ms。 */
+    DMA2_Stream3->CR |= (1 << 2);                   // TEIE = 1（傳輸錯誤）
 
     /* PAR 永遠是 SPI1->DR */
     DMA2_Stream3->PAR = (uint32_t)&SPI1->DR;
@@ -137,6 +142,12 @@ static void spi1_dma_configure(const uint8_t *buf, uint32_t len)
 
 static void spi1_dma_start(void)
 {
+    /* 清掉上一筆殘留的完成通知（前一次逾時、ISR 事後才送達的情況），
+     * 否則這次的 spi1_xfer_wait() 會立刻假性返回。必須在 EN 之前做，
+     * 不然可能把這一筆自己的通知清掉。 */
+    spi1_xfer_reset();
+
+    s_dma_err  = 0;
     s_dma_done = 0;
     DMA2_Stream3->CR |= (1 << 0);                   // EN
 }
@@ -213,25 +224,44 @@ int spi1_is_busy(void)
  */
 int spi1_wait_done(void)
 {
-    uint32_t start   = systick_get_ms();
-    int      timeout = 0;
+    uint32_t start;
+    int      failed = 0;
 
-    while (!s_dma_done) {
-        if (systick_get_ms() - start >= SPI1_DMA_TIMEOUT_MS) {
-            /* DMA TC 中斷沒來。關掉 stream 免得它之後才醒過來動到 buffer，
-             * 並把 busy 旗標放掉，讓下一次傳輸還能發起。 */
+    /* ---- 等 DMA：阻塞，不是忙等 ----
+     * 1024 bytes 在 5.25MHz 下約 1.6ms，而一次睡眠/喚醒來回約 3~8µs，
+     * 比例 300:1，睡覺明顯划算。DMA2_Stream3 的 ISR 在 TC 或 TE 時
+     * spi1_xfer_signal() 把我們叫醒。
+     *
+     * 為什麼這件事重要：這支是在握著 spi1_lock 的情況下被呼叫的，
+     * 原本那 1.6ms 的空轉不只燒 CPU，還把想寫 SD 的 logger 擋在鎖外面。 */
+    /* s_dma_done 已經是 1 = 根本沒有傳輸在跑（或 ISR 比我們先跑完），
+     * 這時不該去等號誌，否則會空等到逾時。原本忙等版天生有這個語意
+     * （初值就是 1），換成阻塞後要明確寫出來。
+     * 沒有競態：真的在傳的話 spi1_dma_start() 已經先把它設成 0；若 ISR
+     * 剛好在這個檢查之後才 give，xSemaphoreTake 會 latch 住，一樣拿得到。 */
+    if (!s_dma_done) {
+        if (spi1_xfer_wait() != 0) {
+            /* 號誌沒來（DMA 卡住、中斷沒觸發）。關掉 stream 免得它之後才
+             * 醒過來動到 buffer，並把 busy 旗標放掉，讓下一次傳輸還能發起。 */
             DMA2_Stream3->CR &= ~(1U << 0);          // EN = 0
             spi1_dma_clear_flags();
             s_dma_done = 1;
-            timeout    = 1;
-            break;
+            failed     = 1;
         }
     }
+    if (s_dma_err) {
+        failed = 1;                                  // ISR 收到 TEIF
+    }
 
+    /* ---- 等 SPI BSY：維持忙等 ----
+     * DMA 的 TC 是在「最後一個 byte 交給 SPI」時觸發，此時 shift register
+     * 還在把它推出去，還要一個 byte 時間（5.25MHz 下 1.52µs）。
+     * 睡一次要 3~8µs，比等待本身還久 —— 粒度不對，忙等才是對的。
+     * 但仍然要有上限，理由同上：這裡卡住就是抱著 spi1_lock 卡住。 */
     start = systick_get_ms();
     while (SPI1->SR & (1 << 7)) {                    // 確保 SPI 真的空了
         if (systick_get_ms() - start >= SPI1_DMA_TIMEOUT_MS) {
-            timeout = 1;
+            failed = 1;
             break;
         }
     }
@@ -243,21 +273,45 @@ int spi1_wait_done(void)
     (void)SPI1->DR;
     (void)SPI1->SR;
 
-    return timeout ? -1 : 0;
+    return failed ? -1 : 0;
 }
 
 /* ============================================================================
  *                              ISR
  * ============================================================================ */
 
+/*
+ * DMA2 Stream3（SPI1_TX）完成 / 錯誤中斷。
+ *
+ * 兩種結果都要喚醒等待的 task —— 錯誤時如果不喚醒，TC 永遠不會來，
+ * 等待端只能白白耗完 50ms 逾時才發現。
+ *
+ * s_dma_done 除了給等待端看，也是 spi1_is_busy() 的依據，所以兩條路徑
+ * 都要設。喚醒放在最後，確保 task 醒來時狀態已經一致。
+ */
 void DMA2_Stream3_IRQHandler(void)
 {
     ISR_PORT_ENTER();
+    {
+        int finished = 0;
 
-    if (DMA2->LISR & DMA_FLAG_TCIF3) {
-        DMA2->LIFCR = DMA_FLAG_TCIF3;               // 清 flag
-        s_dma_done = 1;                              // 通知 wait_done
+        if (DMA2->LISR & DMA_FLAG_TCIF3) {
+            DMA2->LIFCR = DMA_FLAG_TCIF3;           // 清 flag
+            s_dma_done  = 1;
+            finished    = 1;
+        }
+
+        if (DMA2->LISR & DMA_FLAG_TEIF3) {
+            DMA2->LIFCR = DMA_FLAG_TEIF3;
+            /* 傳輸錯誤時硬體已經自動把 EN 清掉了，這裡只記錄並放行。 */
+            s_dma_err   = 1;
+            s_dma_done  = 1;
+            finished    = 1;
+        }
+
+        if (finished) {
+            spi1_xfer_signal();                     // 喚醒 spi1_wait_done()
+        }
     }
-
     ISR_PORT_EXIT();
 }

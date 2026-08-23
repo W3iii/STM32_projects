@@ -26,20 +26,50 @@ static SemaphoreHandle_t s_mI2c1;   /* MPU6050 + INA219 */
  * take 會立刻返回，不會 lost wakeup。 */
 static SemaphoreHandle_t s_sI2c1Xfer;
 
+/* SPI1 DMA 傳輸完成的號誌。理由與 s_sI2c1Xfer 相同：專用 binary semaphore，
+ * 不跟 task notification 的 index 0 打架，而且 give 會 latch，ISR 若在 task
+ * 走到 wait 之前就完成也不會 lost wakeup。 */
+static SemaphoreHandle_t s_sSpi1Xfer;
+
 /* 等待上限。交易本身在 400kHz 下約 400µs，給 50ms 是純粹的保險 ——
  * 狀態機若因為 bus stuck 卡住，Sensor task 要能自己脫身，不能死等。 */
 #define I2C1_XFER_TIMEOUT_MS   50U
+
+/* OLED 一次 1024 bytes 在 5.25MHz 下約 1.6ms、SD 降速到 2.6MHz 時約 3.1ms，
+ * 50ms 有十幾倍餘裕。逾時只代表這一幀沒畫成，driver 會把 DMA 收乾淨。 */
+#define SPI1_XFER_TIMEOUT_MS   50U
 
 int bus_port_init(void)
 {
     s_mSpi1      = xSemaphoreCreateMutex();
     s_mI2c1      = xSemaphoreCreateMutex();
     s_sI2c1Xfer  = xSemaphoreCreateBinary();
-    return (s_mSpi1 != NULL && s_mI2c1 != NULL && s_sI2c1Xfer != NULL) ? 0 : -1;
+    s_sSpi1Xfer  = xSemaphoreCreateBinary();
+    return (s_mSpi1 != NULL && s_mI2c1 != NULL &&
+            s_sI2c1Xfer != NULL && s_sSpi1Xfer != NULL) ? 0 : -1;
 }
 
 void spi1_lock(void)   { xSemaphoreTake(s_mSpi1, portMAX_DELAY); }
 void spi1_unlock(void) { xSemaphoreGive(s_mSpi1); }
+
+/* 呼叫端一定持有 spi1_lock，所以同時只有一支 task 在等這支號誌。 */
+int spi1_xfer_wait(void)
+{
+    return (xSemaphoreTake(s_sSpi1Xfer,
+                           pdMS_TO_TICKS(SPI1_XFER_TIMEOUT_MS)) == pdTRUE) ? 0 : -1;
+}
+
+void spi1_xfer_signal(void)
+{
+    BaseType_t woken = pdFALSE;
+    xSemaphoreGiveFromISR(s_sSpi1Xfer, &woken);
+    portYIELD_FROM_ISR(woken);
+}
+
+void spi1_xfer_reset(void)
+{
+    (void)xSemaphoreTake(s_sSpi1Xfer, 0);
+}
 
 void i2c1_lock(void)   { xSemaphoreTake(s_mI2c1, portMAX_DELAY); }
 void i2c1_unlock(void) { xSemaphoreGive(s_mI2c1); }
