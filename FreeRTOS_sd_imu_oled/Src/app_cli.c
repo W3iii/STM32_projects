@@ -18,7 +18,8 @@
 #include "driver_i2c1.h"        /* i2cscan 指令：i2c1_bus_scan / i2c1_bus_recovery */
 #include "driver_usart1.h"
 #include "FreeRTOS.h"           /* tasks 指令：run-time stats */
-#include "task.h"              /* uxTaskGetSystemState */
+#include "task.h"              /* uxTaskGetSystemState：State/Pri/Stack 三欄 */
+#include "app_cpu_stats.h"     /* CPU% / Peak% / Avg%：自建統計，見該檔檔頭 */
 #include <string.h>
 /* 注意：本檔不再 #include "ff.h"、也不再呼叫 spi1_lock —— 所有 FatFs/SD 存取
  * 都委派給 app_datalogger 的 dl_list/dl_dump/dl_clear，CLI 只負責解析與印字。 */
@@ -229,34 +230,30 @@ static void cli_clear(void)
 }
 
 /* ───────────────── tasks：FreeRTOS 執行期監控 ─────────────────
- * 一次快照全部 task（含 IDLE / Timer service）的狀態、優先權、堆疊剩餘水位、
- * CPU 佔用％。資料源是 uxTaskGetSystemState()（需 configUSE_TRACE_FACILITY=1），
- * 計時源是 run-time stats 計時器（TIM2 @100kHz，見 app_runtime_stats.c）。
- * 純唯讀 FreeRTOS 內部狀態，不碰 SD/OLED、不需 spi1_lock、不新增 task/mutex。
+ *   tasks            一次快照：狀態 / 優先權 / 堆疊水位 / CPU 佔用
+ *   tasks hist [t]   最近 6.4 秒的 CPU% 時間軸（t = task 名稱，省略則全部）
+ *   tasks reset      清掉峰值與時間軸，重新開始觀察
  *
- * CPU% 有兩欄，差別很重要：
- *   Avg%   開機到現在的累積佔用 = ulRunTimeCounter / total。開機後大部分時間
- *          在 IDLE，所以錄製中的負載會被前面那段閒置稀釋掉，看不出真實負荷。
- *   CPU%   距離「上一次執行 tasks」這段區間的佔用，也就是兩次快照的差值：
- *              (累積@t1 - 累積@t0) / (total@t1 - total@t0)
- *          要量「錄製中 Sensor 吃多少 CPU」就看這欄：start 後打一次 tasks
- *          當基準，跑個幾秒再打一次，第二次的 CPU% 就是那段區間的實際值。
+ * 資料來源分兩邊，各取所長：
+ *   State / Pri / Stack   uxTaskGetSystemState()（需 configUSE_TRACE_FACILITY=1）
+ *   CPU% / Peak% / Avg%   app_cpu_stats.c 的自建統計
  *
- * 每次呼叫都會把基準換成這次的快照，所以連打兩次 tasks 得到的是「這兩次之間」。
+ * 為什麼百分比不用 kernel 內建的 ulRunTimeCounter：它把 ISR 時間算到剛好被
+ * 打斷的那支 task 頭上，而且漏掉當下執行中 task 的未結算切片（於是 Σ 各
+ * task% 湊不到 100%）。自建那份把時間拆成 各 task / [ISR] / [SCHED]，
+ * 三者相加就是牆鐘時間。完整說明見 app_cpu_stats.h 檔頭。
  *
- * 計數器繞回（TIM2 32-bit @100kHz 約 11.9 小時）不影響：uint32 減法本身
- * 就是模 2^32 運算，只要兩次呼叫間隔不超過一整圈，差值仍然正確。 */
+ * 三個百分比欄位的分工：
+ *   CPU%   最近 1 秒（10 筆 100ms 取樣）的平均 —— 「現在」的負載
+ *   Peak%  單一 100ms 取樣的歷史最大值 —— 抓瞬間尖峰。logger 每秒 f_sync
+ *          一次，SD 卡 FAT 更新遇到 block erase 可以停上百毫秒，秒級平均
+ *          會把它整個抹平；Sensor 的 overrun 多半就是這樣來的（見 status）。
+ *   Avg%   開機至今的累積平均 —— 長期基準線
+ *
+ * 取樣由 Display task 以 10Hz 驅動（app_tasks.c），不需要打指令也一直在記，
+ * 所以錄製中的尖峰事後用 hist / Peak% 就查得到，不必掐準時機打 tasks。 */
 
-#define CLI_MAX_TASKS   12      /* 5 app task + IDLE，留餘裕（cli_field / cli_uint_field 定義在檔案上方）*/
-
-/* 上一次快照（算差值用）。用 xHandle 當識別，不用名字或索引：
- * task 在列表裡的順序會變，同名也不保證是同一支。 */
-static TaskHandle_t s_prev_handle[CLI_MAX_TASKS];
-static uint32_t     s_prev_rt[CLI_MAX_TASKS];
-static UBaseType_t  s_prev_n;
-static uint32_t     s_prev_total;
-static TickType_t   s_prev_tick;
-static uint8_t      s_have_base;        /* 0 = 還沒有基準，CPU% 印 "-" */
+#define CLI_MAX_TASKS   12      /* 5 app task + IDLE，留餘裕 */
 
 static const char *cli_state_str(eTaskState st)
 {
@@ -270,7 +267,7 @@ static const char *cli_state_str(eTaskState st)
     }
 }
 
-/* 印「百分比 ×10」成 "12.3" 並補空白到欄寬（一位小數：Sensor 這種短命 task
+/* 印「千分比」成 "12.3" 並補空白到欄寬（一位小數：Sensor 這種短命 task
  * 的佔用常在個位數，整數欄位會全部擠成 0 或 1，看不出變化）。 */
 static void cli_pct10_field(uint32_t p10, int width)
 {
@@ -286,75 +283,124 @@ static void cli_pct10_field(uint32_t p10, int width)
     cli_field(b, width);
 }
 
-/* 在上一次快照裡找同一支 task；找到回索引，沒有回 -1（這次才新建的 task）。 */
-static int cli_prev_index(TaskHandle_t h)
+/* 在 uxTaskGetSystemState 的結果裡找同一支 task（用 handle 比對，不用名字：
+ * 同名不保證是同一支）。找不到回 -1 —— [ISR] / [SCHED] 這兩個虛擬列就是。 */
+static int cli_find_status(const TaskStatus_t *st, UBaseType_t n, void *handle)
 {
-    for (UBaseType_t i = 0; i < s_prev_n; i++) {
-        if (s_prev_handle[i] == h) {
-            return (int)i;
+    if (handle != NULL) {
+        for (UBaseType_t i = 0; i < n; i++) {
+            if ((void *)st[i].xHandle == handle) {
+                return (int)i;
+            }
         }
     }
     return -1;
 }
 
-static void cli_cmd_tasks(void)
+/* 把千分比壓成一個字元的濃淡，用來畫時間軸。 */
+static char cli_spark(uint16_t pm)
 {
-    static TaskStatus_t st[CLI_MAX_TASKS];   /* static：TaskStatus_t 陣列別放 stack */
-    uint32_t total_run = 0;
+    if (pm <  25U) return ' ';      /* < 2.5% */
+    if (pm < 100U) return '.';      /* < 10%  */
+    if (pm < 250U) return ':';      /* < 25%  */
+    if (pm < 500U) return '-';      /* < 50%  */
+    if (pm < 750U) return '=';      /* < 75%  */
+    return '#';                     /* >= 75% */
+}
 
-    UBaseType_t n = uxTaskGetSystemState(st, CLI_MAX_TASKS, &total_run);
-    if (n == 0) {
-        usart1_send_string("uxTaskGetSystemState failed (raise CLI_MAX_TASKS)\r\n");
-        return;
-    }
+/* ---- tasks（無參數）：目前狀態總覽 ---- */
+static void cli_tasks_table(void)
+{
+    /* static：這兩個陣列合計 656 bytes（432 + 224），別放 task stack 上。 */
+    static TaskStatus_t     st[CLI_MAX_TASKS];
+    static cpustats_slot_t  sl[CPUSTATS_SLOTS];
 
-    TickType_t now = xTaskGetTickCount();
+    UBaseType_t n_st = uxTaskGetSystemState(st, CLI_MAX_TASKS, NULL);
+    uint32_t    n_sl = cpustats_get(sl, CPUSTATS_SLOTS);
 
-    /* 兩個分母。除以 1000 = 「0.1% 對應多少 counter」，先除再除避免
-     * delta*1000 溢位（區間夠長時 delta 會很大）。 */
-    uint32_t delta_total = total_run - s_prev_total;      /* uint32 減法自帶繞回處理 */
-    uint32_t div_int     = delta_total / 1000U;           /* 區間用 */
-    uint32_t div_avg     = total_run   / 1000U;           /* 累積用 */
+    usart1_send_string("Task         State Pri Stack CPU%  Peak% Avg%\r\n");
+    for (uint32_t i = 0; i < n_sl; i++) {
+        int k = cli_find_status(st, n_st, sl[i].handle);
 
-    /* 表頭前先講清楚這次的 CPU% 涵蓋多長的區間，不然數字沒有意義。 */
-    if (!s_have_base) {
-        usart1_send_string("baseline captured - run 'tasks' again for interval CPU%\r\n");
-    } else {
-        usart1_send_string("interval: ");
-        cli_print_fixed((float)(now - s_prev_tick) / 1000.0f, 1);
-        usart1_send_string(" s\r\n");
-    }
-
-    usart1_send_string("Task         State Pri Stack CPU%  Avg%\r\n");
-    for (UBaseType_t i = 0; i < n; i++) {
-        cli_field(st[i].pcTaskName, 13);
-        cli_field(cli_state_str(st[i].eCurrentState), 6);
-        cli_uint_field((uint32_t)st[i].uxCurrentPriority, 4);
-        cli_uint_field((uint32_t)st[i].usStackHighWaterMark, 6);   /* 剩餘堆疊（words），越小越接近爆 */
-
-        /* 區間佔用：這支 task 在上一次快照裡的累積值找得到才算得出來。 */
-        int p = s_have_base ? cli_prev_index(st[i].xHandle) : -1;
-        if (p < 0 || div_int == 0U) {
-            cli_field("-", 6);              /* 沒基準 / 新 task / 區間太短 */
+        cli_field(sl[i].name, 13);
+        if (k >= 0) {
+            cli_field(cli_state_str(st[k].eCurrentState), 6);
+            cli_uint_field((uint32_t)st[k].uxCurrentPriority, 4);
+            /* 剩餘堆疊（words），越小越接近爆掉 */
+            cli_uint_field((uint32_t)st[k].usStackHighWaterMark, 6);
         } else {
-            uint32_t d = st[i].ulRunTimeCounter - s_prev_rt[p];
-            cli_pct10_field(d / div_int, 6);
+            /* [ISR] / [SCHED] 沒有 task 實體，這三欄留白；已刪除的 task 也走這裡 */
+            cli_field("-", 6);
+            cli_field("-", 4);
+            cli_field("-", 6);
         }
+        cli_pct10_field(sl[i].cur_pm,  6);
+        cli_pct10_field(sl[i].peak_pm, 6);
+        cli_pct10_field(sl[i].avg_pm,  5);
+        usart1_send_string("\r\n");
+    }
+    usart1_send_string("CPU%=last 1s  Peak%=worst 100ms sample  Avg%=since boot\r\n");
+}
 
-        /* 累積佔用（原本的行為）。 */
-        cli_pct10_field((div_avg != 0U) ? (st[i].ulRunTimeCounter / div_avg) : 0U, 5);
+/* ---- tasks hist：時間軸 ---- */
+static void cli_tasks_hist(const char *want)
+{
+    static cpustats_slot_t sl[CPUSTATS_SLOTS];
+    static uint16_t        h[CPUSTATS_HIST_LEN];
+
+    uint32_t n_sl  = cpustats_get(sl, CPUSTATS_SLOTS);
+    int      found = 0;
+
+    usart1_send_string("legend: ' '<2.5%  '.'<10%  ':'<25%  '-'<50%  '='<75%  '#'>=75%\r\n");
+    cli_field("", 10);                  /* 空出名字欄，讓標尺對齊時間軸 */
+    usart1_send_string("older");
+    for (uint32_t i = 0; i < (CPUSTATS_HIST_LEN - 5U - 3U); i++) {
+        usart1_send_byte(' ');
+    }
+    usart1_send_string("now\r\n");
+
+    for (uint32_t i = 0; i < n_sl; i++) {
+        uint32_t n;
+
+        if ((want != NULL) && (want[0] != '\0') && (strcmp(want, sl[i].name) != 0)) {
+            continue;
+        }
+        found = 1;
+
+        cli_field(sl[i].name, 10);
+        n = cpustats_hist(sl[i].slot, h, CPUSTATS_HIST_LEN);
+        for (uint32_t k = 0; k < n; k++) {
+            usart1_send_byte((uint8_t)cli_spark(h[k]));
+        }
         usart1_send_string("\r\n");
     }
 
-    /* 這次的快照變成下次的基準。 */
-    for (UBaseType_t i = 0; i < n; i++) {
-        s_prev_handle[i] = st[i].xHandle;
-        s_prev_rt[i]     = st[i].ulRunTimeCounter;
+    if (!found) {
+        usart1_send_string("no such task (run 'tasks' for the list)\r\n");
+    } else {
+        /* 一格 = 一次取樣，換算成秒讓「尖峰在幾秒前」看得出來 */
+        usart1_send_string("one column = ");
+        cli_print_u32(CPUSTATS_SAMPLE_MS);
+        usart1_send_string(" ms, full width = ");
+        cli_print_fixed((float)(CPUSTATS_HIST_LEN * CPUSTATS_SAMPLE_MS) / 1000.0f, 1);
+        usart1_send_string(" s\r\n");
     }
-    s_prev_n     = n;
-    s_prev_total = total_run;
-    s_prev_tick  = now;
-    s_have_base  = 1;
+}
+
+static void cli_cmd_tasks(const char *arg)
+{
+    if (strncmp(arg, "hist", 4) == 0) {
+        const char *t = arg + 4;
+        while (*t == ' ') {
+            t++;                    /* 跳過 "hist" 後面的空白，剩下的是 task 名 */
+        }
+        cli_tasks_hist(t);
+    } else if (strcmp(arg, "reset") == 0) {
+        cpustats_reset();
+        usart1_send_string("peaks + timeline cleared\r\n");
+    } else {
+        cli_tasks_table();
+    }
 }
 
 /* ───────────────── wfi：IDLE 省電開關 ─────────────────
@@ -488,7 +534,9 @@ static void cli_print_help(void)
         "  dump [file]    print a csv (default: last session)\r\n"
         "  ls             list files + free space\r\n"
         "  clear          delete all logs\r\n"
-        "  tasks          FreeRTOS task monitor\r\n"
+        "  tasks          FreeRTOS task monitor (CPU% / peak / stack)\r\n"
+        "  tasks hist [t] CPU% timeline, last 6.4s (t = task name)\r\n"
+        "  tasks reset    clear peaks + timeline\r\n"
         "  power          INA219 voltage / current / power\r\n"
         "  wfi [on|off]   idle WFI sleep (power saving)\r\n"
         "  i2cscan        scan I2C1 bus (0x08..0x77)\r\n"
@@ -528,7 +576,7 @@ static void cli_dispatch(char *line)
     } else if (strcmp(cmd, "clear") == 0) {
         cli_clear();
     } else if (strcmp(cmd, "tasks") == 0) {
-        cli_cmd_tasks();
+        cli_cmd_tasks(arg);
     } else if (strcmp(cmd, "power") == 0) {
         cli_power();
     } else if (strcmp(cmd, "wfi") == 0) {

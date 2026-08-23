@@ -22,6 +22,7 @@
 
 #include "driver_spi1.h"
 #include "stm32f407xx.h"
+#include "isr_port.h"          /* ISR 計時掛勾；沒有 isr_port_config.h 時展開成空 */
 
 /* DMA2 Stream3 的 LISR/LIFCR bit 位置（RM0090 §10.5.5）
  *   bit 27: TCIF3     bit 22: FEIF3
@@ -203,8 +204,12 @@ void spi1_wait_done(void)
 
 void DMA2_Stream3_IRQHandler(void)
 {
+    ISR_PORT_ENTER();
+
     if (DMA2->LISR & DMA_FLAG_TCIF3) {
         DMA2->LIFCR = DMA_FLAG_TCIF3;               // 清 flag
         s_dma_done = 1;                              // 通知 wait_done
     }
+
+    ISR_PORT_EXIT();
 }

@@ -46,6 +46,29 @@ extern unsigned long ulGetRunTimeCounterValue(void);
 #define portCONFIGURE_TIMER_FOR_RUN_TIME_STATS()  vConfigureTimerForRunTimeStats()
 #define portGET_RUN_TIME_COUNTER_VALUE()          ulGetRunTimeCounterValue()
 
+/* ---- 自建 CPU 統計的掛勾（app_cpu_stats.c）----
+ * kernel 內建的 run-time stats 有兩個治不好的毛病：ISR 時間被算到剛好被打斷
+ * 的那支 task 頭上；以及當下執行中那支 task 的未結算切片永遠漏掉（導致
+ * Σ 各 task% < 100%）。所以額外掛 trace hook 自己記一份，把時間拆成
+ * 各 task / [ISR] / [SCHED] 三類。詳見 app_cpu_stats.h。
+ *
+ * 上面 kernel 那份保留不動：uxTaskGetSystemState 仍用它，且兩份互相對照
+ * 時很容易看出 ISR 到底吃掉多少。兩者共用同一顆 TIM2，沒有額外硬體成本。
+ *
+ * traceISR_ENTER/EXIT 只有 port.c 的 xPortSysTickHandler 會呼叫；其餘 app ISR
+ * 由各自的 handler 直接放 ISR_PORT_ENTER/EXIT 巨集（isr_port.h，預設展開成空，
+ * 實作同樣在 app_cpu_stats.c）—— driver 層不 include 任何 RTOS 或統計標頭，
+ * 才能繼續在 bare-metal 的 exp13 編得起來。 */
+extern void cpustats_switched_in(void *tcb);
+extern void cpustats_switched_out(void);
+extern void cpustats_isr_enter(void);
+extern void cpustats_isr_exit(void);
+#define traceTASK_SWITCHED_IN()         cpustats_switched_in( (void *) pxCurrentTCB )
+#define traceTASK_SWITCHED_OUT()        cpustats_switched_out()
+#define traceISR_ENTER()                cpustats_isr_enter()
+#define traceISR_EXIT()                 cpustats_isr_exit()
+#define traceISR_EXIT_TO_SCHEDULER()    cpustats_isr_exit()
+
 /* ---- hook ---- */
 #define configUSE_IDLE_HOOK                     1   /* vApplicationIdleHook：閒置時 WFI 睡覺（見 app_tasks.c）*/
 #define configUSE_TICK_HOOK                     0

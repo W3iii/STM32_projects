@@ -10,6 +10,7 @@
 #include "driver_usart1.h"
 #include "stm32f407xx.h"
 #include "systick.h"
+#include "isr_port.h"          /* ISR 計時掛勾；沒有 isr_port_config.h 時展開成空 */
 
 /* ========================================================================= */
 /*                          Private constants                                */
@@ -113,6 +114,8 @@ static usart1_status_t wait_sr_flag(uint32_t flag)
  */
 void DMA2_Stream7_IRQHandler(void)
 {
+    ISR_PORT_ENTER();
+
     /* Stream7 的 TCIF 在 HISR bit 27 */
     if (DMA2->HISR & DMA_TCIF_STREAM7) {
         /* 清除 flag（寫 1 清除，跟一般 read-modify-write 反過來）*/
@@ -125,6 +128,8 @@ void DMA2_Stream7_IRQHandler(void)
         DMA2->HIFCR = DMA_TEIF_STREAM7;
         dma_idle = 1;   // error 也釋放 busy，讓系統能繼續
     }
+
+    ISR_PORT_EXIT();
 }
 
 
@@ -137,6 +142,8 @@ void DMA2_Stream7_IRQHandler(void)
  */
 void DMA2_Stream2_IRQHandler(void)
 {
+    ISR_PORT_ENTER();
+
     uint32_t lisr = DMA2->LISR;
 
     if (lisr & (DMA_HTIF_STREAM2 | DMA_TCIF_STREAM2)) {
@@ -144,6 +151,8 @@ void DMA2_Stream2_IRQHandler(void)
         rx_idle_flag = 1;  /* 與 USART IDLE ISR 共用同一個通知機制 */
         if (s_rx_cb) s_rx_cb();   /* 事件驅動：喚醒 console task（連續流、IDLE 還沒到時也能醒）*/
     }
+
+    ISR_PORT_EXIT();
 }
 
 
@@ -154,6 +163,8 @@ void DMA2_Stream2_IRQHandler(void)
  */
 void USART1_IRQHandler(void)
 {
+    ISR_PORT_ENTER();
+
     uint32_t sr = USART1->SR;
 
     if (sr & USART_SR_IDLE) {
@@ -161,6 +172,8 @@ void USART1_IRQHandler(void)
         rx_idle_flag = 1;   /* 通知 main loop：有新資料可以 parse */
         if (s_rx_cb) s_rx_cb();   /* 事件驅動：一段輸入結束就喚醒 console task */
     }
+
+    ISR_PORT_EXIT();
 }
 
 

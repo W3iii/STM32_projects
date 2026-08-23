@@ -19,6 +19,7 @@
 
 #include "app_button.h"
 #include "stm32f407xx.h"
+#include "isr_port.h"          /* ISR 計時掛勾；沒有 isr_port_config.h 時展開成空 */
 
 #define BTN_PIN   0U     /* PA0 = B1 user button，對應 EXTI line 0 / IRQ_EXTI0 */
 
@@ -68,10 +69,14 @@ int app_button_is_down(void)
  */
 void EXTI0_IRQHandler(void)
 {
+    ISR_PORT_ENTER();
+
     if (EXTI->PR & (1U << BTN_PIN)) {
         EXTI->PR = (1U << BTN_PIN);     /* 寫 1 清除 pending（必須清，否則反覆觸發）*/
         if (s_btn_cb) {
             s_btn_cb();                 /* 通知 button task：有邊緣，去去抖確認 */
         }
     }
+
+    ISR_PORT_EXIT();
 }

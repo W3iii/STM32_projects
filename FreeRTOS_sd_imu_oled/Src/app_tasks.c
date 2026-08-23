@@ -49,10 +49,11 @@
 #include "app_datalogger.h"
 #include "app_cli.h"
 #include "app_button.h"
+#include "app_cpu_stats.h"
 
 /* ---- task 參數 ---- */
 #define SENSOR_PERIOD_MS     10          /* 100Hz */
-#define DISPLAY_PERIOD_MS    100         /* ~10Hz */
+#define DISPLAY_PERIOD_MS    100         /* ~10Hz；也是 CPU 統計的取樣節拍，見下方 static_assert */
 #define LOGGER_SYNC_MS       1000        /* 每秒 f_sync */
 #define BTN_DEBOUNCE_MS      20          /* EXTI 喚醒後等接點沉澱，再重讀電位確認 */
 
@@ -71,6 +72,13 @@
 #define STACK_CONSOLE        1024        /* ls/dump/clear 經 dl_* 走 FatFs */
 #define STACK_BUTTON         768         /* toggle→start/stop 會走 FatFs；保守值，可用 high-water-mark 量測後縮小 */
 #define STACK_BOOTSTRAP      1024        /* f_mount 走 FatFs */
+
+/* CPU 統計取樣掛在 Display task 的迴圈上，所以兩邊的週期必須一致：
+ * cpustats 用「最近 10 筆取樣」當作最近 1 秒、用 CPUSTATS_HIST_LEN 換算
+ * 時間軸長度，週期對不上這些換算就會說謊（百分比本身仍是對的，因為分母是
+ * 實際的 TIM2 差值）。改任一邊都會在這裡編不過。 */
+_Static_assert(DISPLAY_PERIOD_MS == CPUSTATS_SAMPLE_MS,
+               "Display task period must match CPUSTATS_SAMPLE_MS");
 
 /* ---- 同步原語 ---- */
 static QueueHandle_t     s_qSamples;
@@ -322,6 +330,13 @@ static void display_task(void *arg)
 
         ssd1306_update_screen();            /* 同步更新，鎖內完成 */
         spi1_unlock();
+
+        /* CPU 統計取樣。掛在這裡而不是另開 task / timer：Display 本來就是
+         * 10Hz 的固定節拍，週期剛好等於 CPUSTATS_SAMPLE_MS，省一支 task 的
+         * 堆疊與排程成本。取樣只是複製一張小表，不呼叫 uxTaskGetSystemState，
+         * 所以不會掛起排程器去走 task list，對 100Hz 的 Sensor 沒有干擾。
+         * 放在 spi1_unlock() 之後，讓 OLED 那段的耗時也落在本次取樣區間內。 */
+        cpustats_sample();
 
         vTaskDelay(pdMS_TO_TICKS(DISPLAY_PERIOD_MS));
     }
