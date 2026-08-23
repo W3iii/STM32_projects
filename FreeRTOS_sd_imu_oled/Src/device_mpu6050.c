@@ -110,7 +110,11 @@ void mpu6050_read_all(mpu6050_axes_t *acc, mpu6050_axes_t *gyro)
      *   0x43~0x48  gyro (6 bytes)
      * 一次 burst read 14 bytes 比兩次 6 bytes 快很多
      */
-    i2c1_read_regs(MPU6050_ADDR, REG_ACCEL_XOUT_H, buf, 14);
+    /* 用非同步版：這支是 Sensor task 的 100Hz 熱路徑，400kHz 下這筆交易
+     * 約 400µs。polling 版會讓 prio 4 的 Sensor 空轉整整 400µs，期間
+     * Logger/Display/Console 全部被鎖在外面；async 版把那段時間讓出去。
+     * 其餘 mpu6050_* 函式（WHO_AM_I、init）不在熱路徑，繼續用 polling。 */
+    i2c1_read_regs_async(MPU6050_ADDR, REG_ACCEL_XOUT_H, buf, 14);
 
     parse_axes(&buf[0], acc);     // buf[0~5]
     parse_axes(&buf[8], gyro);    // buf[8~13]（跳過 buf[6~7] 的溫度）

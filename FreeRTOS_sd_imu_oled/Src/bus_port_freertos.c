@@ -17,11 +17,25 @@
 static SemaphoreHandle_t s_mSpi1;   /* OLED + SD/FatFs */
 static SemaphoreHandle_t s_mI2c1;   /* MPU6050 + INA219 */
 
+/* I2C1 非同步交易完成的號誌。用 binary semaphore 而不是 task notification：
+ * ulTaskNotifyTake 預設吃 index 0，而 sensor / console / button 都已經拿
+ * index 0 接自己的事件（start 通知、UART RX、EXTI），撞在一起會互相吃掉
+ * 對方的通知。專用號誌沒這問題，代價只有約 80 bytes heap。
+ *
+ * binary semaphore 會 latch：ISR 若在 task 走到 wait 之前就 give，稍後的
+ * take 會立刻返回，不會 lost wakeup。 */
+static SemaphoreHandle_t s_sI2c1Xfer;
+
+/* 等待上限。交易本身在 400kHz 下約 400µs，給 50ms 是純粹的保險 ——
+ * 狀態機若因為 bus stuck 卡住，Sensor task 要能自己脫身，不能死等。 */
+#define I2C1_XFER_TIMEOUT_MS   50U
+
 int bus_port_init(void)
 {
-    s_mSpi1 = xSemaphoreCreateMutex();
-    s_mI2c1 = xSemaphoreCreateMutex();
-    return (s_mSpi1 != NULL && s_mI2c1 != NULL) ? 0 : -1;
+    s_mSpi1      = xSemaphoreCreateMutex();
+    s_mI2c1      = xSemaphoreCreateMutex();
+    s_sI2c1Xfer  = xSemaphoreCreateBinary();
+    return (s_mSpi1 != NULL && s_mI2c1 != NULL && s_sI2c1Xfer != NULL) ? 0 : -1;
 }
 
 void spi1_lock(void)   { xSemaphoreTake(s_mSpi1, portMAX_DELAY); }
@@ -29,3 +43,27 @@ void spi1_unlock(void) { xSemaphoreGive(s_mSpi1); }
 
 void i2c1_lock(void)   { xSemaphoreTake(s_mI2c1, portMAX_DELAY); }
 void i2c1_unlock(void) { xSemaphoreGive(s_mI2c1); }
+
+/* 呼叫端一定持有 i2c1_lock，所以同一時間只有一支 task 在等這支號誌。
+ * 發起交易前先把可能殘留的 give 清掉（上一筆逾時後 ISR 才姍姍來遲的情況），
+ * 否則這次的 take 會立刻假性返回。 */
+int i2c1_xfer_wait(void)
+{
+    return (xSemaphoreTake(s_sI2c1Xfer,
+                           pdMS_TO_TICKS(I2C1_XFER_TIMEOUT_MS)) == pdTRUE) ? 0 : -1;
+}
+
+void i2c1_xfer_signal(void)
+{
+    BaseType_t woken = pdFALSE;
+    xSemaphoreGiveFromISR(s_sI2c1Xfer, &woken);
+    /* Sensor 是 prio 4，比被打斷的那支高，直接在離開 ISR 時切過去，
+     * 省掉一次排程延遲。 */
+    portYIELD_FROM_ISR(woken);
+}
+
+/* 發起交易前把殘留的 give 清乾淨（見 i2c1_xfer_wait 的說明）。 */
+void i2c1_xfer_reset(void)
+{
+    (void)xSemaphoreTake(s_sI2c1Xfer, 0);
+}

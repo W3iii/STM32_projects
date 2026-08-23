@@ -39,4 +39,31 @@ void spi1_unlock(void);
 void i2c1_lock(void);
 void i2c1_unlock(void);
 
+/* ── I2C1 非同步交易的等待 / 喚醒 ──────────────────────────────
+ * 中斷驅動的 i2c1_read_regs_async()（driver_i2c1.c）用這一對把「等匯流排」
+ * 從 busy-wait 換成阻塞：發起交易後 task 睡覺，ISR 把整筆交易推完才喚醒一次。
+ *
+ * 為什麼值得：MPU6050 的 14-byte burst 在 400kHz 下約 400µs，而一次
+ * 睡眠/喚醒來回的成本約 3~8µs，比例 50:1 以上。更重要的是 Sensor 是
+ * prio 4（全系統最高），它 busy-wait 時其他 task 全部被鎖在外面動不了，
+ * 改成睡覺才真的把 CPU 讓出去 —— 這是本專案唯一能買到「真並行」的地方。
+ * （SPI/SD 那兩處改成睡覺只換到省電，因為它們不是最高優先權。）
+ *
+ * 反過來說，粒度太細就不划算：逐 byte 睡覺（3µs 的等待付 3~8µs 的代價）
+ * 是淨虧，所以只有「整筆交易」這個層級才這樣做。
+ *
+ * i2c1_xfer_reset()   發起交易「之前」呼叫，清掉上一筆殘留的完成通知
+ *                     （前一次逾時、ISR 事後才送達的情況），否則這次的
+ *                     wait 會立刻假性返回。
+ * i2c1_xfer_wait()    阻塞直到 ISR 呼叫 signal；有 timeout，避免狀態機
+ *                     卡住時把 Sensor task 一起拖死。回傳 0 = 正常被喚醒，
+ *                     非 0 = 逾時。
+ * i2c1_xfer_signal()  由 I2C1 的 ISR 呼叫（跑在中斷脈絡）。
+ *
+ * bare-metal 版：reset/signal 寫成空，wait 寫成 while (i2c1_async_busy());
+ * 行為就退回成原本的 busy-wait，driver 其餘部分不用改。 */
+void i2c1_xfer_reset(void);
+int  i2c1_xfer_wait(void);
+void i2c1_xfer_signal(void);
+
 #endif /* BUS_PORT_H_ */

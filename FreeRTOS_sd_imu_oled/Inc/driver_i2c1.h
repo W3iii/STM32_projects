@@ -97,6 +97,28 @@ i2c_status_t i2c1_read_regs(uint8_t slave, uint8_t reg, uint8_t *buf, uint8_t le
  *   I2C_OK       bus 釋放成功
  *   I2C_ERR_BUS  送完 9 clock 後 SDA 仍 LOW（slave 真的卡死）
  */
+/* ── 中斷驅動版的 read_regs（非同步）────────────────────────────
+ * 匯流排時序與 i2c1_read_regs() 完全相同，差別只在等待方式：polling 版在
+ * while 迴圈裡空轉，這支發起交易後就阻塞（透過 bus_port.h 的
+ * i2c1_xfer_wait()），由 I2C1 的 ISR 把整筆交易推完才喚醒一次。
+ *
+ * 給誰用：Sensor task 的 100Hz 熱路徑。MPU6050 的 14-byte burst 在 400kHz
+ * 下約 400µs，polling 版那 400µs 全部算成 CPU 時間，而且 Sensor 是 prio 4
+ * （全系統最高），空轉期間其他 task 全被鎖在外面 —— 這是本專案唯一能靠
+ * 「改成睡覺」買到真並行的地方。
+ *
+ * 誰不該用：i2cscan / bus_recovery / 寫暫存器，以及 bare-metal 專案。
+ * 那些沿用上面的 polling 版，行為完全沒變。
+ *
+ * 前提：呼叫端必須已持有 i2c1_lock()（與 polling 版相同的約定）。
+ * 回傳值與 i2c1_read_regs() 相同；額外多一種 I2C_ERR_TIMEOUT 的來源：
+ * 狀態機在 bus stuck 時沒推完，等待逾時後周邊會被收乾淨再回報。 */
+i2c_status_t i2c1_read_regs_async(uint8_t slave, uint8_t reg, uint8_t *buf, uint8_t len);
+
+/* 非同步交易是否進行中。給 bare-metal 版的 i2c1_xfer_wait() 盯著用
+ * （退化成 busy-wait），一般應用不需要呼叫。 */
+int i2c1_async_busy(void);
+
 i2c_status_t i2c1_bus_recovery(void);
 
 /*
