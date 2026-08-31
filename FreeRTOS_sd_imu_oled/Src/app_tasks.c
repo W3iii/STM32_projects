@@ -113,6 +113,19 @@ static ina219_data_t s_power;
 static uint8_t       s_power_valid;     /* 0 = INA219 不在線或還沒量到 */
 static uint8_t       s_ina_present;     /* init 成功才在 Display 迴圈裡讀它 */
 
+/* ---- 最近 N 筆量測的環形緩衝：給 CLI 的 power 指令做平均 ----
+ * 為什麼要平均：單筆讀數偶爾會跳出離群值 —— 麵包板上的 I2C 雜訊讓某個
+ * bit 翻掉，或量測窗剛好對上 SD 寫入 / OLED 更新的湧浪電流。只看一筆就會
+ * 把「瞬間尖峰」當成「平均功耗」誤判。取 POWER_AVG_N(10) 筆 @10Hz =
+ * 最近 1 秒的平均：一次性尖峰被攤成 1/10，又不會慢到看不出負載變化。
+ *
+ * writer 只有 Display task、reader 只有 CLI，和 s_power 共用同一段
+ * critical section 保護（同一次更新內寫完，讀者不會看到半新半舊的窗）。 */
+#define POWER_AVG_N  10
+static ina219_data_t s_pwr_hist[POWER_AVG_N];
+static uint8_t       s_pwr_head;        /* 下一筆要寫進去的位置 */
+static uint8_t       s_pwr_count;       /* 已累積筆數，上限 POWER_AVG_N */
+
 int app_tasks_get_power(ina219_data_t *out)
 {
     int valid;
@@ -123,6 +136,54 @@ int app_tasks_get_power(ina219_data_t *out)
     }
     taskEXIT_CRITICAL();
     return valid;
+}
+
+/* 最近 POWER_AVG_N 筆的平均值。回傳 0 的條件和 app_tasks_get_power 一樣
+ * （最新一次讀取失敗 = 資料過期就不給），不會拿舊窗充數。
+ *
+ * 兩段式：critical section 內只做記憶體複製，float 加總留到外面做。
+ * 40 次浮點加法沒必要含在關中斷區間裡；複製 10×16 bytes 才是必要的部分。
+ * 複製前 n 筆在兩種情況都對：未填滿時資料就在 0..n-1，填滿後整個陣列都有效，
+ * 而平均不在乎順序。 */
+int app_tasks_get_power_avg(ina219_data_t *out, uint32_t *n_used)
+{
+    ina219_data_t buf[POWER_AVG_N];
+    uint32_t      n;
+    int           valid;
+
+    taskENTER_CRITICAL();
+    valid = s_power_valid;
+    n     = s_pwr_count;
+    if (valid) {
+        for (uint32_t i = 0; i < n; i++) {
+            buf[i] = s_pwr_hist[i];
+        }
+    }
+    taskEXIT_CRITICAL();
+
+    if (!valid || n == 0) {
+        return 0;
+    }
+
+    float bus = 0.0f, shunt = 0.0f, cur = 0.0f, pwr = 0.0f;
+    for (uint32_t i = 0; i < n; i++) {
+        bus   += buf[i].bus_v;
+        shunt += buf[i].shunt_mv;
+        cur   += buf[i].current_ma;
+        pwr   += buf[i].power_mw;
+    }
+
+    if (out != NULL) {
+        float inv = 1.0f / (float)n;
+        out->bus_v      = bus   * inv;
+        out->shunt_mv   = shunt * inv;
+        out->current_ma = cur   * inv;
+        out->power_mw   = pwr   * inv;
+    }
+    if (n_used != NULL) {
+        *n_used = n;
+    }
+    return 1;
 }
 
 /* ───────────────── Idle 省電：WFI 開關 ─────────────────
@@ -323,6 +384,11 @@ static void display_task(void *arg)
             if (rc == 0) {
                 s_power = p;
                 s_power_valid = 1;
+                s_pwr_hist[s_pwr_head] = p;
+                s_pwr_head = (uint8_t)((s_pwr_head + 1) % POWER_AVG_N);
+                if (s_pwr_count < POWER_AVG_N) {
+                    s_pwr_count++;      /* 只長到滿，之後靠 head 繞圈覆寫最舊的 */
+                }
             } else {
                 s_power_valid = 0;          /* 讀失敗：標記過期，別讓 CLI 印舊值 */
             }

@@ -476,15 +476,21 @@ static void cli_wfi(const char *arg)
     usart1_send_string(g_wfi_enabled ? "on (idle sleeps)\r\n" : "off (idle spins)\r\n");
 }
 
-/* ───────────────── power：INA219 讀數 ─────────────────
- * 不自己碰 I2C —— 量測由 Display task 以 10Hz 做，這裡只取它存下的快照
- * （app_tasks_get_power 內用 critical section 複製，四個值同一時刻）。
+/* ───────────────── power：INA219 讀數（最近 10 筆平均）─────────────────
+ * 不自己碰 I2C —— 量測由 Display task 以 10Hz 做，這裡只取它存下的資料。
  * 好處：CLI 不必上 I2C 鎖、不會和 Sensor 搶 bus，指令回應也是瞬間的。
- * 代價：讀數最舊可能落後 100ms —— 對看電源狀態完全夠用。 */
+ *
+ * 印的是「最近 10 筆的平均」而不是最新一筆：單筆讀數偶爾會跳出離群值
+ * （I2C 雜訊、量測窗剛好撞上 SD 寫入 / OLED 更新的湧浪電流），拿它當
+ * 功耗數字會誤判。10 筆 @10Hz = 最近 1 秒，尖峰被攤成 1/10，量 wfi on/off
+ * 這種對照時兩次讀數才穩定可比。
+ * 代價：反應慢一拍 —— 負載剛變化時要等約 1 秒平均窗才換完。
+ * 想看瞬時值，OLED 第 3 行印的仍是最新一筆。 */
 static void cli_power(void)
 {
     ina219_data_t p;
-    if (!app_tasks_get_power(&p)) {
+    uint32_t      n;
+    if (!app_tasks_get_power_avg(&p, &n)) {
         usart1_send_string("INA219 not available (check wiring, try: i2cscan)\r\n");
         return;
     }
@@ -504,6 +510,11 @@ static void cli_power(void)
     cli_label("power");
     cli_print_fixed(p.power_mw, 1);
     usart1_send_string(" mW\r\n");
+
+    /* 把樣本數印出來，讀數才有可信度可言：開機後第一秒內會少於 10。 */
+    cli_label("avg of");
+    cli_print_u32(n);
+    usart1_send_string(" samples @10Hz\r\n");
 }
 
 /* ───────────────── i2cscan：I2C1 匯流排掃描 ─────────────────
@@ -589,7 +600,7 @@ static void cli_print_help(void)
         "  tasks          FreeRTOS task monitor (CPU% / peak / stack)\r\n"
         "  tasks hist [t] CPU% timeline, last 6.4s (t = task name)\r\n"
         "  tasks reset    clear peaks + timeline\r\n"
-        "  power          INA219 voltage / current / power\r\n"
+        "  power          INA219 V / I / P (avg of last 10 samples)\r\n"
         "  wfi [on|off]   idle WFI sleep (power saving)\r\n"
         "  i2cscan        scan I2C1 bus (0x08..0x77)\r\n"
         "  help           this list\r\n");

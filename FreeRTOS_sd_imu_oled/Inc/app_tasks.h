@@ -53,4 +53,13 @@ extern volatile uint8_t g_wfi_enabled;
  * 回傳：1 = 資料有效，0 = INA219 不在線或還沒量到（out 不會被寫）。 */
 int app_tasks_get_power(ina219_data_t *out);
 
+/* 最近 10 筆量測（10Hz → 約 1 秒）的平均，四個欄位各自平均。
+ * 單筆讀數偶爾會有離群值（I2C 雜訊、剛好撞上 SD/OLED 的湧浪電流），
+ * 要「看系統平均耗電」時用這支，CLI 的 power 指令就是走這條。
+ *
+ * out 可為 NULL；n_used 可為 NULL，非 NULL 時回填實際平均了幾筆
+ * （開機後前 1 秒還沒累積滿，會少於 10）。
+ * 回傳：1 = 有效，0 = INA219 不在線或最新一次讀取失敗（out/n_used 不會被寫）。*/
+int app_tasks_get_power_avg(ina219_data_t *out, uint32_t *n_used);
+
 #endif /* APP_TASKS_H_ */
