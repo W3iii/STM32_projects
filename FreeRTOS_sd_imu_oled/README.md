@@ -13,7 +13,8 @@
 
 同一台 IMU 記錄器（MPU6050 100Hz → CSV/SD、OLED 顯示、UART CLI），但底層換成 FreeRTOS：
 取樣、寫卡、顯示、命令列各自獨立成 task，靠 **Queue + Mutex** 解耦與保護共用資源；
-再往上疊了**功耗量測（INA219）**、**自建 CPU 佔用統計**與**中斷驅動的 I2C**。
+再往上疊了**功耗量測（INA219）**、**自建 CPU 佔用統計**、**中斷驅動的 I2C**、
+一套「等待夠久就去睡」的匯流排等待策略，以及供電不穩時的**降級模式**。
 
 ---
 
@@ -30,6 +31,10 @@
 - **先量測再優化**：自己做一套比 kernel 內建更準的 CPU 統計，用它找出「16% 的 CPU 花在
   空轉等 I2C」，再對症下藥把它降到 0.8%。過程與數據見下方
   [可觀測性](#可觀測性自建-cpu-統計) 與 [I2C 非同步化](#i2c-非同步化從-162-降到-08)。
+- **硬體不穩時還能跟你對話**：板子靠 ST-LINK USB 供電，餘裕本來就小，SD 寫入的湧浪電流會
+  讓三顆周邊間歇性出錯。與其在初始化失敗時掛起，不如**降級**：CLI、OLED、`i2cscan`、`power`
+  全部照常，只有記錄功能關掉，並把失敗分類計數印在 `status`。見
+  [韌性一](#韌性一六個安靜地騙人的缺陷)、[韌性二](#韌性二供電邊界下的降級模式) 兩節。
 
 ---
 
@@ -67,6 +72,7 @@
 | **`spi1_lock`** Mutex | SPI1 匯流排 | OLED 與 SD/FatFs 共用。序列化「整個 transaction」（OLED 整次更新，或一個 FatFs 操作）。 |
 | **`i2c1_lock`** Mutex | I2C1 匯流排 | MPU6050（Sensor）、INA219（Display）、`i2cscan`（Console）共用。包住整組交易，不只單筆。 |
 | **`s_sI2c1Xfer`** Binary Semaphore | I2C 非同步交易 | ISR 把整筆交易推完後喚醒發起的 task。詳見下方 I2C 章節。 |
+| **`s_sSpi1Xfer`** Binary Semaphore | SPI1 DMA 傳輸 | DMA2_Stream3 傳完（或報錯）時喚醒等待的 task，取代原本的忙等。與 I2C 那組同一個 wait/signal 模式。 |
 | **state mutex** | 狀態快照 | 保護 `state/count/filename/fres`。避免讀到半更新的欄位。 |
 
 ### 為什麼拆成兩支 bus mutex
@@ -189,6 +195,43 @@ ISR 裡一個 byte 一個 byte 搬的，因為 I2C 每個 byte 後都可能需�
 
 ---
 
+## 等待策略：什麼時候該睡，什麼時候該轉
+
+RTOS 化真正改變的不是「多了幾支 task」，而是**每一處等待都變成一個要回答的問題**：
+這段時間要抱著 CPU 空轉，還是進 Blocked 讓別人跑？
+
+判準只有一個 —— **等待長度 ÷ 切換成本**。一次 context switch 約 3~8µs；比值愈大愈該睡。
+專案裡每一處等待都用同一把尺量過：
+
+| 等待什麼 | 一次多久 | 比值 | 決定 | 位置 |
+|---|---|---|---|---|
+| SD 卡 busy（flash program/erase）| 1 ms ~ 數百 ms | 200:1 ~ 10⁵:1 | **睡** `vTaskDelay(1)` | `spi1_poll_yield()` |
+| OLED 一次 framebuffer DMA（1024 B @5.25MHz）| 1.6 ms | 300:1 | **睡** 等 DMA ISR | `spi1_wait_done()` |
+| SD 一個 block 的 data-out（512 B @2.6MHz）| 1.6 ms | 300:1 | **睡** 改走 TX-only DMA | `sd_write_block()` |
+| I2C 一整筆交易（14 B @400kHz）| 370 µs | 70:1 | **睡** 等 I2C ISR | `i2c1_read_regs_async()` |
+| I2C 單一 byte @400kHz | 22.5 µs | 13:1 † | 中斷驅動（ISR 內逐 byte 推）| `I2C1_EV_IRQHandler` |
+| DMA 結束後等 SPI `BSY` 落下 | 1.52 µs | 0.2:1 | **轉**（睡比等還久）| `spi1_wait_done()` 尾段 |
+| SPI 單一 byte @2.6MHz | 3.1 µs | 0.5:1 | **轉** | `spi1_transfer_byte()` |
+
+† 這一列的分母是 **ISR 進出開銷 1.7µs**，不是 context switch —— 逐 byte 中斷不換 task。
+其餘各列都是對 3~8µs 的切換成本。
+
+兩個從實作中長出來的細節：
+
+**先轉一下再睡。** 「等卡」的迴圈不會一開頭就睡 —— 先忙等 `SD_SPIN_BEFORE_YIELD`（64 次
+≈ 200µs），之後才改成 `spi1_poll_yield()`。SD 讀取的 NAC 典型 100µs、寫入的 program time
+通常 1~3ms：常見的讀取路徑一次 yield 都走不到，不多付任何延遲；只有真的撞上 wear-leveling
+那種停幾百毫秒的情況才切到 1ms 粒度輪詢。反過來說，一開頭就睡會讓每次存取無條件多付一個
+tick，mount 階段幾十次 sector 讀取加起來很有感。
+
+**讓出的是 CPU，不是匯流排。** `spi1_poll_yield()` 睡著時仍持有 `spi1_lock` —— 這是刻意的：
+SD 的一次 block write 是不可中斷的交易序列，中途讓別人動 SPI1 會直接毀掉它
+（exp13 §2 那個 OVR 坑就是共用匯流排咬人的前例）。另外用 `vTaskDelay(1)` 而不是
+`taskYIELD()`：後者只讓給同優先權以上的 task，而 logger 是 prio 3，讓完馬上被排回來，
+對 Display(1) / Console(2) 一點幫助都沒有 —— 要真的把時間讓出去就得進 Blocked。
+
+---
+
 ## 移植階段
 
 **Phase 1 — 排程器 bring-up**
@@ -219,14 +262,24 @@ ISR 裡一個 byte 一個 byte 搬的，因為 I2C 每個 byte 後都可能需�
 - IDLE 用 **WFI** 睡覺，`wfi on|off` 可即時切換當對照組 —— 配 `power` 就是一組現成的省電量測。
 - `i2cscan` 掃 0x08~0x77，掃不到就順手做一次 bus recovery。
 
-**Phase 5 — 量測、優化與韌性（本版）**
+**Phase 5 — 量測、優化與韌性**
 - 自建 CPU 統計取代 kernel run-time stats（見上方章節）。
 - I2C 400kHz + 中斷驅動讀取（見上方章節）。
 - 六個 bug 修正（見下方）。
 
+**Phase 6 — 把剩下的忙等收乾淨、供電邊界下的降級（本版）**
+- **SPI1 DMA 等待改成睡眠**：`spi1_wait_done()` 不再忙等，DMA2_Stream3 的 ISR 喚醒等待的
+  task；同時開了 `TEIE`，DMA 出錯也會喚醒（以前錯誤發生時 TC 永遠不來，只能白白耗完逾時）。
+  這件事的前提是 Phase 5 已把該 stream 的 NVIC 優先權從 0 改成 6，ISR 才能合法呼叫
+  `...FromISR()`。
+- **SD 區塊寫入改走 DMA**：data-out 期間卡不在 MISO 上說話，正好符合 TX-only DMA 的前提。
+- **「等卡」迴圈改成先轉後睡**（`spi1_poll_yield()`）—— 上面那張表的第一列。
+- **供電邊界下的可診斷性與降級模式**（見下方韌性第二節）。
+- `power` 改印最近 10 筆（1 秒）平均，單筆離群值不再誤導 wfi on/off 這種對照量測。
+
 ---
 
-## 韌性：六個「安靜地騙人」的缺陷
+## 韌性一：六個「安靜地騙人」的缺陷
 
 實際踩到一次「logger 卡住」：`status` 說 LOGGING、OLED 有畫面、`tasks` 的 CPU 分布完全
 正常，但計數再也不動、一筆都沒寫進卡片。根因是供電不穩讓 SD 寫入逾時，但**系統對它的
@@ -248,22 +301,61 @@ ISR 裡一個 byte 一個 byte 搬的，因為 I2C 每個 byte 後都可能需�
 
 ---
 
+## 韌性二：供電邊界下的降級模式
+
+板子目前靠 ST-LINK USB 供電，板載 3.3V LDO 的餘裕本來就小（MCU @168MHz 就吃掉一半以上），
+而 SD 卡寫入瞬間電流可達 100~200mA。實測連續出現三個**彼此獨立**的間歇性故障：
+
+- SD 寫入逾時 → logger 假死
+- INA219 偶爾讀不到 → 最後開機就完全偵測不到
+- `f_mount` 偶爾失敗，`FRESULT=3 (FR_NOT_READY)`
+
+三顆周邊、兩條匯流排、全部間歇 → 共同上游是電。**這一節不修根因**（根因是硬體：SD 獨立
+供電 + 就近加去耦電容），而是讓系統在邊界狀態下**可診斷、可存活**。
+
+| # | 做法 | 為什麼 |
+|---|---|---|
+| 1 | **I2C 失敗依類型分開計數**，印在 `status`：`nack` / `bus` / `timeout` | 三者指向完全不同的方向，混成一個數字就沒辦法對症下藥。`nack`＝slave 沒回應（供電、接觸、位址）；`bus`＝BERR/ARLO/OVR（電氣雜訊，或 ISR 被延遲太久 —— 400kHz 下每 22.5µs 就來一個 byte）；`timeout`＝狀態機沒被推動。計數放在 driver 層，上層的重試不會把真實失敗率藏起來。 |
+| 2 | **INA219 讀取重試一次** | `ina219_read()` 是兩筆交易，任一筆失敗整個讀取就作廢，一次 glitch 就讓那一幀顯示 `--`。麵包板上偶爾出錯是常態，一次重試蓋掉絕大多數；失敗率仍看得到（第 1 項）。代價：失敗時多約 500µs，10Hz 下可忽略。 |
+| 3 | **async 交易發 START 前先等 `BUSY`** | RM0090 要求 START 只能在 BUSY=0 時發起。`ina219_read()` 兩筆交易背靠背，第一筆的 STOP 在線上還要約一個 SCL 週期才成形，而 task 被喚醒後可能更快就發下一個 START。只有 INA219 會踩到（MPU6050 一次 lock 只做一筆交易）。上限抓短（數百 µs），真卡住由既有的 50ms 逾時接手。 |
+| 4 | **SD 掛載重試 3 次**，間隔 200ms，且**重試過就顯示出來** | `FRESULT=3` 代表 CMD0/ACMD41 沒走完，SD 在初始化期間對供電最敏感；因為是「偶爾」而非確定性失敗，重試很有效（技術上可行是因為 `disk_initialize()` 沒有快取狀態，每次都真的重跑 `sd_init()` 全套）。但「一次就過」才是健康的，所以 `status` 會講：`mounted after 1 retry (power margin?)` —— 這是早期警訊，不是「修好了」。 |
+| 5 | **初始化失敗不再 `vTaskSuspend`**（最重要的一項）| 原本 MPU6050 或 `f_mount` 失敗就把 bootstrap 掛起，而**建立工作 task 是在那之後** —— 結果「SD 掛不起來 → console task 從沒被建立 → 連 CLI 都沒有」，正好在最需要 `i2cscan` / `status` 診斷的時候工具沒了。改成照樣把所有 task 建起來，只有 `app_datalogger_start()` 會因未掛載而失敗，`status` 第一行就講清楚：`SD  NOT MOUNTED (logging disabled, FRESULT 3)`。只有 heap 不夠建不出 state mutex 時仍然 suspend —— 那個沒得降級。 |
+
+> 硬體不穩時最需要的是一台失敗了還能跟你對話的機器。
+
+`status` 現在是一張完整的健康表，理想狀況下所有計數都是 0：
+
+```
+> status
+  state     LOGGING
+  file      log_003.csv
+  samples   12480
+  write err 0
+  overruns  0
+  i2c recov 0
+  i2c err   nack 0  bus 0  timeout 0
+  chip      41.2 C  (VDDA 2.98 V)
+```
+
+---
+
 ## 檔案地圖（相對 exp13 的差異）
 
 | 檔案 | 說明 |
 |---|---|
 | `Src/app_tasks.c` · `Inc/app_tasks.h` | **新增**：五 task + Queue + bootstrap + ISR→task 通知接線 |
 | `Src/app_button.c` · `Inc/app_button.h` | **新增**：PA0 EXTI0 事件驅動按鈕（去抖留給上層 task）|
-| `Inc/bus_port.h` · `Src/bus_port_freertos.c` | **新增**：RTOS 中立的匯流排 porting 介面 —— `spi1_lock`/`i2c1_lock` 與 I2C 非同步交易的 wait/signal |
+| `Inc/bus_port.h` · `Src/bus_port_freertos.c` | **新增**：RTOS 中立的匯流排 porting 介面 —— `spi1_lock`/`i2c1_lock`、SPI/I2C 非同步交易的 wait/signal，以及等慢速裝置時讓出 CPU 的 `spi1_poll_yield()` |
 | `Inc/isr_port.h` · `Inc/isr_port_config.h` | **新增**：ISR 計時掛勾，預設展開成空（仿 `traceXXX`），bare-metal 零成本 |
 | `Src/app_cpu_stats.c` · `Inc/app_cpu_stats.h` | **新增**：自建 CPU 佔用統計（task / `[ISR]` / `[SCHED]` 三桶 + 10Hz 取樣器 + 環形歷史）|
 | `Src/app_runtime_stats.c` | **新增**：TIM2 @100kHz 自由計數器，兩份統計共用的計時源 |
-| `Src/device_ina219.c` · `Inc/device_ina219.h` | **新增**：INA219 功耗量測 |
+| `Src/device_ina219.c` · `Inc/device_ina219.h` | **新增**：INA219 功耗量測（讀取失敗重試一次）|
 | `Src/device_tempsensor.c` | **新增**：晶片內建溫度感測（ADC，不走 I2C）|
 | `Src/driver_i2c1.c` | polling API 原封不動；**新增**中斷驅動的 `i2c1_read_regs_async()` + 兩支 ISR；400kHz fast mode |
 | `Src/app_datalogger.c` | 拆取樣/寫入、加鎖、狀態快照；`DL_ERROR` 與寫入錯誤回報；`dl_dump/dl_list/dl_clear` |
-| `Src/app_cli.c` | `tasks` / `power` / `wfi` / `i2cscan` 指令；`status` 加 `write err` 與 `i2c recov` |
-| `Src/driver_spi1.c` | DMA 等待加逾時；NVIC 優先權修正 |
+| `Src/app_cli.c` | `tasks` / `power` / `wfi` / `i2cscan` 指令；`status` 加 `write err`、`i2c recov`、`i2c err` 分類與掛載狀態；`power` 改印 10 筆平均 |
+| `Src/driver_spi1.c` | DMA 等待從忙等改成睡眠（ISR 喚醒）+ 100ms 上限；開啟 `TEIE` 讓傳輸錯誤也喚醒；NVIC 優先權修正 |
+| `Src/device_sdcard.c` | block 寫入的 512 byte data-out 改走 TX-only DMA；「等 token / 等卡 busy」兩個迴圈改成先轉 64 次再 `spi1_poll_yield()`；掛載期由上層重試 |
 | `Src/driver_usart1.c` | RX IDLE/DMA 中斷 → callback 喚醒 console |
 | `Inc/FreeRTOSConfig.h` | CM4F 設定、handler alias、heap 28KB、run-time stats 計時源、CPU 統計的 trace hook |
 | `Src/{tasks,queue,list,timers,port,heap_4}.c` 等 | **新增**：vendored FreeRTOS-Kernel V11.1.0 |
@@ -286,15 +378,19 @@ commands:
   tasks          FreeRTOS task monitor (CPU% / peak / stack)
   tasks hist [t] CPU% timeline, last 6.4s (t = task name)
   tasks reset    clear peaks + timeline
-  power          INA219 voltage / current / power
+  power          INA219 V / I / P (avg of last 10 samples)
   wfi [on|off]   idle WFI sleep (power saving)
   i2cscan        scan I2C1 bus (0x08..0x77)
   help           this list
 ```
 
 3. CLI 指令或按 **PA0（B1）** 都能 toggle start/stop。
-4. `status` 的四個健康指標，理想全為 0：`overruns`（佇列掉拍）、`write err`（SD 寫入失敗
-   次數 + FatFs FRESULT）、`i2c recov`（I2C 匯流排卡住並自動復原的次數）。
+4. `status` 的健康指標理想全為 0：`overruns`（佇列掉拍）、`write err`（SD 寫入失敗次數
+   + FatFs FRESULT）、`i2c recov`（I2C 匯流排卡住並自動復原的次數）、`i2c err` 的
+   `nack`/`bus`/`timeout`。開頭若出現 `SD NOT MOUNTED` 或 `mounted after N retry`，
+   先查供電（見上方韌性第二節）。
+   `power` 印的是最近 10 筆（1 秒）平均並附樣本數 —— 開機第一秒內看到 `3 samples`
+   就知道這個數字先別當真；要看瞬時值看 OLED 第 3 行。
 5. 若 heap/stack 不夠，UART 會印 `[PANIC] ...` / `[ASSERT] file:line`，不再靜默卡死。
 
 ---
@@ -312,11 +408,20 @@ commands:
 - `elapsed` 是 `uint32`，開機超過 11.9 小時後 Avg% 失效。
 - CPU 統計 slot 用盡（>12 task）時該 task 的時間會靜默消失。
 
+**Phase 6 尚未上板驗證**
+- SPI 睡眠等待、SD DMA 寫入、`spi1_poll_yield()`、`power` 平均 —— 四項都還沒在板子上跑過。
+  下面這些數字是**算出來的，不是量到的**：display 預期從 4.2% 降到約 2.7%（省下來的流回
+  IDLE 去 WFI，所以是省電不是省吞吐 —— Display 是 prio 1，它空轉本來就擋不住誰；真正的
+  收益是不再抱著 `spi1_lock` 空轉）；logger 的 Peak% 預期從 90.8% 掉到個位數。
+  上板後要重跑 `tasks` 對帳。
+
 **還沒做的優化**
-- OLED 的 `spi1_wait_done()` 仍是忙等（約 1.56% CPU）。DMA 已經在用，只差改成睡覺 ——
-  `bus_port` 的 wait/signal 模式可以直接套。省下來的是電流不是吞吐（Display 是最低優先權）。
-- SD 區塊寫入仍是逐 byte polling（`spi1_transfer_byte` × 512，約 0.7%）。改走
-  `spi1_send_buffer` 的 DMA 即可，比例 1.56ms : 5µs 很划算。
+- **SD 讀取仍是逐 byte polling**（`sd_read_block` 的 512 byte 迴圈）。寫入能用 TX-only DMA
+  是因為 data-out 期間不必收 MISO；讀取要收，得另外開 RX DMA 或全雙工雙 stream，工程量
+  不是同一個等級。`dump` 大檔時感受最明顯。
+- SD 多 block 讀寫（CMD18/25）未做，每個 block 都要重付一次命令 + 等 token 的開銷。
+- `spi1_poll_yield()` 固定睡 1ms，沒有 backoff。對 SD 夠用，但它是 `bus_port` 的公開介面，
+  之後若有等待尺度差很多的裝置要用，語意會不夠。
 - **I2C 只有讀做了 async**，`i2c1_write_reg` / `write_reg16` 仍是 polling（都是一次性的
   初始化，不在熱路徑）。
 - `configGENERATE_RUN_TIME_STATS` 仍為 1，kernel 每次 context switch 白算一份沒人讀的
@@ -331,3 +436,7 @@ commands:
   所有被 instrument 的 ISR 優先權 ≥ 6。**第二條靠約定維持，編譯器不會警告**
   （上面第 6 個 bug 就是它被違反）。
 - HardFault handler（fault stack dump）未做。
+
+**硬體**
+- 供電根因未解：SD 獨立供電 + 就近去耦電容還沒做。韌性第二節做的是「可診斷、可存活」，
+  不是把問題修掉 —— `mounted after N retry` 與 `i2c err` 非 0 都還是會出現。
