@@ -22,6 +22,7 @@
 
 #include "device_sdcard.h"
 #include "driver_spi1.h"
+#include "bus_port.h"    /* spi1_poll_yield()：等卡 busy 時讓出 CPU（RTOS 中立） */
 #include "systick.h"
 #include "stm32f407xx.h"
 
@@ -48,6 +49,17 @@
  * 而逾時的代價是「整個 session 從此寫不進去」，寧可等久一點。 */
 #define SD_READ_TIMEOUT_MS    200
 #define SD_WRITE_TIMEOUT_MS   1000
+
+/* 「等卡」的迴圈先忙等幾次，之後才改成 spi1_poll_yield()。
+ *
+ * 64 次 × 3.1µs @2.6MHz ≈ 200µs。卡在正常狀況下就在這個範圍內回應
+ * （讀的 NAC 典型 100µs、寫完一個 block 的 program time 通常 1~3ms），
+ * 所以常見路徑一次 yield 都不會走到，不多付任何延遲；只有真的撞上
+ * wear-leveling / block erase 那種停幾百毫秒的情況才切到 1ms 粒度輪詢。
+ *
+ * 反過來說，一開頭就直接睡會讓每次讀寫都無條件多付一個 tick，
+ * mount 階段幾十次 sector 讀取加起來很有感。 */
+#define SD_SPIN_BEFORE_YIELD  64U
 
 /* 資料 token */
 #define SD_TOKEN_START        0xFE   /* 單 block 讀/寫的起始 token */
@@ -298,6 +310,7 @@ uint8_t sd_read_block(uint32_t block, uint8_t *buf)
      * 正常是 0xFE；其他值代表 error token。 */
     uint8_t token = 0xFF;
     uint32_t start = systick_get_ms();
+    uint32_t spins = 0;
     do {
         token = spi1_transfer_byte(0xFF);
         if (token != 0xFF) {
@@ -306,6 +319,9 @@ uint8_t sd_read_block(uint32_t block, uint8_t *buf)
         if (systick_get_ms() - start > SD_READ_TIMEOUT_MS) {
             sd_deselect();
             return SD_ERR_READ;
+        }
+        if (++spins > SD_SPIN_BEFORE_YIELD) {
+            spi1_poll_yield();          /* 卡遲遲不給 token，別空轉燒 CPU */
         }
     } while (1);
 
@@ -340,9 +356,19 @@ uint8_t sd_write_block(uint32_t block, const uint8_t *buf)
     spi1_transfer_byte(0xFF);
     spi1_transfer_byte(SD_TOKEN_START);
 
-    /* 送 512 byte 資料 + 2 byte 假 CRC */
-    for (int i = 0; i < SD_BLOCK_SIZE; i++) {
-        spi1_transfer_byte(buf[i]);
+    /* 送 512 byte 資料 + 2 byte 假 CRC
+     *
+     * data-out 期間卡不會在 MISO 上說話，所以這段是純送 —— 正好符合
+     * spi1_send_buffer() 那條 TX-only DMA 的前提（等卡回應的地方就不行，
+     * 收不到 MISO）。512 bytes @2.6MHz ≈ 1.6ms，跟 OLED 一次 1024 bytes
+     * 同一個量級，按 bus_port.h 的粒度判準就是該睡的：DMA 跑的時候
+     * task 進 Blocked，不再逐 byte 忙等。
+     *
+     * buf 來自 FatFs（FIL 內的 sector 緩衝或呼叫端的陣列），本專案沒有
+     * 任何東西放在 CCMRAM，都在 DMA 讀得到的主 SRAM。 */
+    if (spi1_send_buffer(buf, SD_BLOCK_SIZE) != 0) {
+        sd_deselect();                  /* DMA 逾時：block 送到一半，整筆放棄 */
+        return SD_ERR_WRITE;
     }
     spi1_transfer_byte(0xFF);
     spi1_transfer_byte(0xFF);
@@ -354,12 +380,22 @@ uint8_t sd_write_block(uint32_t block, const uint8_t *buf)
         return SD_ERR_WRITE;
     }
 
-    /* 卡寫 flash 期間會把 MISO 拉低(回 0x00) = busy，等到回 0xFF 才算寫完 */
+    /* 卡寫 flash 期間會把 MISO 拉低(回 0x00) = busy，等到回 0xFF 才算寫完。
+     *
+     * 這就是把 logger 的 Peak% 推到 90.8% 的那個迴圈（見上面
+     * SD_WRITE_TIMEOUT_MS 的註解）。忙等 SD_SPIN_BEFORE_YIELD 次之後改成
+     * 讓出 CPU：正常的 program time 落在毫秒級，會走到 yield，但一次只
+     * 睡 1ms，寫入吞吐量幾乎不受影響；而遇到 block erase 停幾百毫秒時，
+     * 讓出來的就是整整幾百毫秒的 CPU。 */
     uint32_t start = systick_get_ms();
+    uint32_t spins = 0;
     while (spi1_transfer_byte(0xFF) == 0x00) {
         if (systick_get_ms() - start > SD_WRITE_TIMEOUT_MS) {
             sd_deselect();
             return SD_ERR_WRITE;
+        }
+        if (++spins > SD_SPIN_BEFORE_YIELD) {
+            spi1_poll_yield();
         }
     }
 

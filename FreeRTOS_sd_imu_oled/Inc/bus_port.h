@@ -61,6 +61,24 @@ void spi1_xfer_reset(void);
 int  spi1_xfer_wait(void);
 void spi1_xfer_signal(void);
 
+/* ── 等慢速裝置時讓出 CPU ──────────────────────────────
+ * 上面那組解的是「等 DMA 傳完」，這一支解的是另一種等待：SD 卡收下一個
+ * block 之後會把 MISO 拉低幾毫秒到幾百毫秒做 flash program / erase，
+ * device_sdcard.c 只能反覆送 0xFF 去問它好了沒 —— 沒有中斷可以掛。
+ *
+ * 那個迴圈原本是純忙等，代價很具體：logger 的 Peak% 實測從 2.5% 衝到
+ * 90.8%，而且它全程握著 spi1_lock，Display 更新不了、CLI 也沒反應。
+ *
+ * 粒度是對的：單 byte 3.1µs @2.6MHz 不值得睡（所以 spi1_transfer_byte
+ * 維持忙等），但「卡 busy 整段」是 10^3~10^5 µs 尺度，睡一次 3~8µs 的
+ * 成本比例 300:1 以上，跟上面 DMA 那組同一個判準。
+ *
+ * 語意刻意保持寬鬆：只承諾「讓出 CPU 一小段」，不保證睡多久。呼叫端
+ * 已經有自己的逾時（SD_WRITE_TIMEOUT_MS），不依賴這裡的時間精度。
+ *
+ * bare-metal 版寫成空函式，行為就退回原本的忙等，driver 其餘部分不用改。 */
+void spi1_poll_yield(void);
+
 void i2c1_lock(void);
 void i2c1_unlock(void);
 

@@ -12,6 +12,7 @@
 
 #include "bus_port.h"
 #include "FreeRTOS.h"
+#include "task.h"
 #include "semphr.h"
 
 static SemaphoreHandle_t s_mSpi1;   /* OLED + SD/FatFs */
@@ -69,6 +70,22 @@ void spi1_xfer_signal(void)
 void spi1_xfer_reset(void)
 {
     (void)xSemaphoreTake(s_sSpi1Xfer, 0);
+}
+
+/* 睡一個 tick（1ms）。SD 卡 busy 是毫秒到數百毫秒尺度，1ms 的輪詢粒度
+ * 綽綽有餘，而 logger 從「燒滿一顆 CPU」變成幾乎不佔 —— 剩下的時間
+ * Display / Console 這些低優先權的 task 才跑得到。
+ *
+ * 用 vTaskDelay 而不是 taskYIELD()：後者只讓給「同優先權以上」的人，
+ * logger 是 prio 3，讓完馬上又被排回來，對 Display(1)/Console(2) 沒有
+ * 任何幫助，CPU 一樣是滿的。要真的把時間讓出去就得進 Blocked。
+ *
+ * 注意呼叫端全程持有 spi1_lock，睡著時鎖不會放掉 —— 這是刻意的：
+ * SD 的一次 block write 是不可中斷的交易序列，中途讓別人插進來動
+ * SPI1 會直接毀掉它。這裡讓出的是 CPU，不是匯流排。 */
+void spi1_poll_yield(void)
+{
+    vTaskDelay(1);
 }
 
 void i2c1_lock(void)   { xSemaphoreTake(s_mI2c1, portMAX_DELAY); }
