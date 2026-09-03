@@ -1,267 +1,178 @@
-# STM32 軟韌體工程師進度 Roadmap
+# STM32F407 — 從暫存器到 RTOS
 
-更新日期：2026-06-08  
-平台：STM32F407VGTX、STM32CubeIDE、bare-metal C、register-level driver  
-目標：成為可獨立 bring-up、寫 driver、除錯、整合系統的軟韌體工程師
+> STM32F407VGTX（Discovery）· STM32CubeIDE · **全部 register-level，不使用 HAL/LL**
+> 一條連續的學習與工程軌跡：**裸暫存器 → bare-metal driver 整合 → FreeRTOS 多工系統**。
 
----
-
-## 一句話定位
-
-已進入 **bare-metal driver integration 中階**：能查 register、設定所有主要外設、用 DMA 做 non-blocking 傳輸、寫帶 timeout 與 status code 的 driver API，並已完成跨外設整合（MPU6050 + SSD1306 + UART）。下一步的重心是**塊裝置 driver（SD card via SPI）**與**系統架構能力（UART CLI、cooperative scheduler）**。
+這個 repo 不是十三個互不相干的範例，而是**同一套 driver 一路長出來的過程**。
+每個專案都是下一個的地基：`blink_register` 學會的 RCC/GPIO 位元操作，最後仍活在
+FreeRTOS 版的 `driver_spi1.c` 裡；exp12 踩到的 SPI OVR 坑，決定了 exp13 的匯流排收尾規則；
+exp13 的 co-operative 主迴圈之所以要換成 RTOS，是因為它已經被自己的輪詢節奏卡住。
 
 ---
 
-## 目前專案地圖
+## 三個階段
 
-| 專案 | 主題 | 狀態 |
+```
+ 階段一 · Register Level          階段二 · Bare-metal 整合         階段三 · RTOS
+ 「讓這顆外設動起來」              「讓多顆外設一起活著」            「讓多件事同時發生」
+
+ blink / systick / button          exp12  SPI OLED + I2C IMU        FreeRTOS_sd_imu_oled
+ tim_pwm / dma_basic         ──►   exp13  + SD driver + FatFs   ──► 五個事件驅動 task
+ UART / dma_uart / adc / i2c              co-operative 主迴圈         Queue + 雙 bus mutex
+                                                                     中斷驅動 I2C
+ 查 RM0090 直接寫暫存器            分層架構、status code、          自建 CPU 統計
+ 一個專案一顆外設                  timeout、bus recovery            供電邊界降級模式
+```
+
+| 階段 | 核心問題 | 學到的東西 |
 |---|---|---|
-| `blink_register` | RCC/GPIO register-level LED blink | 完成 |
-| `systick_register` | SysTick 1ms tick 與 delay | 完成 |
-| `button_interrupt` | EXTI0 + SysTick debounce | 完成 |
-| `tim_pwm` | TIM4 PWM 呼吸燈 | 完成 |
-| `dma_basic` | DMA memory-to-memory + TC interrupt | 完成 |
-| `UART_register` | USART1 polling TX | 完成 |
-| `dma_uart` | USART1 TX DMA（non-blocking 概念）| 完成 |
-| `adc_circular_dma_write_uart` | ADC internal temp + circular DMA + UART DMA TX | 完成 |
-| `i2c_mpu6050_dma_uart` | I2C polling 讀 MPU6050（帶 timeout 前版本）| 完成 |
-| `exp12_ssd1306_spi` | **整合最成熟**：SPI DMA OLED + I2C MPU6050 + UART DMA；完整 driver 架構含 timeout / status code / bus recovery | **主線專案** |
+| **一** | 這個位元設下去，硬體到底做了什麼？ | memory map、clock gating、AF 對應、中斷向量、DMA 通道是硬體綁死的 |
+| **二** | 兩顆裝置共用一條匯流排會怎樣？ | 分層、錯誤碼、逾時、bus recovery，以及**共用狀態的髒污會咬人** |
+| **三** | 誰在等？等多久？這段時間 CPU 在幹嘛？ | 同步原語、優先權、事件驅動、**先量測再優化**、失敗時的降級 |
 
 ---
 
-## 已具備的能力
+## 專案地圖
 
-**外設操作：**
-- 能直接操作 STM32F407 memory map、RCC、GPIO、USART、DMA、TIM、ADC、I2C、SPI、SysTick、NVIC
-- 能從裸 register 寫出可運作的 peripheral 範例，不依賴 HAL
+### 階段一 — Register Level（一顆外設一個實驗）
 
-**Driver 設計（exp12 已達到的品質）：**
-- `i2c1_write_reg()` / `i2c1_read_regs()`：有 timeout（`systick_get_ms()`）、NACK 偵測、回傳 `i2c_status_t`
-- `i2c1_bus_recovery()`：送 9 clock pulse 強制 slave 釋放 SDA，保護系統不卡死
-- `i2c1_scan()`：掃描 I2C bus，診斷工具
-- `usart1_send_dma()` / `usart1_send_busy()`：非阻塞 DMA TX，有 busy flag
-- `usart1_send_byte()` / `usart1_recv_byte()`：polling API 有 timeout
-- `spi1_send_buffer_async()` / `spi1_wait_done()`：SPI DMA 非同步傳輸
-- `ssd1306_update_screen_async()` + `ssd1306_wait_update_done()`：framebuffer async push
-- `mpu6050_init()`：檢查 WHO_AM_I、喚醒、回傳錯誤碼（-1 = NACK，-2 = bus stuck）
+| 專案 | 實驗 | 主題 | 關鍵收穫 |
+|---|---|---|---|
+| [`blink_register`](blink_register) | 一 | RCC + GPIO | 開 clock、MODER 每 pin 佔 2 bit、ODR/BSRR |
+| [`systick_register`](systick_register) | 二 | SysTick | Cortex-M 內建計時器、1ms tick、`volatile` 的必要性 |
+| [`button_interrupt`](button_interrupt) | 三 / 四 | EXTI + NVIC | 邊沿偵測 → EXTI → NVIC → ISR 這條鏈；軟體去抖 |
+| [`tim_pwm`](tim_pwm) | 五 | TIM4 PWM | 時脈鏈 → PSC/ARR/CCR，呼吸燈 |
+| [`dma_basic`](dma_basic) | 六 | DMA mem→mem | DMA 要知道的四件事、TC 中斷 |
+| [`UART_register`](UART_register) | 七 | USART1 polling | BRR 怎麼從 clock 算、TXE/TC 的差別 |
+| [`dma_uart`](dma_uart) | 八 | USART1 TX DMA | **stream/channel 是晶片畫死的**（RM0090 Table 43）|
+| [`adc_circular_dma_write_uart`](adc_circular_dma_write_uart) | 九 / 十 | ADC + circular DMA + UART DMA | 完整資料流，CPU 全程不搬資料 |
+| [`i2c_mpu6050_dma_uart`](i2c_mpu6050_dma_uart) | 十一 | I2C + MPU6050 | 多 byte 讀的 ACK/NACK 收尾規則各不相同 |
 
-**系統設計：**
-- 理解 interrupt handler、`volatile`、DMA transfer complete、polling vs async 的差異
-- 已建立 `stm32f407xx.h`，struct mapping 取代散落的裸 address macro
-- `systick_get_ms()` 跨 driver 共用做 timeout 基準
-- I2C 錯誤在 OLED 上顯示，不是 `while(1)` 卡死
+### 階段二 — Bare-metal 整合
 
----
+| 專案 | 實驗 | 主題 |
+|---|---|---|
+| [`exp12_ssd1306_spi`](exp12_ssd1306_spi) | 十二 | **第一個整合系統**：SPI DMA OLED + I2C MPU6050 + UART DMA。driver 開始有 `*_status_t`、timeout、`i2c1_bus_recovery()`、async 傳輸 |
+| [`exp13_sd_imu_oled`](exp13_sd_imu_oled) | 十三 | **IMU 資料記錄器**：自己刻 SD 卡 SPI driver（CMD0/8/17/24/55/58、ACMD41）+ 掛 FatFs（FAT32）+ `app_datalogger` 狀態機 + UART CLI。co-operative 主迴圈 |
+| [`test_uart`](test_uart) | — | 除錯用的最小專案：把 USART1 單獨拉出來驗 Discovery 的替代腳位（見下方坑 §3）|
 
-## 目前缺口（誠實清單）
+### 階段三 — RTOS
 
-| 項目 | 說明 |
+| 專案 | 主題 |
 |---|---|
-| UART RX | 目前只有 polling recv_byte，沒有 ring buffer 或中斷式 RX |
-| UART CLI | 無法從 PC 端下指令控制板子 |
-| SD card | 尚未實作，是下一個主要目標 |
-| MPU6050 scaling | raw value 沒有轉成 g 與 deg/s；無 DLPF / 量程設定 |
-| DMA error handling | TEIF/DMEIF/FEIF 只記錄，沒有 recovery 流程 |
-| Cooperative scheduler | 還沒有多 task 架構，目前是單一 while loop |
-| HardFault handler | 發生 fault 時無 stack dump，難以 debug |
-| RTOS | 尚未進入 FreeRTOS |
+| [`FreeRTOS_sd_imu_oled`](FreeRTOS_sd_imu_oled) | **exp13 的 FreeRTOS 移植**（Kernel V11.1.0 LTS）。五個事件驅動 task、Queue + 雙 bus mutex、中斷驅動 I2C、自建 CPU 佔用統計、INA219 功耗量測、供電邊界下的降級模式。SYSCLK 拉到 168MHz（HSE→PLL，HSERDY 逾時自動 fallback HSI）。**[→ 完整說明](FreeRTOS_sd_imu_oled/README.md)** |
 
 ---
 
-## 下一個目標：SD Card SPI Driver
+## 貫穿全程的幾件事
 
-### 為什麼選 SD card
+**一、`stm32f407xx.h` 是自己寫的。**
+不是 ST 的那份。從散落的 `#define GPIOD_MODER (*(volatile uint32_t*)0x40020C00)` 慢慢收斂成
+struct mapping，一路沿用到 RTOS 版。看得懂官方 header 為什麼長那樣，是因為自己走過一次。
 
-- 面試高頻外設：SD card 是塊裝置，涵蓋 SPI 時序、命令協定、塊讀寫、錯誤處理
-- 技術深度：比單純的 OLED / sensor 更接近真實產品中的儲存子系統
-- 已有 SPI DMA driver 底座（`spi1_send_buffer_async()`），可以直接複用
+**二、driver 有錯誤碼、有逾時，沒有 `while(1)`。**
+從 exp12 開始，每支會等硬體的函式都帶 `systick_get_ms()` 逾時與狀態回傳。
+`i2c1_bus_recovery()` 送 9 個 clock pulse 把卡住 SDA 的 slave 逼放手 —— sensor 掉線時
+系統該重試或進 error state，不是整機死等。
 
-### SD card SPI 模式基礎
+**三、分層是為了能換掉其中一層。**
 
 ```
-初始化序列：
-  1. CS HIGH + 送 ≥74 個 clock pulse（讓 SD 卡進入 SPI 模式）
-  2. CS LOW + CMD0（GO_IDLE_STATE）→ R1 = 0x01（Idle 狀態）
-  3. CMD8（SEND_IF_COND）→ 確認電壓範圍（SDHC/SDXC 支援）
-  4. ACMD41（SD_SEND_OP_COND）→ 輪詢到 R1 = 0x00（Ready）
-  5. CMD58（READ_OCR）→ 讀 OCR，確認 SDHC bit
-
-讀取單一塊（512 bytes）：
-  CMD17（READ_SINGLE_BLOCK）→ 等 Data Token 0xFE → 讀 512 bytes + 2 bytes CRC
-
-寫入單一塊：
-  CMD24（WRITE_BLOCK）→ 送 Data Token 0xFE → 送 512 bytes + 2 bytes CRC
-  → 等 busy（MISO = 0）結束
+ Application   app_datalogger · app_cli · app_tasks
+ Middleware    FatFs (FAT32) ── diskio.c
+ Device        device_mpu6050 · device_ssd1306 · device_sdcard · device_ina219
+ Bus / Driver  driver_i2c1 · driver_spi1 · driver_usart1 · driver_rcc · systick
+ Porting       bus_port.h · isr_port.h        ← RTOS 中立，link-time 綁定
+ MCU           stm32f407xx.h（自寫 register map）
 ```
 
-### 計劃 API
+`bus_port.h` / `isr_port.h` 這層是 RTOS 化時長出來的：**只宣告具名函式、不 include 任何
+RTOS 標頭**，FreeRTOS 版實作成 mutex/semaphore，bare-metal 版寫成 no-op。所以同一份
+`device_sdcard.c` 在 exp13 和 RTOS 版都能編，driver 層完全不知道底下有沒有 kernel。
 
-```c
-typedef enum {
-    SD_OK = 0,
-    SD_ERR_TIMEOUT,
-    SD_ERR_INIT,
-    SD_ERR_CMD,
-    SD_ERR_CRC,
-} sd_status_t;
+**四、先量測，再優化。**
+RTOS 版自己寫了一套比 kernel 內建更準的 CPU 佔用統計（kernel 那份把 ISR 時間算到被打斷的
+task 頭上，而且漏掉當下未結算的切片）。用它量到「16.2% 的 CPU 花在空轉等 I2C」，才決定把
+I2C 改成中斷驅動 —— 降到 0.8%，而且省下來的每一點都在 IDLE 那欄對得起來。
+沒有那個數字，改哪裡都只是猜。
 
-sd_status_t sd_init(void);
-sd_status_t sd_read_block (uint32_t block_addr, uint8_t *buf);
-sd_status_t sd_write_block(uint32_t block_addr, const uint8_t *buf);
-```
-
-### 建議順序
-
-1. 先用 polling SPI 完成 init + CMD0 + CMD8 + ACMD41
-2. 用 polling 讀寫單塊（CMD17 / CMD24），UART 驗證資料
-3. 再把讀寫換成 DMA（`spi1_send_buffer_async()`）
-4. 加入錯誤處理和 retry 邏輯
+**五、失敗要看得見。**
+最難查的 bug 不是當機，是**安靜地騙人**：`status` 說 LOGGING、OLED 有畫面、CPU 分布正常，
+但一筆都沒寫進卡片（FatFs 第一次失敗就把錯誤鎖進 `fp->err`，之後每次 `f_write` 直接返回）。
+現在每個「可能默默失敗」的地方都有計數器，並且印在 `status` 上。
 
 ---
 
-## Phase 2：通訊能力補齊（進行中）
+## 五個值得講的坑
 
-### SD Card（首要）
-
-- [ ] polling SPI 完成 SD 初始化（CMD0/CMD8/ACMD41）
-- [ ] 讀寫單塊 512 bytes（CMD17/CMD24）
-- [ ] 換成 DMA 非同步讀寫
-- [ ] 整合進 `exp12_ssd1306_spi`：SD log + OLED 顯示
-
-### UART RX / CLI（次要）
-
-- [ ] UART RX interrupt + ring buffer
-- [ ] USART IDLE line + DMA circular RX（封包接收）
-- [ ] line-based command parser：
-  - `mpu read` → 印出 acc/gyro raw
-  - `oled clear` → 清 OLED
-  - `sd read <block>` → 印出 512 bytes hex dump
-  - `rate <n>` → 設定顯示更新頻率
-- [ ] UART TX DMA queue：多筆字串連續送不互相覆蓋
-
-### I2C / MPU6050 深化
-
-- [ ] MPU6050 raw → g（÷16384）、deg/s（÷131）
-- [ ] 設定 DLPF（Digital Low Pass Filter）
-- [ ] 設定量程（±2g / ±4g / ±8g / ±16g）
-
----
-
-## Phase 3：Timer、ADC、DMA 深化
-
-目標：從「會設定外設」進到「會設計資料流」。
-
-- TIM input capture：量測外部 PWM 頻率與 duty
-- TIM encoder mode：接旋轉編碼器
-- ADC external channel + circular DMA
-- ADC + timer trigger：固定 sample rate，不靠 while loop
-- DMA double buffer：一邊收資料，一邊處理上一包
-- DMA error flag（TEIF/DMEIF/FEIF）recovery 流程
-
-完成標準：
-- 能畫出資料流：Timer trigger → ADC → DMA buffer → processing → UART/OLED
-- 能解釋 DMA buffer 的 ownership rule，何時可以讀、何時不能改
-
----
-
-## Phase 4：系統設計與 RTOS
-
-先做 non-RTOS：
-
-- cooperative scheduler（1ms tick 下跑多個 task）
-- event queue（button/sensor/uart command 都丟事件）
-- state machine（BOOT、INIT_SENSOR、RUN、ERROR、RECOVERY）
-- HardFault handler：印出 stacked PC/LR/xPSR
-- watchdog
-
-再做 FreeRTOS：
-
-- task、queue、semaphore、mutex
-- UART RX task + sensor task + display task + SD log task
-- DMA ISR 裡只做通知，不做重工作
-- priority inversion 與 stack size 觀念
-
-完成標準：
-- sensor、display、UART CLI、SD logging 同時跑，彼此不互卡
-- 出錯時能進 error state 或重啟 peripheral，不是整機死等
-
----
-
-## Phase 5：作品集專題
-
-以 `exp12_ssd1306_spi` 為核心，發展成兩個代表作。
-
-### 作品集 1：MPU6050 OLED Motion Dashboard + SD Logger
-
-功能：
-- MPU6050 讀取 acc/gyro，轉換成 g / deg/s
-- OLED 即時顯示 X/Y/Z、姿態估測（傾斜角）
-- UART CLI 控制顯示模式、量程、更新率
-- SD card 記錄 IMU data（CSV 格式，可用 Python/Excel 畫圖）
-- 系統 state machine：BOOT → INIT_SENSOR → RUN → ERROR
-
-展示重點：
-- 完整的 register-level driver 堆疊
-- 跨外設 DMA 非同步整合
-- 塊裝置 driver（SD card）
-- 可操作的 CLI + 可分析的 log 檔
-
-### 作品集 2：ADC DMA Data Logger
-
-功能：
-- Timer 觸發 ADC，固定 sample rate
-- ADC circular DMA double buffer
-- UART DMA 輸出 CSV 或 binary packet
-- SD card 儲存長時間 log
-
-展示重點：
-- real-time sampling pipeline
-- buffer ownership
-- throughput 與 latency 分析
-
-### 作品集 3：小型 Bootloader（進階）
-
-- UART 接收 firmware image
-- 寫入 flash，checksum/CRC
-- 跳轉 application
-- 展示 linker script、vector table、flash erase/program
-
----
-
-## 必備知識矩陣
-
-| 領域 | 目前狀態 | 下一步 |
+| # | 現象 | 根因 |
 |---|---|---|
-| C 語言 | 已能寫裸機 C、指標、volatile、struct register map、status code pattern | 補 ring buffer、state machine、const correctness |
-| MCU 架構 | 已做 SysTick/NVIC/interrupt/DMA | 補 exception model、HardFault stack dump、startup flow |
-| 外設 driver | GPIO/UART/DMA/TIM/ADC/I2C/SPI 皆有，I2C/UART 已有 timeout + status | 補 SD card（塊裝置）、UART RX ring buffer |
-| Toolchain | 使用 CubeIDE 與 linker script | 補 map file、objdump、size、startup assembly |
-| Debug | 目前偏 LED/UART/OLED debug | 補 breakpoint/watchpoint、logic analyzer、HardFault dump |
-| RTOS | 尚未進入 | 先寫 cooperative scheduler，再進 FreeRTOS |
-| 工程化 | Driver API 有 status code；每個專案有 README | 補 UART CLI、state machine、demo 影片 |
+| **1** | SD 卡 CMD0/CMD8 都過，ACMD41 卻永遠停在 idle；UART 同時糊字、MCU 間歇重開機 | **5V 灌進 3.3V 腳**。低電流命令跑得動，ACMD41 要驅動內部 flash 就撐不住。三個現象同時出現，只有「電壓被拉垮」能一起解釋。教訓：CMD8 只是 echo 你宣告的電壓範圍，**不代表實際 VDD 正確**。 |
+| **2** | 只跑 SD 一切正常，**一把 OLED 加進主迴圈**，CSV 就截斷、下一個檔整個空白 | OLED 用 **TX-only DMA** 推 framebuffer，全程不讀 RX → 傳完後 SPI 的 **OVR** 被設起、DR 卡著舊 byte。接著 SD 的全雙工 `spi1_transfer_byte()` 看到 RXNE 早已 set，**直接讀走舊 byte、根本沒把命令時脈出去**。修法：所有 DMA 收尾都排空 RX 並清 OVR（先讀 DR 再讀 SR）。→ **共用匯流排最隱晦的坑：一個用 DMA-TX-only、一個用全雙工 polling，前者的髒狀態會咬到後者。** |
+| **3** | USART1 接 PA9/PA10 就是亂碼 | Discovery 板上 **PA9/PA10 被板載 USB-OTG（CN5 VBUS/ID）佔用**。改用 PB6/PB7，並把 I2C1 SCL 從 PB6 讓到 PB8。`test_uart` 就是為了隔離驗證這件事而建的最小專案。**注意：exp12/exp13 的 README 仍寫 PA9/PA10 —— 那是發現這件事之前寫的，只有 FreeRTOS 版改過腳位。** |
+| **4** | I2C 非同步交易「還沒開始就結束」，而且會自我延續 | SR1 的錯誤位元是**準位觸發**的。原本「先開中斷、再發 START」，只要殘留 `AF`/`BERR`，`ITERREN` 一開 ER 中斷就當場觸發；沒人收拾的 START 留在匯流排上，讓下一筆更容易出錯。改成發起前先清旗標、START 移到開中斷之前。 |
+| **5** | SD 寫入逾時、INA219 偶爾讀不到、`f_mount` 偶爾 `FR_NOT_READY` —— 三個間歇故障同時出現 | 三顆周邊、兩條匯流排、全部間歇 → **共同上游是電**（ST-LINK USB 供電，SD 寫入湧浪 100~200mA）。這是硬體問題，但軟體的責任是**讓它可診斷、可存活**：I2C 失敗依 nack/bus/timeout 分類計數、掛載重試並顯示重試過、初始化失敗改成降級而非 suspend（不然 SD 掛不起來連 CLI 都沒有，正好在最需要診斷工具的時候）。 |
 
 ---
 
-## 面試準備清單
+## 硬體與環境
+
+| 項目 | 內容 |
+|---|---|
+| MCU | STM32F407VGTX（STM32F4 Discovery），Cortex-M4F |
+| 時脈 | 階段一/二：HSI 16MHz。階段三：HSE 8MHz → PLL **168MHz**，HSERDY 逾時 fallback HSI |
+| 感測 | MPU6050（I2C，GY-521）· INA219（I2C，功耗）· 晶片內建溫度感測（ADC）|
+| 顯示 | SSD1306 128×64 OLED（SPI，DMA 推 framebuffer）|
+| 儲存 | microSD（SPI 模式，自寫 driver）+ FatFs R0.15a |
+| 通訊 | USART1 → CP2102/CH340 → PC，115200 8N1 |
+| 工具 | STM32CubeIDE（managed build）· ST-LINK · RM0090 / PM0214 / 各晶片 datasheet |
+
+> ⚠️ SD 卡務必吃 **3.3V**，VDD–GND 建議補 `10µF + 100nF` 去耦（見坑 §1、§5）。
+
+---
+
+## 怎麼讀這個 repo
+
+- **想看完成度最高的東西** → [`FreeRTOS_sd_imu_oled`](FreeRTOS_sd_imu_oled/README.md)（RTOS 設計、量測數據、取捨與已知限制都寫在它自己的 README）
+- **想看 bare-metal 怎麼整合** → [`exp13_sd_imu_oled`](exp13_sd_imu_oled/README.md)（SD driver 從 CMD0 刻起、FatFs 整合、開發歷程與踩坑）
+- **想看某顆外設怎麼從暫存器設起** → 階段一的任一專案，每個都有自己的 README，附暫存器表與時序說明
+
+每個資料夾都是獨立的 STM32CubeIDE 專案：Import → Existing Projects into Workspace → Build → 燒錄。
+FreeRTOS 版的 kernel 原始碼直接 vendored 在 `Src/` / `Inc/`，managed build 自動收編，**零 `.cproject` 改動**。
+
+---
+
+## 目前狀態與下一步
+
+**已完成**：階段一全部、階段二全部、階段三的 Phase 1~6（排程器 bring-up → 拆 task →
+事件驅動 → 功耗與匯流排擴充 → 量測與優化 → 收乾忙等與降級模式）。
+
+**進行中 / 下一步**：
+
+- **上板驗證 Phase 6**：SPI 睡眠等待、SD DMA 寫入、`spi1_poll_yield()` 的預期數字要用 `tasks` 對帳
+- **供電根因**：SD 獨立供電 + 就近去耦 —— 降級模式只是讓它可診斷，不是修好
+- **SD 讀取路徑**：寫入已走 DMA，讀取仍是逐 byte polling（要收 MISO，得開 RX DMA 或全雙工雙 stream）；多 block CMD18/25 未做
+- **HardFault handler**：印出 stacked PC/LR/xPSR，目前 fault 發生時沒有任何線索
+- **MPU6050 深化**：DLPF、量程設定、raw → g / °/s 的定點換算與傾斜角
+- **Timer / ADC 資料流**：input capture、encoder mode、timer 觸發 ADC 固定 sample rate、DMA double buffer
+- **小型 bootloader**：UART 收 firmware image、CRC、寫 flash、跳轉 application（linker script / vector table 的實戰）
+
+---
+
+## 面試準備清單（自問自答用）
 
 - `volatile` 解決什麼問題？不能解決什麼問題？
-- ISR 裡為什麼不適合做太多事？
-- DMA transfer complete 代表資料真的送完了嗎？SPI 的 BSY 為什麼還要等？
+- ISR 裡為什麼不適合做太多事？「ISR 只做通知」在這個 repo 的哪些地方看得到？
+- DMA transfer complete 代表資料真的送完了嗎？SPI 的 `BSY` 為什麼還要等？
 - UART baud rate 怎麼從 clock 算出 BRR？
-- I2C single-byte、two-byte、multi-byte read 為什麼 ACK/NACK 流程不同？
+- I2C single-byte / two-byte / multi-byte read 為什麼收尾流程不同？`POS` 是做什麼的？
 - circular DMA buffer 什麼時候可以讀？什麼時候不能改？
-- SD card SPI 初始化為什麼要送 74 個 clock before CS LOW？
-- linker script 裡 FLASH/RAM 區段在做什麼？
-- startup assembly 如何跳到 `main()`？
+- SD card SPI 初始化為什麼要在 CS 拉低前送 74 個 clock？
+- 兩個裝置共用一條 SPI，一個用 DMA、一個用 polling，會出什麼事？（坑 §2）
+- 一段等待要忙等還是睡覺，你怎麼決定？（等待長度 ÷ 切換成本）
+- mutex 的優先權繼承解決什麼？什麼情況下它救不了你？
+- 為什麼要自己寫 CPU 佔用統計，而不是用 `configGENERATE_RUN_TIME_STATS`？
+- 承載 `...FromISR()` 的中斷，優先權為什麼必須 ≥ `configMAX_SYSCALL_INTERRUPT_PRIORITY`？
+- linker script 裡 FLASH/RAM 區段在做什麼？startup assembly 如何跳到 `main()`？
 - HardFault 發生時你會怎麼查？
 - sensor 掉線，firmware 應該卡住、重試、進 error state，還是 reset peripheral？
-
----
-
-## 建議下一個工作項目
-
-1. **SD card driver（polling 版）**：接好 SPI，完成 CMD0 → CMD8 → ACMD41 初始化，UART 印出成功訊息
-2. **SD 單塊讀寫**：CMD17 讀 + CMD24 寫，寫完再讀回來驗證資料
-3. **SD DMA 版**：把讀寫換成 `spi1_send_buffer_async()`
-4. **UART RX + ring buffer**：讓 `exp12` 可以收 PC 的指令
-5. **MPU6050 scaling**：raw → g / deg/s，加簡單的傾斜角計算
