@@ -102,13 +102,27 @@ void app_datalogger_set_producer(TaskHandle_t producer);
 
 /* 列出根目錄所有檔案，每個檔呼叫一次 emit(name,size)；free_kb_out 取回剩餘 KB
  * （傳 NULL 可不取）。回傳檔案數 / <0=opendir 失敗。 */
-int dl_list(void (*emit)(const char *name, uint32_t size), uint32_t *free_kb_out);
+/* f_getfree 失敗時填進 *free_kb_out 的哨兵值。用 0 會被讀成「卡滿了」。 */
+#define DL_FREE_KB_UNKNOWN   0xFFFFFFFFU
+
+/* 列出根目錄的檔案。
+ *   回傳 >= 0  檔案數（0 = 目錄真的是空的）
+ *        -1    目錄讀取失敗，*fres_out 給 FatFs 的 FRESULT
+ * fres_out 可為 NULL。錯誤與空目錄一定要分開判斷 —— 供電邊界下 f_readdir
+ * 會失敗，舊版把兩者混成同一個回傳值，ls 就會謊報成空卡。 */
+int dl_list(void (*emit)(const char *name, uint32_t size),
+            uint32_t *free_kb_out, uint8_t *fres_out);
 
 /* 把 name 這個檔讀回來，每一行呼叫一次 emit_line(line)。回傳 0=OK / <0=open 失敗。
  * 注意：記錄中的 session 檔正開著寫，dump 它請先 stop（呼叫端自行判斷）。 */
 int dl_dump(const char *name, void (*emit_line)(const char *line));
 
 /* 刪掉所有 log_NNN.csv（NNN=000..999）。deleted_out 取回刪除數（可 NULL）。回傳 0。 */
-int dl_clear(uint32_t *deleted_out);
+/* 刪掉所有 log_NNN.csv。
+ *   回傳 0  全部刪完
+ *       -1  中途失敗，*fres_out 給 FatFs 的 FRESULT
+ * 兩種情形 *deleted_out 都填實際刪掉的數量。中途失敗必須回報 —— 否則
+ * 「本來就只有 N 個」跟「刪到第 N+1 個時卡掛了」印出來完全一樣。 */
+int dl_clear(uint32_t *deleted_out, uint8_t *fres_out);
 
 #endif /* APP_DATALOGGER_H_ */

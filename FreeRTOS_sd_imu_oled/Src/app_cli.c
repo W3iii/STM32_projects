@@ -255,17 +255,26 @@ static void cli_emit_file(const char *name, uint32_t size)
 static void cli_ls(void)
 {
     uint32_t free_kb = 0;
-    int n = dl_list(cli_emit_file, &free_kb);
+    uint8_t  fres    = 0;
+    int n = dl_list(cli_emit_file, &free_kb, &fres);
     if (n < 0) {
-        usart1_send_string("opendir failed\r\n");
+        /* 讀失敗跟空目錄是兩回事：1=FR_DISK_ERR（供電/接觸）、3=FR_NOT_READY。
+         * 再打一次 ls 常常就好了 —— 那本身就是供電邊界的徵兆。 */
+        usart1_send_string("dir read failed (FRESULT ");
+        cli_print_u32(fres);
+        usart1_send_string(") - retry, or check power\r\n");
         return;
     }
     if (n == 0) {
         usart1_send_string("  (no files)\r\n");
     }
     usart1_send_string("free: ");
-    cli_print_u32(free_kb);
-    usart1_send_string(" KB\r\n");
+    if (free_kb == DL_FREE_KB_UNKNOWN) {
+        usart1_send_string("unknown (getfree failed)\r\n");
+    } else {
+        cli_print_u32(free_kb);
+        usart1_send_string(" KB\r\n");
+    }
 }
 
 /* 刪掉所有 log_NNN.csv（重複 demo 前清場用）。實際 unlink 迴圈在 dl_clear()。 */
@@ -276,10 +285,18 @@ static void cli_clear(void)
         return;
     }
     uint32_t deleted = 0;
-    dl_clear(&deleted);
+    uint8_t  fres    = 0;
+    int rc = dl_clear(&deleted, &fres);
     usart1_send_string("deleted ");
     cli_print_u32(deleted);
-    usart1_send_string(" files\r\n");
+    usart1_send_string(" files");
+    if (rc != 0) {
+        /* 沒刪完。數量本身不代表卡上原本就只有這些。 */
+        usart1_send_string(" then ABORTED (FRESULT ");
+        cli_print_u32(fres);
+        usart1_send_string(") - files remain");
+    }
+    usart1_send_string("\r\n");
 }
 
 /* ───────────────── tasks：FreeRTOS 執行期監控 ─────────────────
@@ -669,16 +686,41 @@ static void cli_dispatch(char *line)
     }
 
     if (strcmp(cmd, "start") == 0) {
-        if (app_datalogger_start() == 0) {
+        int start_rc = app_datalogger_start();
+        if (start_rc == 0) {
             usart1_send_string("started: ");
             usart1_send_string(app_datalogger_filename());
             usart1_send_string("\r\n");
+        } else if (start_rc == -1) {
+            /* 掛載失敗（含當場重掛也沒過）。這條路徑不經過 f_open，所以
+             * s_fres 是 0 —— 要印的是 f_mount 的 FRESULT，不是寫入的。 */
+            usart1_send_string("start failed: SD not mounted (FRESULT ");
+            cli_print_u32((uint32_t)app_datalogger_mount_result());
+            usart1_send_string(") - check power/card\r\n");
         } else {
-            usart1_send_string("start failed\r\n");
+            /* 開檔失敗。1=FR_DISK_ERR、3=FR_NOT_READY 指向供電或接觸，
+             * 7=FR_DENIED 是空間。 */
+            dl_status_t st;
+            app_datalogger_get_status(&st);
+            usart1_send_string("start failed");
+            if (st.fres != 0) {
+                usart1_send_string(" (FRESULT ");
+                cli_print_u32(st.fres);
+                usart1_send_string(")");
+            }
+            usart1_send_string("\r\n");
         }
     } else if (strcmp(cmd, "stop") == 0) {
-        app_datalogger_stop();
-        usart1_send_string("stopped\r\n");
+        if (app_datalogger_stop() == 0) {
+            usart1_send_string("stopped\r\n");
+        } else {
+            /* 收尾寫入失敗 = 這個 session 的資料沒落地。必須說出來。 */
+            dl_status_t st;
+            app_datalogger_get_status(&st);
+            usart1_send_string("stopped, but FLUSH FAILED (FRESULT ");
+            cli_print_u32(st.fres);
+            usart1_send_string(") - data may be lost\r\n");
+        }
     } else if (strcmp(cmd, "status") == 0) {
         cli_status();
     } else if (strcmp(cmd, "dump") == 0) {

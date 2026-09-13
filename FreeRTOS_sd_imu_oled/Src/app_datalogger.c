@@ -50,7 +50,14 @@ static inline void state_lock(void)   { xSemaphoreTake(s_state_mtx, portMAX_DELA
 static inline void state_unlock(void) { xSemaphoreGive(s_state_mtx); }
 
 /* 找第一個還沒被用的 log_NNN.csv（NNN = 000..999）。 */
-static void dl_make_filename(void)
+/* 找第一個沒被占用的 log_NNN.csv。
+ *
+ * 回傳 FR_OK = s_filename 可用；其他值 = 卡讀不動，呼叫端該放棄。
+ * 「讀不動」必須跟「這個名字是空的」分開：只有 FR_NO_FILE 才代表可用，
+ * FR_DISK_ERR / FR_NOT_READY 這些以前會被當成「已被占用」繼續往下找，
+ * 於是在壞掉的卡上要磨完 1000 圈、每圈各吃一次 SD 逾時（實測 start 要等
+ * 十幾秒才回 "start failed"），最後還沿用 log_999.csv 去開檔。 */
+static FRESULT dl_make_filename(void)
 {
     FILINFO fno;
     for (int i = 0; i < 1000; i++) {
@@ -66,11 +73,16 @@ static void dl_make_filename(void)
         s_filename[9] = 's';
         s_filename[10] = 'v';
         s_filename[11] = '\0';
-        if (f_stat(s_filename, &fno) == FR_NO_FILE) {
-            return;                 /* 這個沒人用，就用它 */
+        FRESULT fr = f_stat(s_filename, &fno);
+        if (fr == FR_NO_FILE) {
+            return FR_OK;           /* 這個沒人用，就用它 */
+        }
+        if (fr != FR_OK) {
+            return fr;              /* 卡讀不動，再找下去只是浪費時間 */
         }
     }
     /* 000..999 都被用了：沿用迴圈最後設定的 log_999.csv（會被覆蓋）*/
+    return FR_OK;
 }
 
 int app_datalogger_init(void)
@@ -124,7 +136,27 @@ int app_datalogger_mount_result(void)
 int app_datalogger_start(void)
 {
     if (!s_mounted) {
-        return -1;
+        /* 開機那三次掛載失敗，不代表卡從此不能用 —— 供電邊界下卡往往只是
+         * 慢了一步（FRESULT 3 = FR_NOT_READY）。但 s_mounted 以前是開機一鎚
+         * 定音，之後就算卡完全正常也解不開，只能重開機。
+         *
+         * 實測踩到：剛完整格式化過的卡，開機第一次 f_mount 沒過，之後 ls
+         * 讀得好好的、free 也正確（FatFs 在下一次 API 呼叫時自己重掛成功了），
+         * 唯獨 start 一直回 -1 —— 而且那條路徑不設 s_fres，CLI 只能印一句
+         * 沒有任何資訊的 "start failed"。
+         *
+         * 所以這裡當場重掛一次。f_mount(opt=1) 會真的重跑 disk_initialize()
+         * → sd_init()，是實質重試而不是只改旗標。 */
+        spi1_lock();
+        s_mount_res = f_mount(&s_fs, "", 1);
+        spi1_unlock();
+        if (s_mount_res != FR_OK) {
+            return -1;              /* 原因在 app_datalogger_mount_result() */
+        }
+        s_mounted = 1;
+        state_lock();
+        s_state = DL_IDLE;
+        state_unlock();
     }
     if (app_datalogger_state() == DL_LOGGING) {
         return 0;                   /* 已在記錄 */
@@ -142,10 +174,14 @@ int app_datalogger_start(void)
         state_unlock();
     }
 
-    int rc = 0;
+    int     rc = 0;
+    FRESULT fr;
     spi1_lock();
-    dl_make_filename();             /* 寫 s_filename（在 bus 內、稍後 state 內公布）*/
-    if (f_open(&s_fil, s_filename, FA_WRITE | FA_CREATE_ALWAYS) != FR_OK) {
+    fr = dl_make_filename();        /* 寫 s_filename（在 bus 內、稍後 state 內公布）*/
+    if (fr == FR_OK) {
+        fr = f_open(&s_fil, s_filename, FA_WRITE | FA_CREATE_ALWAYS);
+    }
+    if (fr != FR_OK) {
         rc = -2;
     } else {
         f_puts("t_ms,ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps,temp_c\n", &s_fil);
@@ -153,6 +189,12 @@ int app_datalogger_start(void)
     spi1_unlock();
 
     if (rc != 0) {
+        /* 失敗原因留在 s_fres，讓 status 印得出 FRESULT。沒有這個的話
+         * CLI 只能說 "start failed"，分不出 FR_DISK_ERR(1) 是供電/接觸，
+         * 還是 FR_NOT_READY(3) 是卡根本沒認到。 */
+        state_lock();
+        s_fres = (uint8_t)fr;
+        state_unlock();
         return rc;
     }
 
@@ -186,10 +228,25 @@ int app_datalogger_stop(void)
     s_state = DL_IDLE;
     state_unlock();
 
+    /* f_sync/f_close 的結果以前被丟掉，於是「收尾失敗」印出來也是 "stopped"。
+     * 實測踩到：VDDA 掉到 2.74V 時 f_close 寫不回 FAT，檔案停在 0 B，CLI 卻
+     * 回報成功 —— 使用者以為錄到了，實際上整個 session 都沒落地。
+     * f_close 失敗時 FIL 的狀態已經不可信，一律把 state 留在 IDLE 不重試。 */
     spi1_lock();
-    f_sync(&s_fil);
-    f_close(&s_fil);
+    FRESULT fr  = f_sync(&s_fil);
+    FRESULT frc = f_close(&s_fil);
     spi1_unlock();
+
+    if (fr == FR_OK) {
+        fr = frc;
+    }
+    if (fr != FR_OK) {
+        state_lock();
+        s_fres = (uint8_t)fr;
+        s_err_count++;
+        state_unlock();
+        return -1;
+    }
     return 0;
 }
 
@@ -348,18 +405,40 @@ void app_datalogger_set_producer(TaskHandle_t producer)
  * 全部 FatFs/SD 存取 + spi1_lock 收在這裡，emit callback 在 spi1_lock 內被回呼，
  * callback 內只能碰 UART、不可碰 SD/OLED（同一支 spi1_lock）。 */
 
-int dl_list(void (*emit)(const char *name, uint32_t size), uint32_t *free_kb_out)
+int dl_list(void (*emit)(const char *name, uint32_t size),
+            uint32_t *free_kb_out, uint8_t *fres_out)
 {
     static DIR dir;             /* static：DIR 別放 stack */
     FILINFO    fno;
     int        n = 0;
 
+    if (fres_out) {
+        *fres_out = 0;
+    }
+
     spi1_lock();                 /* 整段目錄掃描 + getfree 與寫卡/OLED 互斥 */
-    if (f_opendir(&dir, "/") != FR_OK) {
+    FRESULT fr = f_opendir(&dir, "/");
+    if (fr != FR_OK) {
         spi1_unlock();
+        if (fres_out) { *fres_out = (uint8_t)fr; }
         return -1;
     }
-    while (f_readdir(&dir, &fno) == FR_OK && fno.fname[0] != '\0') {
+
+    /* f_readdir 的回傳值以前被併進 while 條件裡一起吃掉，於是「讀取失敗」
+     * 跟「列舉結束」長得一模一樣 —— 迴圈正常離開、n 留在 0，CLI 就印出
+     * "(no files)"。實測供電邊界下踩到過：卡上明明有 24 個檔，ls 卻說空的，
+     * 過一下再 ls 又全部回來。錯誤必須跟空目錄分開回報。 */
+    for (;;) {
+        fr = f_readdir(&dir, &fno);
+        if (fr != FR_OK) {
+            f_closedir(&dir);
+            spi1_unlock();
+            if (fres_out) { *fres_out = (uint8_t)fr; }
+            return -1;
+        }
+        if (fno.fname[0] == '\0') {
+            break;              /* 真的列舉完了 */
+        }
         if (fno.fattrib & AM_DIR) {
             continue;           /* 只列檔案 */
         }
@@ -377,7 +456,7 @@ int dl_list(void (*emit)(const char *name, uint32_t size), uint32_t *free_kb_out
         if (f_getfree("", &fre_clust, &fsp) == FR_OK) {
             *free_kb_out = (uint32_t)((uint64_t)fre_clust * fsp->csize / 2);
         } else {
-            *free_kb_out = 0;
+            *free_kb_out = DL_FREE_KB_UNKNOWN;   /* 0 會被讀成「卡滿了」*/
         }
     }
     spi1_unlock();
@@ -434,7 +513,7 @@ static int is_log_csv(const char *nm)
     return (e1 == 'c' && e2 == 's' && e3 == 'v');
 }
 
-int dl_clear(uint32_t *deleted_out)
+int dl_clear(uint32_t *deleted_out, uint8_t *fres_out)
 {
     static DIR dir;             /* static：DIR 別放 stack */
     FILINFO    fno;
@@ -445,13 +524,23 @@ int dl_clear(uint32_t *deleted_out)
      * 直到掃不到為止。空目錄一次掃完即回 —— 不再盲目對 000..999 跑 1000 次
      * f_unlink（那會抱著 spi1_lock 掃目錄上千遍，看起來像當機）。
      * 刪不掉就停手，避免同一檔一直被重掃造成無限迴圈。 */
+    FRESULT fr = FR_OK;
+    if (fres_out) {
+        *fres_out = 0;
+    }
+
     spi1_lock();
     for (;;) {
-        if (f_opendir(&dir, "/") != FR_OK) {
+        fr = f_opendir(&dir, "/");
+        if (fr != FR_OK) {
             break;
         }
         int found = 0;
-        while (f_readdir(&dir, &fno) == FR_OK && fno.fname[0] != '\0') {
+        for (;;) {
+            fr = f_readdir(&dir, &fno);
+            if (fr != FR_OK || fno.fname[0] == '\0') {
+                break;          /* 讀失敗或列舉完；fr 帶著原因往外走 */
+            }
             if (fno.fattrib & AM_DIR) {
                 continue;
             }
@@ -467,14 +556,29 @@ int dl_clear(uint32_t *deleted_out)
             }
         }
         f_closedir(&dir);
-        if (!found || f_unlink(name) != FR_OK) {
+        if (fr != FR_OK) {
+            break;              /* f_readdir 失敗 */
+        }
+        if (!found) {
+            break;              /* 掃完了，沒有 log_*.csv 了 —— 正常結束 */
+        }
+        fr = f_unlink(name);
+        if (fr != FR_OK) {
             break;
         }
         n++;
     }
     spi1_unlock();
+
     if (deleted_out) {
         *deleted_out = (uint32_t)n;
+    }
+    /* 以前不管發生什麼都回 0，於是「卡上只有 3 個檔」和「刪到第 4 個時卡
+     * 讀不動了」印出來一模一樣（都是 "deleted 3 files"）。實測在供電邊界
+     * 的卡上踩到：23 個檔只刪掉 3 個，CLI 卻回報成功。 */
+    if (fr != FR_OK) {
+        if (fres_out) { *fres_out = (uint8_t)fr; }
+        return -1;
     }
     return 0;
 }
