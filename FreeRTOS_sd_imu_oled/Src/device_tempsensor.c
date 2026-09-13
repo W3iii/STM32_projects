@@ -18,6 +18,7 @@
  */
 
 #include "device_tempsensor.h"
+#include "bus_port.h"       /* adc_lock()：ADC1 被 Sensor 與 Console 共用 */
 #include "stm32f407xx.h"
 
 /* ========================================================================= */
@@ -97,22 +98,52 @@ static uint16_t adc_read_channel(uint32_t ch)
 
 uint16_t tempsensor_read_raw(void)
 {
-    return adc_read_channel(TS_ADC_CHANNEL);
+    adc_lock();
+    uint16_t v = adc_read_channel(TS_ADC_CHANNEL);
+    adc_unlock();
+    return v;
 }
+
+/* VREFINT 的出廠校正值：ST 在產線上以 VDDA = 3.3V、30°C 量測後燒進系統記憶體
+ * （RM0090 §13.10 / 資料手冊 §6.3.24），12-bit 右對齊。
+ *
+ * 為什麼不用 TS_VREFINT_V 這個「典型值」算 VDDA：1.21V 只是 typ，實際分佈
+ * 1.18~1.24V，換算出來的 VDDA 帶著 ±2.5% 的系統性誤差（3.3V 下約 ±80mV）。
+ * 拿來判斷「供電是不是掉到 SD 卡規格下限」時，這個誤差跟要判斷的量級同級，
+ * 等於沒在量。改用同一顆晶片自己的校正值就沒有這個問題：
+ *     VDDA = 3.3V × VREFINT_CAL / adc_ref
+ * 注意這只修正 VDDA 的絕對值；tempsensor_read_c() 用的是比值法，VDDA 會約分
+ * 掉，本來就不受影響。 */
+#define VREFINT_CAL_ADDR    ((const volatile uint16_t *)0x1FFF7A2AU)
+#define VREFINT_CAL_VDDA    3.3f
 
 float tempsensor_vdda(void)
 {
+    adc_lock();
     uint16_t adc_ref = adc_read_channel(VREF_ADC_CHANNEL);
+    adc_unlock();
     if (adc_ref == 0) {
         return 0.0f;                        /* 異常：避免除以 0 */
     }
-    return TS_VREFINT_V * ADC_MAX / (float)adc_ref;
+
+    uint16_t cal = *VREFINT_CAL_ADDR;
+    /* 校正值理應落在 1500~1800 附近。晶片沒燒到（讀回 0 或 0xFFFF）就退回
+     * 典型值，寧可少一點精度也不要印出離譜的電壓。 */
+    if (cal < 1000U || cal > 2500U) {
+        return TS_VREFINT_V * ADC_MAX / (float)adc_ref;
+    }
+    return VREFINT_CAL_VDDA * (float)cal / (float)adc_ref;
 }
 
 float tempsensor_read_c(void)
 {
+    /* 兩次轉換必須是原子的：比值法要求 adc_temp 與 adc_ref 來自同一段時間、
+     * 而且中間沒有別人動過 SQR3/DR。被搶的話兩者會變成同一個通道的值，
+     * 比值 = 1 → 溫度算出 205°C。 */
+    adc_lock();
     uint16_t adc_temp = adc_read_channel(TS_ADC_CHANNEL);
     uint16_t adc_ref  = adc_read_channel(VREF_ADC_CHANNEL);
+    adc_unlock();
     if (adc_ref == 0) {
         return -999.0f;                     /* VREFINT 讀不到：回離譜值而非除以 0 */
     }

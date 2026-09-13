@@ -17,6 +17,7 @@
 
 static SemaphoreHandle_t s_mSpi1;   /* OLED + SD/FatFs */
 static SemaphoreHandle_t s_mI2c1;   /* MPU6050 + INA219 */
+static SemaphoreHandle_t s_mAdc;    /* 內建溫度感測器 + VREFINT */
 
 /* I2C1 非同步交易完成的號誌。用 binary semaphore 而不是 task notification：
  * ulTaskNotifyTake 預設吃 index 0，而 sensor / console / button 都已經拿
@@ -44,11 +45,15 @@ int bus_port_init(void)
 {
     s_mSpi1      = xSemaphoreCreateMutex();
     s_mI2c1      = xSemaphoreCreateMutex();
+    s_mAdc       = xSemaphoreCreateMutex();
     s_sI2c1Xfer  = xSemaphoreCreateBinary();
     s_sSpi1Xfer  = xSemaphoreCreateBinary();
-    return (s_mSpi1 != NULL && s_mI2c1 != NULL &&
+    return (s_mSpi1 != NULL && s_mI2c1 != NULL && s_mAdc != NULL &&
             s_sI2c1Xfer != NULL && s_sSpi1Xfer != NULL) ? 0 : -1;
 }
+
+void adc_lock(void)    { xSemaphoreTake(s_mAdc, portMAX_DELAY); }
+void adc_unlock(void)  { xSemaphoreGive(s_mAdc); }
 
 void spi1_lock(void)   { xSemaphoreTake(s_mSpi1, portMAX_DELAY); }
 void spi1_unlock(void) { xSemaphoreGive(s_mSpi1); }

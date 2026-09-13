@@ -82,6 +82,19 @@ void spi1_poll_yield(void);
 void i2c1_lock(void);
 void i2c1_unlock(void);
 
+/* ADC1 也是共享周邊：adc_read_channel() 是「設 SQR3 → SWSTART → 等 EOC →
+ * 讀 DR」的非原子序列，而它有兩個不同優先權的呼叫者 —— Sensor task(prio 4)
+ * 每 10ms 讀一次溫度，Console task(prio 2) 在 status 指令裡也讀。
+ *
+ * 沒有鎖的話 Sensor 會搶在 Console 的 SWSTART 與讀 DR 之間，把 DR 換成自己
+ * 那次轉換的結果，Console 就拿到別的通道的值。實測症狀：logging 中打 status
+ * 會看到 chip 204.7 °C —— 那是 adc_temp 誤讀成 VREFINT、與 adc_ref 相等時
+ * (1.21-0.76)/0.0025+25 的結果，而同一支 tempsensor_vdda() 也會一起讀錯。
+ *
+ * 不可巢狀對自己再 lock。 */
+void adc_lock(void);
+void adc_unlock(void);
+
 /* ── I2C1 非同步交易的等待 / 喚醒 ──────────────────────────────
  * 中斷驅動的 i2c1_read_regs_async()（driver_i2c1.c）用這一對把「等匯流排」
  * 從 busy-wait 換成阻塞：發起交易後 task 睡覺，ISR 把整筆交易推完才喚醒一次。
