@@ -61,6 +61,16 @@
  * 重試就好；設 5 表示 50ms 內都讀不到才動手，避免小抖動就去搖匯流排。 */
 #define SENSOR_I2C_FAIL_LIMIT  5
 
+/* Display 讀 INA219 連續失敗幾次才做 bus recovery。10Hz 下 5 次 = 0.5s。
+ * 熱插拔（把 INA219 拔掉再插回）會在交易途中抽走 slave，插回的瞬間接點彈跳
+ * 也可能讓它的狀態機停在半途抓著 SDA —— 那不會自己好，得搖 clock 把它踢出來。 */
+#define DISPLAY_I2C_FAIL_LIMIT 5
+
+/* INA219 不在線時的重探週期（Display 迴圈輪數）。10Hz 下 50 輪 = 5s。
+ * 不能只在開機探一次就定終身：探不到就永遠不再讀，插回來也不會恢復。
+ * 也不能每輪都探 —— 沒接的時候每輪吃 NACK/timeout 會把 10Hz 更新拖垮。 */
+#define INA_REPROBE_PERIOD     50
+
 #define QSAMPLES_LEN         64          /* 64 × 16B ≈ 640ms 緩衝 */
 
 #define PRIO_SENSOR          4
@@ -91,9 +101,13 @@ static volatile uint32_t s_overruns;
 /* spi1_lock()/spi1_unlock() 的實作已搬到 bus_port_freertos.c（匯流排鎖屬於
  * bus 自己，見 bus_port.h）；這裡只在 app_tasks_start() 呼叫 bus_port_init()。 */
 
-/* Sensor 的 I2C 健康度：連續失敗計數（成功即歸零）與累計 recovery 次數。
- * 單一 writer(Sensor) / 單一 reader(CLI)，32-bit 對齊，讀到舊值無害。 */
+/* I2C 健康度：連續失敗計數（成功即歸零）與累計 recovery 次數。
+ * s_i2c_recovers 有兩個 writer（Sensor 與 Display），但兩邊都在持有 i2c1_lock
+ * 期間才遞增，所以那支 mutex 已經把它序列化了；reader(CLI) 讀到舊值無害。
+ * s_i2c_fails / s_ina_fails 各自只有一個 writer。 */
 static uint32_t          s_i2c_fails;
+static uint32_t          s_ina_fails;     /* Display 讀 INA219 的連續失敗數 */
+static uint32_t          s_ina_reprobe;   /* 不在線時的重探倒數 */
 static volatile uint32_t s_i2c_recovers;
 
 uint32_t app_tasks_overruns(void) { return s_overruns; }
@@ -379,6 +393,26 @@ static void display_task(void *arg)
                  * 層計數的，重試不會把它藏起來。 */
                 rc = ina219_read(&p);
             }
+
+            /* 重試還是失敗就開始累計。連續 DISPLAY_I2C_FAIL_LIMIT 次才動手 ——
+             * 偶發 NACK 上面那次重試已經蓋掉了，還過不去就不是雜訊。
+             *
+             * 以前這裡沒有任何 recovery：bus_recovery 只接在 Sensor task 上，
+             * 而 Sensor 只有 logging 中才在跑。所以把 INA219 拔掉再插回、
+             * slave 卡住 SDA 時，OLED 就永遠停在 "--"，沒人去救。
+             *
+             * recovery 之後要重跑 ina219_init()：熱插拔回來的晶片已經回到
+             * power-on 預設值，而且 init 的 config read-back 順便當在線偵測。 */
+            if (rc != 0) {
+                if (++s_ina_fails >= DISPLAY_I2C_FAIL_LIMIT) {
+                    i2c1_bus_recovery();
+                    s_ina_present = (ina219_init() == 0) ? 1 : 0;
+                    s_ina_fails   = 0;
+                    s_i2c_recovers++;       /* 在 i2c1_lock 內，與 Sensor 序列化 */
+                }
+            } else {
+                s_ina_fails = 0;
+            }
             i2c1_unlock();
             taskENTER_CRITICAL();
             if (rc == 0) {
@@ -393,6 +427,16 @@ static void display_task(void *arg)
                 s_power_valid = 0;          /* 讀失敗：標記過期，別讓 CLI 印舊值 */
             }
             taskEXIT_CRITICAL();
+        } else {
+            /* 不在線：每 INA_REPROBE_PERIOD 輪重探一次，讓插回來的晶片能自己
+             * 回到線上。s_ina_present 以前是開機探一次就定終身 —— 開機時沒接
+             * （或 recovery 後 init 沒過）就再也不會讀，插回去也不會恢復。 */
+            if (++s_ina_reprobe >= INA_REPROBE_PERIOD) {
+                s_ina_reprobe = 0;
+                i2c1_lock();
+                s_ina_present = (ina219_init() == 0) ? 1 : 0;
+                i2c1_unlock();
+            }
         }
 
         char line[22];
