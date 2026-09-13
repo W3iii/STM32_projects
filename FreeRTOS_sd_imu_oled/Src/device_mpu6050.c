@@ -24,8 +24,7 @@
 #include "device_mpu6050.h"
 #include "driver_i2c1.h"
 
-/* ---- I2C 7-bit address ---- */
-#define MPU6050_ADDR        0x68
+/* MPU6050_ADDR 定義在 device_mpu6050.h（故障注入的 CLI 也要用）。 */
 
 /* ---- Register address ---- */
 #define REG_PWR_MGMT_1      0x6B

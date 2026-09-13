@@ -10,6 +10,11 @@
 
 #include <stdint.h>
 
+/* ---- I2C 7-bit address ----
+ * 放在 header 是因為故障注入（i2c1_inject_sda_stuck）要指定受害的 slave，
+ * 跟 device_ina219.h 的 INA219_ADDR 一致。 */
+#define MPU6050_ADDR               0x68
+
 /* ---- 資料結構：三軸 raw 值 ---- */
 typedef struct {
     int16_t x;

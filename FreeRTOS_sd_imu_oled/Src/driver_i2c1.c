@@ -711,23 +711,47 @@ i2c_status_t i2c1_bus_recovery(void)
     GPIOB->MODER |=  (GPIO_MODER_OUTPUT << (9 * 2));
     /* OTYPER 在 gpio_init 已設 open-drain，SDA 拉高靠 pull-up */
     GPIOB->ODR |= (1U << 9);    /* SDA 放開（high）*/
-    GPIOB->ODR |= (1U << 8);    /* SCL high */
+    GPIOB->ODR |= (1U << 8);    /* SCL 放開（high）*/
+    short_delay();
 
-    /* 3. 送最多 9 個 clock pulse，期間檢查 SDA 是否被釋放 */
-    i2c_status_t result = I2C_ERR_BUS;
-    for (int i = 0; i < 9; i++) {
-        /* 如果 SDA 已經回到 high，slave 釋放了 → 成功 */
-        if (GPIOB->IDR & (1U << 9)) {
-            result = I2C_OK;
-            break;
-        }
-        GPIOB->ODR &= ~(1U << 8);   /* SCL low */
+    /* 3. SCL 必須真的回到 high 才有得搖。slave 把 SCL 拉住不放（clock
+     *    stretch 卡死）的話，下面的「脈衝」根本產生不了任何邊緣 —— 我們寫
+     *    ODR high，線卻仍是 low，slave 收不到 clock 就永遠不會釋放 SDA。
+     *    先擋掉還有一個理由：這種狀態下 SDA 很可能是 high（slave 根本沒在
+     *    送資料），舊版會直接回 I2C_OK —— 匯流排明明是死的卻回報成功。
+     *
+     *    正常運作中的短暫 clock stretching 不會誤判：recovery 只在連續多次
+     *    交易逾時之後才跑，這時還撐著超過一個 short_delay() 就是真的卡死。 */
+    if (!(GPIOB->IDR & (1U << 8))) {
+        i2c1_init();                /* 腳位切回 AF，把周邊交還給硬體 */
+        return I2C_ERR_SCL_STUCK;
+    }
+
+    /* 4. 送最多 9 個 clock pulse，每個 pulse 之後檢查 SDA 有沒有被釋放。
+     *
+     *    檢查必須在 pulse「之後」：slave 是在 SCL 下降沿才更新／釋放 SDA，
+     *    所以最後一個 pulse 的效果要再看一眼才知道。舊版把檢查放在 pulse
+     *    前面，9 次檢查全部發生在 9 個 pulse 之前，於是第 9 個 pulse 讓
+     *    slave 放手的情況永遠看不到 —— 回報 I2C_ERR_BUS，但匯流排其實已經
+     *    好了。i2cstuck 注入測試就是踩到這個：recovery 印 "SDA still low"，
+     *    緊接著的 who_am_i 卻讀回 0x68。 */
+    i2c_status_t result = (GPIOB->IDR & (1U << 9)) ? I2C_OK : I2C_ERR_BUS;
+    for (int i = 0; (i < 9) && (result != I2C_OK); i++) {
+        GPIOB->ODR &= ~(1U << 8);   /* SCL low：slave 在這個邊緣更新 SDA */
         short_delay();
         GPIOB->ODR |=  (1U << 8);   /* SCL high */
         short_delay();
+
+        if (!(GPIOB->IDR & (1U << 8))) {
+            i2c1_init();            /* 搖到一半被 stretch 住，同樣沒救 */
+            return I2C_ERR_SCL_STUCK;
+        }
+        if (GPIOB->IDR & (1U << 9)) {
+            result = I2C_OK;
+        }
     }
 
-    /* 4. 產生一次 STOP condition（SDA 由 low → high 當 SCL high）*/
+    /* 5. 產生一次 STOP condition（SDA 由 low → high 當 SCL high）*/
     GPIOB->ODR &= ~(1U << 9);   /* SDA low */
     short_delay();
     GPIOB->ODR |=  (1U << 8);   /* SCL high */
@@ -735,11 +759,66 @@ i2c_status_t i2c1_bus_recovery(void)
     GPIOB->ODR |=  (1U << 9);   /* SDA high → STOP */
     short_delay();
 
-    /* 5. 重新 init I2C（gpio_init 會把腳位切回 AF mode）*/
+    /* 6. 重新 init I2C（gpio_init 會把腳位切回 AF mode）*/
     i2c1_init();
 
     return result;
 }
+
+
+/* ========================================================================= */
+/*                          Fault injection (test only)                      */
+/* ========================================================================= */
+
+#if I2C1_FAULT_INJECT
+/* 契約與原理見 driver_i2c1.h 的宣告。 */
+int i2c1_inject_sda_stuck(uint8_t slave)
+{
+    /* 1. 關掉周邊，接管腳位（跟 bus_recovery 的前置一樣）*/
+    I2C1->CR1 &= ~I2C_CR1_PE;
+
+    GPIOB->MODER &= ~(0x3U << (8 * 2));
+    GPIOB->MODER |=  (GPIO_MODER_OUTPUT << (8 * 2));
+    GPIOB->MODER &= ~(0x3U << (9 * 2));
+    GPIOB->MODER |=  (GPIO_MODER_OUTPUT << (9 * 2));
+
+    GPIOB->ODR |= (1U << 9) | (1U << 8);    /* idle：兩條都放開（open-drain）*/
+    short_delay();
+
+    /* 2. START：SCL 保持 high 時 SDA high→low */
+    GPIOB->ODR &= ~(1U << 9);
+    short_delay();
+    GPIOB->ODR &= ~(1U << 8);
+    short_delay();
+
+    /* 3. 送 addr + R 的 8 個 bit，MSB first。
+     *    SCL low 時擺好 SDA，拉 high 讓 slave 取樣，再拉 low。 */
+    uint8_t byte = (uint8_t)((slave << 1) | 1U);
+    for (int i = 7; i >= 0; i--) {
+        if (byte & (1U << i)) {
+            GPIOB->ODR |=  (1U << 9);
+        } else {
+            GPIOB->ODR &= ~(1U << 9);
+        }
+        short_delay();
+        GPIOB->ODR |=  (1U << 8);
+        short_delay();
+        GPIOB->ODR &= ~(1U << 8);
+        short_delay();
+    }
+
+    /* 4. 第 9 個 clock = ACK。master 放開 SDA 交給 slave，拉 high SCL
+     *    取樣後就「停手」—— 不給下降沿，slave 只能一直拉著 SDA。 */
+    GPIOB->ODR |= (1U << 9);
+    short_delay();
+    GPIOB->ODR |= (1U << 8);
+    short_delay();
+
+    /* 5. 讀回線上的真實狀態。open-drain 寫 1 之後 IDR 才有意義：
+     *    仍是 low 就代表被 slave 拉著 = 注入成功。 */
+    return (GPIOB->IDR & (1U << 9)) ? 0 : 1;
+}
+#endif  /* I2C1_FAULT_INJECT */
 
 /* ========================================================================= */
 /*                          Bus scanner                                      */

@@ -32,6 +32,7 @@ typedef enum {
     I2C_ERR_NACK,           /* slave 沒回 ACK（位址錯、晶片沒上電） */
     I2C_ERR_BUS,            /* bus error（arbitration lost、SDA stuck） */
     I2C_ERR_PARAM,          /* buf == NULL 或 len == 0 */
+    I2C_ERR_SCL_STUCK,      /* SCL 被拉在 LOW —— clock stretch 卡死，搖 clock 救不了 */
 } i2c_status_t;
 
 
@@ -94,8 +95,12 @@ i2c_status_t i2c1_read_regs(uint8_t slave, uint8_t reg, uint8_t *buf, uint8_t le
  *   - 系統啟動時保險呼叫一次
  *
  * 回傳：
- *   I2C_OK       bus 釋放成功
- *   I2C_ERR_BUS  送完 9 clock 後 SDA 仍 LOW（slave 真的卡死）
+ *   I2C_OK             bus 釋放成功
+ *   I2C_ERR_BUS        送完 9 clock 後 SDA 仍 LOW（slave 真的卡死）
+ *   I2C_ERR_SCL_STUCK  SCL 被拉在 LOW。這種情況搖 clock 完全無效（我們寫
+ *                      ODR high，線卻還是 low，產生不了任何邊緣），slave 收
+ *                      不到 clock 就永遠不會放開 SDA。指向硬體問題：slave
+ *                      當機、SCL 短路到地、或 SCL 缺上拉。
  */
 /* ── 中斷驅動版的 read_regs（非同步）────────────────────────────
  * 匯流排時序與 i2c1_read_regs() 完全相同，差別只在等待方式：polling 版在
@@ -128,6 +133,47 @@ int i2c1_async_busy(void);
 void i2c1_async_err_counts(uint32_t *nack, uint32_t *bus, uint32_t *timeout);
 
 i2c_status_t i2c1_bus_recovery(void);
+
+
+/* ========================================================================= */
+/*                          Fault injection (test only)                      */
+/* ========================================================================= */
+
+/* 故障注入只在 Debug build 編進去（.cproject 的 Debug 組態會定義 DEBUG）。
+ * 要強制關掉就在 build 加 -DI2C1_FAULT_INJECT=0。 */
+#ifndef I2C1_FAULT_INJECT
+#  ifdef DEBUG
+#    define I2C1_FAULT_INJECT  1
+#  else
+#    define I2C1_FAULT_INJECT  0
+#  endif
+#endif
+
+#if I2C1_FAULT_INJECT
+/*
+ * 故意把匯流排搞卡，用來驗證 i2c1_bus_recovery() 真的有效。
+ *
+ * 為什麼不能「MCU 自己把 SDA 拉低」來測：bus_recovery 一開頭就把 PB9 的
+ * ODR 寫成 1，等於自己放開自己，迴圈第一次讀 IDR 就是 high，直接回
+ * I2C_OK —— 假陽性，什麼都沒測到。必須讓真的 slave 去抓 SDA。
+ *
+ * 手法：bit-bang 送 START + (slave<<1|R) 的 8 個 bit，然後停在第 9 個
+ * （ACK）clock 的 high phase。slave 此刻正拉低 SDA 表示 ACK，而規格上要
+ * 到下一個 SCL 下降沿才能釋放 —— 我們不給那個下降沿，SDA 就卡住了，
+ * 跟電源 glitch 造成的 stuck 在電氣上無法區分。
+ *
+ * 離開時 I2C1 是 disabled、腳位停在 GPIO mode、SCL 停在 high，
+ * 由後續的 i2c1_bus_recovery()（或 Sensor task 的自動路徑）負責收拾。
+ *
+ * 前提：呼叫端必須持有 i2c1_lock()，且只能在 task 脈絡呼叫。
+ *
+ * 回傳：
+ *   1  已卡住（IDR 讀到 SDA 仍是 low）
+ *   0  注入失敗 —— slave 沒回 ACK（位址錯 / 沒供電）。此時匯流排沒被弄壞，
+ *      但周邊仍是 disabled，呼叫端還是要跑一次 recovery 或 i2c1_init()。
+ */
+int i2c1_inject_sda_stuck(uint8_t slave);
+#endif
 
 /*
  * I2C bus scanner

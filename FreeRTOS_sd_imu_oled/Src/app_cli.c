@@ -15,6 +15,7 @@
 #include "app_tasks.h"          /* app_tasks_overruns（status 用）*/
 #include "bus_port.h"           /* i2cscan 指令：i2c1_lock / i2c1_unlock */
 #include "device_tempsensor.h"  /* status：晶片溫度 raw / 換算除錯讀數 */
+#include "device_mpu6050.h"     /* i2cstuck 指令：MPU6050_ADDR / who_am_i */
 #include "driver_i2c1.h"        /* i2cscan 指令：i2c1_bus_scan / i2c1_bus_recovery */
 #include "driver_usart1.h"
 #include "FreeRTOS.h"           /* tasks 指令：run-time stats */
@@ -573,7 +574,9 @@ static void cli_cmd_i2cscan(void)
         i2c1_lock();                    /* recovery 會 disable I2C1、手動搖 SCL，同樣要獨佔 */
         i2c_status_t rc = i2c1_bus_recovery();
         i2c1_unlock();
-        usart1_send_string(rc == I2C_OK ? "ok\r\n" : "SDA still low\r\n");
+        usart1_send_string(rc == I2C_OK            ? "ok\r\n"
+                         : rc == I2C_ERR_SCL_STUCK ? "SCL held low (dead slave / short / no pull-up)\r\n"
+                                                   : "SDA still low\r\n");
         return;
     }
 
@@ -585,6 +588,49 @@ static void cli_cmd_i2cscan(void)
     }
     usart1_send_string("\r\n");
 }
+
+#if I2C1_FAULT_INJECT
+/*
+ * i2cstuck —— 故障注入，驗證 bus recovery 真的能救回卡住的匯流排。
+ *
+ *   i2cstuck        注入後立刻手動 recovery，三行輸出把整個流程驗完
+ *   i2cstuck raw    只注入就放手，讓 Sensor task 的自動路徑去救
+ *
+ * raw 模式是端到端測試：離開時 I2C1 是 disabled，之後每筆 mpu6050_read_all()
+ * 都會吃滿逾時，連續 SENSOR_I2C_FAIL_LIMIT 次後 app_tasks.c 觸發 recovery。
+ * 驗收方式是 status 的 i2c recov 從 0 變 1、取樣自動續跑（CSV 中間少幾筆）。
+ * 要先 start 讓 Sensor task 在跑，否則沒人會去救，匯流排會一直卡著。
+ */
+static void cli_cmd_i2cstuck(const char *arg)
+{
+    int raw = (strcmp(arg, "raw") == 0);
+
+    i2c1_lock();
+    int stuck = i2c1_inject_sda_stuck(MPU6050_ADDR);
+    usart1_send_string(stuck ? "  inject:    SDA held low by slave\r\n"
+                             : "  inject:    failed (no ACK - check addr/power)\r\n");
+
+    if (raw) {
+        i2c1_unlock();      /* 匯流排就這樣壞著交出去 */
+        usart1_send_string("  left broken: Sensor task should recover in ~250ms\r\n");
+        usart1_send_string("  check 'status' i2c recov (needs logging active)\r\n");
+        return;
+    }
+
+    i2c_status_t rc = i2c1_bus_recovery();
+    usart1_send_string("  recovery:  ");
+    usart1_send_string(rc == I2C_OK            ? "ok\r\n"
+                     : rc == I2C_ERR_SCL_STUCK ? "SCL held low (dead slave / short / no pull-up)\r\n"
+                                               : "SDA still low\r\n");
+
+    uint8_t id = mpu6050_who_am_i();     /* recovery 之後匯流排真的能用嗎 */
+    i2c1_unlock();
+
+    usart1_send_string("  who_am_i:  ");
+    cli_print_hex8(id);          /* 自己會印 "0x" 前綴 */
+    usart1_send_string(id == 0x68 ? "  (bus healthy)\r\n" : "  (expected 0x68)\r\n");
+}
+#endif
 
 /* 對齊的指令清單（開機、help、打錯指令都印這個）。 */
 static void cli_print_help(void)
@@ -603,6 +649,9 @@ static void cli_print_help(void)
         "  power          INA219 V / I / P (avg of last 10 samples)\r\n"
         "  wfi [on|off]   idle WFI sleep (power saving)\r\n"
         "  i2cscan        scan I2C1 bus (0x08..0x77)\r\n"
+#if I2C1_FAULT_INJECT
+        "  i2cstuck [raw] jam SDA to test bus recovery (debug build)\r\n"
+#endif
         "  help           this list\r\n");
 }
 
@@ -646,6 +695,10 @@ static void cli_dispatch(char *line)
         cli_wfi(arg);
     } else if (strcmp(cmd, "i2cscan") == 0) {
         cli_cmd_i2cscan();
+#if I2C1_FAULT_INJECT
+    } else if (strcmp(cmd, "i2cstuck") == 0) {
+        cli_cmd_i2cstuck(arg);
+#endif
     } else if (strcmp(cmd, "help") == 0) {
         cli_print_help();
     } else {
