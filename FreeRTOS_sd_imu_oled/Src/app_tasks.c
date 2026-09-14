@@ -546,6 +546,86 @@ static void button_task(void *arg)
 /* ───────────────── Bootstrap task ─────────────────
  * 初始化集中在這裡：跑在排程器啟動後（delay_ms = vTaskDelay 才有效），
  * 完成後建立五個工作 task、接好通知接線，再把自己刪掉。 */
+/* ───────────────── 開機報告的印字 helper ─────────────────
+ * usart 沒有 printf。bootstrap 原本用臨時 char[4] 拼 FRESULT，這裡收成兩支
+ * 小函式讓開機報告能印十進位與十六進位。與 app_cli.c 的 cli_print_* 同形，
+ * 但那兩支是 CLI 的 static，開機報告不該反過來依賴 CLI 模組。 */
+static void boot_u32(uint32_t v)
+{
+    char b[11];
+    int  i = 10;
+    b[i] = '\0';
+    if (v == 0) {
+        usart1_send_string("0");
+        return;
+    }
+    while (v && i > 0) {
+        b[--i] = (char)('0' + (v % 10));
+        v /= 10;
+    }
+    usart1_send_string(&b[i]);
+}
+
+/* 印 4 個 byte 的十六進位（不帶 0x），給 R7 / OCR 這種原始暫存器值用。 */
+static void boot_hex4(const volatile uint8_t *p)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    for (int i = 0; i < 4; i++) {
+        usart1_send_byte((uint8_t)hex[(p[i] >> 4) & 0xF]);
+        usart1_send_byte((uint8_t)hex[p[i] & 0xF]);
+    }
+}
+
+/* SD 卡那一行：類型、定址方式、R7 / OCR 原始值。
+ *
+ * 成功時也印原始值，不只失敗才印 —— 開機 log 是最便宜的診斷管道，使用者
+ * 不用接 debugger 就能回答「這張卡是哪一代、走 byte 還是 block 定址」。
+ * 失敗時 R7/OCR 更是關鍵：CMD8 回 0x05 是卡太老（v1），R7 是亂碼是線接不好，
+ * 兩者的修法完全不同。
+ *
+ * R7 只在 CMD8 被送出後才有意義（CMD0 就掛了的話沒有），OCR 只在走到
+ * CMD58 之後才有；沒走到的印 -------- 而不是印初始值 0 誤導人。 */
+static void boot_print_sd(void)
+{
+    uint8_t rc = sd_last_init_rc;
+
+    if (rc == SD_OK) {
+        usart1_send_string("  [ok] SD card   ");
+        switch (sd_card_type) {
+        case SD_TYPE_SDHC: usart1_send_string("SDHC/SDXC, block addressing"); break;
+        case SD_TYPE_V2:   usart1_send_string("SD v2 SDSC, byte addressing"); break;
+        case SD_TYPE_V1:   usart1_send_string("SD v1/MMC, byte addressing");  break;
+        default:           usart1_send_string("type unknown");                break;
+        }
+    } else {
+        usart1_send_string("  [!!] SD card   init failed at ");
+        switch (rc) {
+        case SD_ERR_CMD0:   usart1_send_string("CMD0 (no response: wiring/CS/power)");    break;
+        case SD_ERR_CMD8:   usart1_send_string("CMD8 (bad R7: v1 card or noisy bus)");    break;
+        case SD_ERR_ACMD41: usart1_send_string("ACMD41 (stuck idle: power margin)");      break;
+        case SD_ERR_CMD58:  usart1_send_string("CMD58 (OCR read failed: noisy bus)");     break;
+        default:            usart1_send_string("step "); boot_u32(rc);                    break;
+        }
+    }
+
+    usart1_send_string("   R7=");
+    if (rc != SD_ERR_CMD0) { boot_hex4(sd_r7); } else { usart1_send_string("--------"); }
+    usart1_send_string("  OCR=");
+    if (rc == SD_OK || rc == SD_ERR_CMD58) { boot_hex4(sd_ocr); } else { usart1_send_string("--------"); }
+    usart1_send_string("\r\n");
+}
+
+/* FRESULT 的一句話說明。只列開機掛載會碰到的幾個。 */
+static const char *fres_hint(int fr)
+{
+    switch (fr) {
+    case 1:  return "DISK_ERR: SPI/card I/O";
+    case 3:  return "NOT_READY: card init failed, see SD card line";
+    case 13: return "NO_FILESYSTEM: not FAT32, reformat";
+    default: return "see ff.h FRESULT";
+    }
+}
+
 static void bootstrap_task(void *arg)
 {
     (void)arg;
@@ -577,39 +657,52 @@ static void bootstrap_task(void *arg)
      * 會因為 s_mounted == 0 而失敗。CLI、OLED、i2cscan、power、tasks 全部可用。
      * 這在供電邊界的板子上很重要 —— 失敗時你需要一台還能跟你對話的機器。 */
     int rc = app_datalogger_init();
+    if (rc != 0 && rc != -1 && rc != -2) {
+        /* -3 = state mutex 建不出來，那是 heap 不夠，沒得降級。 */
+        usart1_send_string("  [!!] FATAL     init error (out of heap?)\r\n");
+        vTaskSuspend(NULL);
+    }
+
+    /* ---- 開機報告：一個裝置一行 ----
+     * 順序照初始化的依賴：MPU6050 → SD 卡 → FAT32 → INA219。
+     * app_datalogger_init() 在 MPU6050 失敗時不會去掛載，所以 SD/FAT32 兩行
+     * 只在 MPU6050 那關過了才印，免得印出根本沒跑過的步驟。 */
     if (rc == -1) {
-        usart1_send_string("[WARN] MPU6050 not found -> logging disabled\r\n"
-                           "       CLI still up; try: i2cscan\r\n");
+        usart1_send_string("  [!!] MPU6050   not found -> logging disabled (try: i2cscan)\r\n");
         ssd1306_clear();
         ssd1306_draw_string(0, 0, "MPU FAIL");
         ssd1306_draw_string(0, 16, "CLI OK");
         ssd1306_update_screen();
-    } else if (rc == -2) {
-        int mr = app_datalogger_mount_result();   /* FRESULT: 13=非FAT32, 1/3=SPI/卡片 */
-        usart1_send_string("[WARN] FAT32 mount failed after 3 tries, FRESULT=");
-        char num[4] = { (char)('0' + (mr / 10) % 10), (char)('0' + mr % 10), '\r', '\n' };
-        usart1_send((const uint8_t *)num, 4);
-        usart1_send_string("       3=NOT_READY(card/power)  1=DISK_ERR  13=not FAT32\r\n"
-                           "       logging disabled; CLI still up\r\n");
-        ssd1306_clear();
-        ssd1306_draw_string(0, 0, "FS FAIL");
-        ssd1306_draw_string(0, 16, "FRES:");
-        ssd1306_draw_int(48, 16, mr);
-        ssd1306_draw_string(0, 32, "SDINIT:");      /* 卡在哪一步：1=CMD0 3=ACMD41 */
-        ssd1306_draw_int(64, 32, sd_last_init_rc);
-        ssd1306_update_screen();
-    } else if (rc != 0) {
-        /* -3 = state mutex 建不出來，那是 heap 不夠，沒得降級。 */
-        usart1_send_string("[FATAL] init error (out of heap?)\r\n");
-        vTaskSuspend(NULL);
     } else {
-        usart1_send_string("  [ok] sensors + FAT32 ready");
-        if (app_datalogger_mount_retries() > 0) {
-            /* 一次就過才是健康的。需要重試代表 SD 在初始化期間電壓不夠穩 ——
-             * 這次被重試救回來了，但它是供電邊界的早期警訊，值得在硬體上處理。 */
-            usart1_send_string("  (mount retried)");
+        usart1_send_string("  [ok] MPU6050   @0x68\r\n");
+        boot_print_sd();
+
+        if (rc == -2) {
+            int mr = app_datalogger_mount_result();
+            usart1_send_string("  [!!] FAT32     mount failed x3, FRESULT ");
+            boot_u32((uint32_t)mr);
+            usart1_send_string(" (");
+            usart1_send_string(fres_hint(mr));
+            usart1_send_string(")\r\n"
+                               "       logging disabled; CLI still up\r\n");
+            ssd1306_clear();
+            ssd1306_draw_string(0, 0, "FS FAIL");
+            ssd1306_draw_string(0, 16, "FRES:");
+            ssd1306_draw_int(48, 16, mr);
+            ssd1306_draw_string(0, 32, "SDINIT:");      /* 卡在哪一步：1=CMD0 3=ACMD41 */
+            ssd1306_draw_int(64, 32, sd_last_init_rc);
+            ssd1306_update_screen();
+        } else {
+            usart1_send_string("  [ok] FAT32     mounted");
+            if (app_datalogger_mount_retries() > 0) {
+                /* 一次就過才是健康的。需要重試代表 SD 在初始化期間電壓不夠穩 ——
+                 * 這次被重試救回來了，但它是供電邊界的早期警訊，值得在硬體上處理。 */
+                usart1_send_string(" after ");
+                boot_u32((uint32_t)app_datalogger_mount_retries());
+                usart1_send_string(" retry (power margin?)");
+            }
+            usart1_send_string("\r\n");
         }
-        usart1_send_string("\r\n");
     }
 
     /* ---- INA219（選配）----
@@ -619,8 +712,8 @@ static void bootstrap_task(void *arg)
     s_ina_present = (ina219_init() == 0) ? 1 : 0;
     i2c1_unlock();
     usart1_send_string(s_ina_present
-        ? "  [ok] INA219 @0x40\r\n\r\n"
-        : "  [--] INA219 not found (try: i2cscan)\r\n\r\n");
+        ? "  [ok] INA219    @0x40\r\n\r\n"
+        : "  [--] INA219    not found (try: i2cscan)\r\n\r\n");
 
     app_cli_init();
     app_button_init();            // PA0 user button → EXTI0（rising edge）：按一下切換 start/stop
