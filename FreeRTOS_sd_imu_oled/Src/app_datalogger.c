@@ -315,12 +315,18 @@ int app_datalogger_write_sample(uint32_t t_ms,
             /* FatFs 已經把錯誤鎖進 s_fil.err，之後每次 f_write 都會在
              * 開頭直接返回。所以這次 session 到此為止，翻成 DL_ERROR：
              * Sensor 會停止取樣、Logger 不再嘗試寫，使用者看得到。
-             * 檔案先不關 —— 留給 stop 去 f_close，已寫進去的資料保住。 */
+             * 檔案先不關 —— 留給 stop 去 f_close，已寫進去的資料保住。
+             *
+             * s_mounted 也一併清掉：檔案層錯誤常常是卡片層退回 idle state
+             * 造成的（供電瞬斷、熱插拔），不能假設卡還在線。下次 start 會
+             * 因為 !s_mounted 真的重跑 f_mount(opt=1) → sd_init()，而不是
+             * 只清檔案狀態、對已經掉線的卡片視而不見。 */
             state_lock();
             s_fres = (uint8_t)s_fil.err;
             s_err_count++;
             s_state = DL_ERROR;
             state_unlock();
+            s_mounted = 0;
         }
     }
     spi1_unlock();
@@ -332,7 +338,8 @@ void app_datalogger_sync(void)
     spi1_lock();
     if (s_state == DL_LOGGING) {
         /* f_sync 失敗代表 FAT/目錄項沒寫回去，跟寫樣本失敗一樣嚴重，
-         * 同樣要翻狀態，不能再默默丟掉回傳值。 */
+         * 同樣要翻狀態，不能再默默丟掉回傳值。同樣清 s_mounted，理由見
+         * write_sample 失敗那段。 */
         FRESULT fr = f_sync(&s_fil);
         if (fr != FR_OK) {
             state_lock();
@@ -340,6 +347,7 @@ void app_datalogger_sync(void)
             s_err_count++;
             s_state = DL_ERROR;
             state_unlock();
+            s_mounted = 0;
         }
     }
     spi1_unlock();
