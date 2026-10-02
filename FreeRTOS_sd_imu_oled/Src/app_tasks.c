@@ -712,8 +712,13 @@ static void bootstrap_task(void *arg)
     s_ina_present = (ina219_init() == 0) ? 1 : 0;
     i2c1_unlock();
     usart1_send_string(s_ina_present
-        ? "  [ok] INA219    @0x40\r\n\r\n"
-        : "  [--] INA219    not found (try: i2cscan)\r\n\r\n");
+        ? "  [ok] INA219    @0x40\r\n"
+        : "  [--] INA219    not found (try: i2cscan)\r\n");
+
+    /* heap 在哪塊 RAM（HEAP_IN_CCM），A/B 對照時看 log 就知道燒的是哪一版 */
+    usart1_send_string("  [ok] heap      ");
+    boot_u32((uint32_t)configTOTAL_HEAP_SIZE);
+    usart1_send_string(HEAP_IN_CCM ? " B in CCM\r\n\r\n" : " B in SRAM\r\n\r\n");
 
     app_cli_init();
     app_button_init();            // PA0 user button → EXTI0（rising edge）：按一下切換 start/stop

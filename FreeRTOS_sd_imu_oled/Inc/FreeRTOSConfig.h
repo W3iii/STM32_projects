@@ -27,6 +27,8 @@
 #define configMINIMAL_STACK_SIZE                ( 128 )         /* words (idle task) */
 #define configMAX_PRIORITIES                    ( 5 )
 #define configTOTAL_HEAP_SIZE                   ( 28 * 1024 )   /* heap_4：5 task 堆疊 + qSamples（含建立期尖峰）*/
+#define configAPPLICATION_ALLOCATED_HEAP        1               /* ucHeap 由 main.c 定義 */
+#define HEAP_IN_CCM                             1              /* 1 = ucHeap 放 CCM（.ccmbss）；0 = 放主 SRAM（.bss，對照組）*/
 #define configSUPPORT_STATIC_ALLOCATION         0
 #define configSUPPORT_DYNAMIC_ALLOCATION        1
 

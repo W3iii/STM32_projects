@@ -170,6 +170,22 @@ SECTIONS
     _eccmram = .;       /* create a global symbol at ccmram end */
   } >CCMRAM AT> FLASH
 
+  /* CCM-RAM 未初始化區（NOLOAD）
+  *
+  * 放不需要初值的大塊 buffer（目前是 FreeRTOS 的 ucHeap）。NOLOAD = 不佔
+  * flash、startup 也不清零。不能直接塞進上面的 .ccmram：那段是 AT> FLASH，
+  * 會把整塊 0 燒進 flash 映像。
+  *
+  * 注意：DMA1/DMA2 碰不到 CCM（只接在 CPU D-bus），DMA buffer 不能放這裡。
+  */
+  .ccmbss (NOLOAD) :
+  {
+    . = ALIGN(8);
+    *(.ccmbss)
+    *(.ccmbss*)
+    . = ALIGN(8);
+  } >CCMRAM
+
   /* Uninitialized data section into "RAM" Ram type memory */
   . = ALIGN(4);
   .bss :

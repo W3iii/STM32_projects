@@ -364,8 +364,9 @@ uint8_t sd_write_block(uint32_t block, const uint8_t *buf)
      * 同一個量級，按 bus_port.h 的粒度判準就是該睡的：DMA 跑的時候
      * task 進 Blocked，不再逐 byte 忙等。
      *
-     * buf 來自 FatFs（FIL 內的 sector 緩衝或呼叫端的陣列），本專案沒有
-     * 任何東西放在 CCMRAM，都在 DMA 讀得到的主 SRAM。 */
+     * buf 來自 FatFs（FIL 內的 sector 緩衝或呼叫端的陣列），必須在 DMA
+     * 讀得到的主 SRAM。FreeRTOS heap（= 所有 task stack）在 CCM，DMA 碰
+     * 不到；目前的 FIL/FATFS 都是 static，所以沒問題。 */
     if (spi1_send_buffer(buf, SD_BLOCK_SIZE) != 0) {
         sd_deselect();                  /* DMA 逾時：block 送到一半，整筆放棄 */
         return SD_ERR_WRITE;

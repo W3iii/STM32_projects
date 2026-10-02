@@ -18,6 +18,22 @@
 #include "driver_rcc.h"
 #include "driver_usart1.h"
 
+/* FreeRTOS heap（configAPPLICATION_ALLOCATED_HEAP=1）放在 64KB CCM，騰出主 SRAM。
+ * heap 裡只有 task stack/TCB 與 queue storage，全是 CPU 存取：CCM 零等待，
+ * 也不跟 DMA2 搶 bus matrix。
+ *
+ * 代價：DMA 碰不到 CCM。task 裡的 local 陣列（在 stack 上 = 在 CCM）不能
+ * 交給 spi1_send_buffer / usart1_try_send / 一次 >=512B 的 f_write（FatFs 會
+ * 把呼叫端 buffer 直接交給 disk_write）。DMA buffer 一律宣告成 static。
+ * .ccmbss 是 NOLOAD，不清零 —— heap_4 的 prvHeapInit 自己會建 free list。
+ *
+ * HEAP_IN_CCM=0 退回主 SRAM 的 .bss，給 A/B 對照用（開機報告的 heap 行會標出是哪一版）。 */
+#if HEAP_IN_CCM
+uint8_t ucHeap[configTOTAL_HEAP_SIZE] __attribute__((section(".ccmbss"), aligned(8)));
+#else
+uint8_t ucHeap[configTOTAL_HEAP_SIZE] __attribute__((aligned(8)));
+#endif
+
 int main(void)
 {
     /* 先把 SYSCLK 拉到 168MHz（HSE 8MHz→PLL，失敗 fallback HSI，見 driver_rcc.c）。
