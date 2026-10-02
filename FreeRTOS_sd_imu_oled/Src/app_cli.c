@@ -25,6 +25,9 @@
 /* 注意：本檔不再 #include "ff.h"、也不再呼叫 spi1_lock —— 所有 FatFs/SD 存取
  * 都委派給 app_datalogger 的 dl_list/dl_dump/dl_clear，CLI 只負責解析與印字。 */
 
+/* 一行最多切幾個 token："tasks hist IMU" = 3，留一格餘裕。 */
+#define CLI_MAX_ARGS 4
+
 static char    s_line[32];
 static uint8_t s_idx;
 
@@ -54,14 +57,22 @@ static void cli_print_hex8(uint8_t v)
     usart1_send_byte((uint8_t)hex[v & 0xF]);
 }
 
-/* 送字串後補空白到欄寬 width（左對齊）。表格 / key-value 對齊共用。 */
-static void cli_field(const char *s, int width)
+/* 印字串，回傳印了幾個字元。help 左欄要把 "parent sub [args]" 拼起來再補
+ * 空白，所以需要邊印邊數。 */
+static int cli_put(const char *s)
 {
     int n = 0;
     for (const char *p = s; *p; p++) {
         usart1_send_byte((uint8_t)*p);
         n++;
     }
+    return n;
+}
+
+/* 送字串後補空白到欄寬 width（左對齊）。表格 / key-value 對齊共用。 */
+static void cli_field(const char *s, int width)
+{
+    int n = cli_put(s);
     while (n < width) {
         usart1_send_byte(' ');
         n++;
@@ -115,8 +126,10 @@ static void cli_label(const char *name)
     cli_field(name, 10);
 }
 
-static void cli_status(void)
+static void cli_status(int argc, char **argv)
 {
+    (void)argc;
+    (void)argv;
     dl_status_t st;
     app_datalogger_get_status(&st);     /* 一次取走快照（mState 保護）*/
 
@@ -212,8 +225,9 @@ static void cli_emit_line(const char *line)
  *   dump <file> → 指定檔名（配 ls 用，可印上一輪開機留下的 log）
  * 無參數版需要先 stop（記錄中檔案被開著寫，不重複開）。
  * 實際 FatFs 讀取在 app_datalogger 的 dl_dump() 內、包在 spi1_lock 裡。 */
-static void cli_dump(const char *arg)
+static void cli_dump(int argc, char **argv)
 {
+    const char *arg = (argc > 1) ? argv[1] : "";
     const char *fn;
 
     if (arg[0] != '\0') {
@@ -252,8 +266,10 @@ static void cli_emit_file(const char *name, uint32_t size)
 
 /* 列出根目錄的檔案 + 大小，再印剩餘空間。像真的設備 console。
  * 目錄掃描 + getfree 都在 dl_list() 內、包在 spi1_lock 裡。 */
-static void cli_ls(void)
+static void cli_ls(int argc, char **argv)
 {
+    (void)argc;
+    (void)argv;
     uint32_t free_kb = 0;
     uint8_t  fres    = 0;
     int n = dl_list(cli_emit_file, &free_kb, &fres);
@@ -278,8 +294,10 @@ static void cli_ls(void)
 }
 
 /* 刪掉所有 log_NNN.csv（重複 demo 前清場用）。實際 unlink 迴圈在 dl_clear()。 */
-static void cli_clear(void)
+static void cli_clear(int argc, char **argv)
 {
+    (void)argc;
+    (void)argv;
     if (app_datalogger_state() == DL_LOGGING) {
         usart1_send_string("stop first\r\n");
         return;
@@ -379,8 +397,10 @@ static char cli_spark(uint16_t pm)
 }
 
 /* ---- tasks（無參數）：目前狀態總覽 ---- */
-static void cli_tasks_table(void)
+static void cli_tasks_table(int argc, char **argv)
 {
+    (void)argc;
+    (void)argv;
     /* static：這兩個陣列合計 656 bytes（432 + 224），別放 task stack 上。 */
     static TaskStatus_t     st[CLI_MAX_TASKS];
     static cpustats_slot_t  sl[CPUSTATS_SLOTS];
@@ -413,8 +433,9 @@ static void cli_tasks_table(void)
 }
 
 /* ---- tasks hist：時間軸 ---- */
-static void cli_tasks_hist(const char *want)
+static void cli_tasks_hist(int argc, char **argv)
 {
+    const char *want = (argc > 1) ? argv[1] : "";
     static cpustats_slot_t sl[CPUSTATS_SLOTS];
     static uint16_t        h[CPUSTATS_HIST_LEN];
 
@@ -457,20 +478,13 @@ static void cli_tasks_hist(const char *want)
     }
 }
 
-static void cli_cmd_tasks(const char *arg)
+/* ---- tasks reset：清掉 peak 與時間軸 ---- */
+static void cli_tasks_reset(int argc, char **argv)
 {
-    if (strncmp(arg, "hist", 4) == 0) {
-        const char *t = arg + 4;
-        while (*t == ' ') {
-            t++;                    /* 跳過 "hist" 後面的空白，剩下的是 task 名 */
-        }
-        cli_tasks_hist(t);
-    } else if (strcmp(arg, "reset") == 0) {
-        cpustats_reset();
-        usart1_send_string("peaks + timeline cleared\r\n");
-    } else {
-        cli_tasks_table();
-    }
+    (void)argc;
+    (void)argv;
+    cpustats_reset();
+    usart1_send_string("peaks + timeline cleared\r\n");
 }
 
 /* ───────────────── wfi：IDLE 省電開關 ─────────────────
@@ -480,8 +494,9 @@ static void cli_cmd_tasks(const char *arg)
  *
  * 配 power 指令就是一組現成的省電量測：wfi off → power → wfi on → power，
  * 兩次電流差就是「核心空轉」燒掉的部分。開關與說明在 app_tasks.c。 */
-static void cli_wfi(const char *arg)
+static void cli_wfi(int argc, char **argv)
 {
+    const char *arg = (argc > 1) ? argv[1] : "";
     if (strcmp(arg, "on") == 0) {
         g_wfi_enabled = 1;
     } else if (strcmp(arg, "off") == 0) {
@@ -504,8 +519,10 @@ static void cli_wfi(const char *arg)
  * 這種對照時兩次讀數才穩定可比。
  * 代價：反應慢一拍 —— 負載剛變化時要等約 1 秒平均窗才換完。
  * 想看瞬時值，OLED 第 3 行印的仍是最新一筆。 */
-static void cli_power(void)
+static void cli_power(int argc, char **argv)
 {
+    (void)argc;
+    (void)argv;
     ina219_data_t p;
     uint32_t      n;
     if (!app_tasks_get_power_avg(&p, &n)) {
@@ -561,8 +578,10 @@ static const char *cli_i2c_guess(uint8_t addr)
     return "?";
 }
 
-static void cli_cmd_i2cscan(void)
+static void cli_cmd_i2cscan(int argc, char **argv)
 {
+    (void)argc;
+    (void)argv;
     if (app_datalogger_state() == DL_LOGGING) {
         usart1_send_string("stop first (scan would stall 100Hz sampling)\r\n");
         return;
@@ -618,8 +637,9 @@ static void cli_cmd_i2cscan(void)
  * 驗收方式是 status 的 i2c recov 從 0 變 1、取樣自動續跑（CSV 中間少幾筆）。
  * 要先 start 讓 Sensor task 在跑，否則沒人會去救，匯流排會一直卡著。
  */
-static void cli_cmd_i2cstuck(const char *arg)
+static void cli_cmd_i2cstuck(int argc, char **argv)
 {
+    const char *arg = (argc > 1) ? argv[1] : "";
     int raw = (strcmp(arg, "raw") == 0);
 
     i2c1_lock();
@@ -649,112 +669,216 @@ static void cli_cmd_i2cstuck(const char *arg)
 }
 #endif
 
-/* 對齊的指令清單（開機、help、打錯指令都印這個）。 */
-static void cli_print_help(void)
+/* ── 指令 handler：簽章統一成 void (*)(int argc, char **argv)，才進得了表 ── */
+
+static void cli_start(int argc, char **argv)
 {
-    usart1_send_string(
-        "commands:\r\n"
-        "  start          begin logging (new log_NNN.csv)\r\n"
-        "  stop           stop logging\r\n"
-        "  status         logger state + chip temp\r\n"
-        "  dump [file]    print a csv (default: last session)\r\n"
-        "  ls             list files + free space\r\n"
-        "  clear          delete all logs\r\n"
-        "  tasks          FreeRTOS task monitor (CPU% / peak / stack)\r\n"
-        "  tasks hist [t] CPU% timeline, last 6.4s (t = task name)\r\n"
-        "  tasks reset    clear peaks + timeline\r\n"
-        "  power          INA219 V / I / P (avg of last 10 samples)\r\n"
-        "  wfi [on|off]   idle WFI sleep (power saving)\r\n"
-        "  i2cscan        scan I2C1 bus (0x08..0x77)\r\n"
-#if I2C1_FAULT_INJECT
-        "  i2cstuck [raw] jam SDA to test bus recovery (debug build)\r\n"
-#endif
-        "  help           this list\r\n");
+    (void)argc;
+    (void)argv;
+    int start_rc = app_datalogger_start();
+    if (start_rc == 0) {
+        usart1_send_string("started: ");
+        usart1_send_string(app_datalogger_filename());
+        usart1_send_string("\r\n");
+    } else if (start_rc == -1) {
+        /* 掛載失敗（含當場重掛也沒過）。這條路徑不經過 f_open，所以
+         * s_fres 是 0 —— 要印的是 f_mount 的 FRESULT，不是寫入的。 */
+        usart1_send_string("start failed: SD not mounted (FRESULT ");
+        cli_print_u32((uint32_t)app_datalogger_mount_result());
+        usart1_send_string(") - check power/card\r\n");
+    } else {
+        /* 開檔失敗。1=FR_DISK_ERR、3=FR_NOT_READY 指向供電或接觸，
+         * 7=FR_DENIED 是空間。 */
+        dl_status_t st;
+        app_datalogger_get_status(&st);
+        usart1_send_string("start failed");
+        if (st.fres != 0) {
+            usart1_send_string(" (FRESULT ");
+            cli_print_u32(st.fres);
+            usart1_send_string(")");
+        }
+        usart1_send_string("\r\n");
+    }
 }
 
-/* 把行切成「指令 + 參數」：第一個空白前是指令，之後（去頭空白）是參數。
- * 直接在 buffer 上切（塞 '\0'），參數空字串代表沒給。 */
+static void cli_stop(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    if (app_datalogger_stop() == 0) {
+        usart1_send_string("stopped\r\n");
+    } else {
+        /* 收尾寫入失敗 = 這個 session 的資料沒落地。必須說出來。 */
+        dl_status_t st;
+        app_datalogger_get_status(&st);
+        usart1_send_string("stopped, but FLUSH FAILED (FRESULT ");
+        cli_print_u32(st.fres);
+        usart1_send_string(") - data may be lost\r\n");
+    }
+}
+
+static void cli_print_help(int argc, char **argv);   /* 表裡有 help，先宣告 */
+
+/* ── 指令表（Zephyr shell / U-Boot 的形狀）─────────────────────────────
+ * 一列 = 一個 token。有子指令就掛一張子表，dispatch 會逐 token 往下走，
+ * 所以 handler 裡不必再寫一層 if/else 去拆子指令。
+ *
+ * 加一個指令 = 加一列；加一個子指令 = 在子表加一列。cli_dispatch 和 help
+ * 都不用動，說明文字和 dispatch 也共用同一份來源，不會再對不上。 */
+typedef struct cli_cmd_s cli_cmd_t;
+struct cli_cmd_s {
+    const char      *name;      /* 單一 token，不含空白；NULL = 表尾 */
+    void           (*fn)(int argc, char **argv);
+    const cli_cmd_t *sub;       /* 子指令表，NULL = 葉節點 */
+    const char      *args;      /* help 的參數提示，例如 "[on|off]"，沒有就 "" */
+    const char      *help;
+};
+
+#define CLI_CMD_END { NULL, NULL, NULL, NULL, NULL }
+
+static const cli_cmd_t s_tasks_sub[] = {
+    { "hist",  cli_tasks_hist,  NULL, "[t]", "CPU% timeline, last 6.4s (t = task name)" },
+    { "reset", cli_tasks_reset, NULL, "",    "clear peaks + timeline"                   },
+    CLI_CMD_END
+};
+
+static const cli_cmd_t s_cmds[] = {
+    { "start",    cli_start,        NULL,         "",         "begin logging (new log_NNN.csv)"    },
+    { "stop",     cli_stop,         NULL,         "",         "stop logging"                       },
+    { "status",   cli_status,       NULL,         "",         "logger state + chip temp"           },
+    { "dump",     cli_dump,         NULL,         "[file]",   "print a csv (default: last session)" },
+    { "ls",       cli_ls,           NULL,         "",         "list files + free space"            },
+    { "clear",    cli_clear,        NULL,         "",         "delete all logs"                    },
+    { "tasks",    cli_tasks_table,  s_tasks_sub,  "",         "FreeRTOS task monitor (CPU% / peak / stack)" },
+    { "power",    cli_power,        NULL,         "",         "INA219 V / I / P (avg of last 10 samples)"   },
+    { "wfi",      cli_wfi,          NULL,         "[on|off]", "idle WFI sleep (power saving)"      },
+    { "i2cscan",  cli_cmd_i2cscan,  NULL,         "",         "scan I2C1 bus (0x08..0x77)"         },
+#if I2C1_FAULT_INJECT
+    { "i2cstuck", cli_cmd_i2cstuck, NULL,         "[raw]",    "jam SDA to test bus recovery (debug build)" },
+#endif
+    { "help",     cli_print_help,   NULL,         "",         "this list"                          },
+    CLI_CMD_END
+};
+
+/* 印一張表的說明。prefix 是父指令名（根層傳 NULL），讓子指令印成
+ * "tasks hist" 而不是光一個 "hist"。只處理兩層 —— 這個 CLI 用不到更深。 */
+static void cli_print_tbl(const cli_cmd_t *tbl, const char *prefix)
+{
+    for (const cli_cmd_t *c = tbl; c->name != NULL; c++) {
+        int n = 2;
+        usart1_send_string("  ");
+        if (prefix != NULL) {
+            n += cli_put(prefix);
+            n += cli_put(" ");
+        }
+        n += cli_put(c->name);
+        if (c->args[0] != '\0') {
+            n += cli_put(" ");
+            n += cli_put(c->args);
+        }
+        while (n < 17) {            /* 2 空白 + 15 欄寬，跟舊版排版相同 */
+            usart1_send_byte(' ');
+            n++;
+        }
+        usart1_send_string(c->help);
+        usart1_send_string("\r\n");
+        if (c->sub != NULL) {
+            cli_print_tbl(c->sub, c->name);
+        }
+    }
+}
+
+/* 對齊的指令清單（開機、help、打錯指令都印這個）。 */
+static void cli_print_help(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    usart1_send_string("commands:\r\n");
+    cli_print_tbl(s_cmds, NULL);
+}
+
+/* 就地切 token：在空白處塞 '\0'，argv 指進原本的 buffer，不複製。
+ * 超過 CLI_MAX_ARGS 的部分直接丟掉（這個 CLI 最多用到 2 個 token + 1 參數）。 */
+static int cli_tokenize(char *line, char **argv, int max)
+{
+    int argc = 0;
+
+    while (argc < max) {
+        while (*line == ' ') {
+            line++;                 /* 跳過分隔空白（連續幾個都吃）*/
+        }
+        if (*line == '\0') {
+            break;
+        }
+        argv[argc++] = line;
+        while (*line != '\0' && *line != ' ') {
+            line++;                 /* 走到這個 token 的結尾 */
+        }
+        if (*line == ' ') {
+            *line++ = '\0';         /* 切斷，下一圈從這裡繼續 */
+        }
+    }
+    return argc;
+}
+
+static const cli_cmd_t *cli_find(const cli_cmd_t *tbl, const char *tok)
+{
+    for (const cli_cmd_t *c = tbl; c->name != NULL; c++) {
+        if (strcmp(c->name, tok) == 0) {
+            return c;
+        }
+    }
+    return NULL;
+}
+
+/* 逐 token 往下走：argv[0] 在根表找，命中的那列若有子表且還有 token，
+ * 就拿 argv[1] 在子表找，如此遞進。走不動了就呼叫當層的 fn，並把
+ * 「命中的那個 token 起算」的 argv 交給它（argv[0] = 指令名，Unix 慣例）。 */
 static void cli_dispatch(char *line)
 {
-    char *cmd = line;
-    char *arg = line;
-    while (*arg && *arg != ' ') {
-        arg++;                      /* 走到指令結尾 */
-    }
-    while (*arg == ' ') {
-        *arg++ = '\0';              /* 砍掉分隔空白，arg 指向參數開頭 */
+    char *argv[CLI_MAX_ARGS];
+    int   argc = cli_tokenize(line, argv, CLI_MAX_ARGS);
+
+    const cli_cmd_t *tbl = s_cmds;
+    const cli_cmd_t *cmd = NULL;
+    int              i   = 0;
+
+    while (i < argc) {
+        const cli_cmd_t *c = cli_find(tbl, argv[i]);
+        if (c == NULL) {
+            break;                  /* cmd==NULL：根層不認得；否則：子指令不認得 */
+        }
+        cmd = c;
+        i++;
+        if (c->sub == NULL) {
+            break;                  /* 葉節點，剩下的 token 都是參數 */
+        }
+        tbl = c->sub;
     }
 
-    if (strcmp(cmd, "start") == 0) {
-        int start_rc = app_datalogger_start();
-        if (start_rc == 0) {
-            usart1_send_string("started: ");
-            usart1_send_string(app_datalogger_filename());
-            usart1_send_string("\r\n");
-        } else if (start_rc == -1) {
-            /* 掛載失敗（含當場重掛也沒過）。這條路徑不經過 f_open，所以
-             * s_fres 是 0 —— 要印的是 f_mount 的 FRESULT，不是寫入的。 */
-            usart1_send_string("start failed: SD not mounted (FRESULT ");
-            cli_print_u32((uint32_t)app_datalogger_mount_result());
-            usart1_send_string(") - check power/card\r\n");
-        } else {
-            /* 開檔失敗。1=FR_DISK_ERR、3=FR_NOT_READY 指向供電或接觸，
-             * 7=FR_DENIED 是空間。 */
-            dl_status_t st;
-            app_datalogger_get_status(&st);
-            usart1_send_string("start failed");
-            if (st.fres != 0) {
-                usart1_send_string(" (FRESULT ");
-                cli_print_u32(st.fres);
-                usart1_send_string(")");
-            }
-            usart1_send_string("\r\n");
-        }
-    } else if (strcmp(cmd, "stop") == 0) {
-        if (app_datalogger_stop() == 0) {
-            usart1_send_string("stopped\r\n");
-        } else {
-            /* 收尾寫入失敗 = 這個 session 的資料沒落地。必須說出來。 */
-            dl_status_t st;
-            app_datalogger_get_status(&st);
-            usart1_send_string("stopped, but FLUSH FAILED (FRESULT ");
-            cli_print_u32(st.fres);
-            usart1_send_string(") - data may be lost\r\n");
-        }
-    } else if (strcmp(cmd, "status") == 0) {
-        cli_status();
-    } else if (strcmp(cmd, "dump") == 0) {
-        cli_dump(arg);
-    } else if (strcmp(cmd, "ls") == 0) {
-        cli_ls();
-    } else if (strcmp(cmd, "clear") == 0) {
-        cli_clear();
-    } else if (strcmp(cmd, "tasks") == 0) {
-        cli_cmd_tasks(arg);
-    } else if (strcmp(cmd, "power") == 0) {
-        cli_power();
-    } else if (strcmp(cmd, "wfi") == 0) {
-        cli_wfi(arg);
-    } else if (strcmp(cmd, "i2cscan") == 0) {
-        cli_cmd_i2cscan();
-#if I2C1_FAULT_INJECT
-    } else if (strcmp(cmd, "i2cstuck") == 0) {
-        cli_cmd_i2cstuck(arg);
-#endif
-    } else if (strcmp(cmd, "help") == 0) {
-        cli_print_help();
-    } else {
+    if (argc == 0) {
+        /* 空行：什麼都不做，只補 prompt */
+    } else if (cmd == NULL) {
         usart1_send_string("unknown command '");
-        usart1_send_string(cmd);
+        usart1_send_string(argv[0]);
         usart1_send_string("' (type 'help')\r\n");
+    } else if (i < argc && cmd->sub != NULL) {
+        /* 進了子表卻沒命中 —— 別默默跑父指令，把這層能用的印出來 */
+        usart1_send_string("unknown subcommand '");
+        usart1_send_string(argv[i]);
+        usart1_send_string("', try:\r\n");
+        cli_print_tbl(cmd->sub, cmd->name);
+    } else {
+        cmd->fn(argc - i + 1, &argv[i - 1]);
     }
     usart1_send_string("> ");
 }
 
+
 void app_cli_init(void)
 {
     s_idx = 0;
-    cli_print_help();
+    cli_print_help(0, NULL);
     usart1_send_string("> ");
 }
 
