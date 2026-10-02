@@ -25,6 +25,7 @@
 #include "isr_port.h"          /* ISR 計時掛勾；沒有 isr_port_config.h 時展開成空 */
 #include "systick.h"           /* systick_get_ms()：DMA 等待的逾時上限 */
 #include "bus_port.h"          /* DMA 傳輸的等待/喚醒（RTOS 中立）*/
+#include "dma_mem.h"           /* dma_mem_ok()：buffer 在 CCM 的話 DMA 讀不到 */
 
 /* DMA2 Stream3 的 LISR/LIFCR bit 位置（RM0090 §10.5.5）
  *   bit 27: TCIF3     bit 22: FEIF3
@@ -152,6 +153,23 @@ static void spi1_dma_start(void)
     DMA2_Stream3->CR |= (1 << 0);                   // EN
 }
 
+/* 檢查 buffer → 設定 → 啟動。sync / async 共用的唯一入口。
+ *
+ * buffer 不在 DMA 碰得到的區域（典型是 task 的 local 陣列，在 CCM）就不
+ * 啟動，並把 s_dma_err 設起來：s_dma_done 維持 1，之後的 spi1_wait_done()
+ * 不會去等號誌，直接因 s_dma_err 回 -1 —— async 呼叫端就算沒看這裡的
+ * 回傳值，wait_done 那一步照樣拿得到失敗。 */
+static int spi1_dma_begin(const uint8_t *buf, uint32_t len)
+{
+    if (!dma_mem_ok(buf, len)) {
+        s_dma_err = 1;
+        return -1;
+    }
+    spi1_dma_configure(buf, len);
+    spi1_dma_start();
+    return 0;
+}
+
 /* ============================================================================
  *                              Public API
  * ============================================================================ */
@@ -192,15 +210,15 @@ void spi1_set_baud(uint8_t br)
 
 int spi1_send_buffer(const uint8_t *buf, uint32_t len)
 {
-    spi1_dma_configure(buf, len);
-    spi1_dma_start();
+    if (spi1_dma_begin(buf, len) != 0) {
+        return -1;                    /* buffer DMA 讀不到，什麼都沒送 */
+    }
     return spi1_wait_done();          /* 逾時時回 -1；呼叫端可忽略 */
 }
 
-void spi1_send_buffer_async(const uint8_t *buf, uint32_t len)
+int spi1_send_buffer_async(const uint8_t *buf, uint32_t len)
 {
-    spi1_dma_configure(buf, len);
-    spi1_dma_start();
+    return spi1_dma_begin(buf, len);
     /* 立刻 return，使用者自己 wait_done */
 }
 

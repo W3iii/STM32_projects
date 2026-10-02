@@ -43,7 +43,7 @@ typedef enum {
     USART1_OK = 0,
     USART1_ERR_TIMEOUT,
     USART1_ERR_BUSY,         /* DMA 還在傳，不能發新的 */
-    USART1_ERR_PARAM,        /* buf == NULL 或 len == 0 */
+    USART1_ERR_PARAM,        /* buf == NULL、len == 0，或 buf 不在 DMA 可存取區 */
     USART1_ERR_EMPTY,        /* RX ring buffer 為空     */
 } usart1_status_t;
 
@@ -99,7 +99,8 @@ usart1_status_t usart1_send_string(const char *s);
  *
  * IMPORTANT:
  *   傳輸期間 buf 內容不可改！
- *   不要傳 stack 上的區域變數（除非確定 caller 會等完）。
+ *   buf 必須在 Flash 或主 SRAM（static / 全域 / 字串常數）。task stack 在 CCM，
+ *   DMA 讀不到 —— local 陣列一律回 USART1_ERR_PARAM，就算 caller 會等完也不行。
  */
 usart1_status_t usart1_try_send(const uint8_t *buf, uint16_t len);
 

@@ -11,6 +11,7 @@
 #include "stm32f407xx.h"
 #include "systick.h"
 #include "isr_port.h"          /* ISR 計時掛勾；沒有 isr_port_config.h 時展開成空 */
+#include "dma_mem.h"           /* dma_mem_ok()：buffer 在 CCM 的話 DMA 讀不到 */
 
 /* ========================================================================= */
 /*                          Private constants                                */
@@ -330,7 +331,9 @@ usart1_status_t usart1_send_string(const char *s)
 
 usart1_status_t usart1_try_send(const uint8_t *buf, uint16_t len)
 {
-    if (buf == 0 || len == 0) {
+    /* NULL / len 0 / buf 不在 DMA 碰得到的區域（task 的 local 陣列在 CCM）
+     * 都在這裡擋掉，不啟動 DMA。dma_mem_ok() 本身就涵蓋 NULL 與 len 0。 */
+    if (!dma_mem_ok(buf, len)) {
         return USART1_ERR_PARAM;
     }
 

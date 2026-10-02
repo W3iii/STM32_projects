@@ -13,7 +13,9 @@
 /* 初始化 */
 void spi1_init(void);
 
-/* 同步：等到完成才 return */
+/* 同步：等到完成才 return
+ * spi1_send_buffer 回傳 0 = 正常，-1 = 逾時 / TEIF / buf 不在 DMA 可存取區
+ * （Flash 或主 SRAM；task stack 在 CCM，local 陣列不行，見 dma_mem.h）。 */
 void spi1_send_byte  (uint8_t b);
 int  spi1_send_buffer(const uint8_t *buf, uint32_t len);
 
@@ -23,8 +25,9 @@ uint8_t spi1_transfer_byte(uint8_t b);
 /* 切鮑率：br = CR1[5:3]，PCLK2=84MHz：7=/256(328kHz, SD init), 4=/32(2.6MHz) */
 void spi1_set_baud(uint8_t br);
 
-/* 非同步：啟動 DMA 就 return */
-void spi1_send_buffer_async(const uint8_t *buf, uint32_t len);
+/* 非同步：啟動 DMA 就 return。回傳 0 = 已啟動，-1 = buf 不在 DMA 可存取區、
+ * 沒有啟動（之後的 spi1_wait_done() 也會回 -1，忽略這裡的回傳值也不會漏）。 */
+int  spi1_send_buffer_async(const uint8_t *buf, uint32_t len);
 
 /* 狀態查詢 */
 int  spi1_is_busy(void);
