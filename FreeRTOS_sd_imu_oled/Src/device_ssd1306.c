@@ -63,6 +63,13 @@ static void ssd1306_send_cmd(uint8_t cmd)
     OLED_CS_HIGH();
 }
 
+/* 硬體 reset：RES 拉低一段時間讓控制器回到已知狀態。
+ * datasheet 只要求 RES 低電位 ≥3µs，這裡給 10ms 是保守值 —— reset 只在
+ * 開機跑一次，多等 20ms 換「絕不會因為 reset 沒做滿而偶發開不起來」划算。
+ *
+ * 注意 RES 跟 DC 一樣不是 SPI 訊號，是 SSD1306 自己的控制腳（見 .h 的接線）。
+ * SD 卡的對應物是 CMD0 —— 同樣是「回到已知狀態」，一個走帶外訊號、一個走
+ * 協定內的命令，因為 SD 卡的腳位被卡槽規格綁死，沒有多拉一根線的餘地。 */
 static void ssd1306_reset(void)
 {
     OLED_RES_HIGH();
@@ -78,34 +85,40 @@ void ssd1306_init(void)
     ssd1306_gpio_init();
     ssd1306_reset();
 
-    ssd1306_send_cmd(0xAE);
-    ssd1306_send_cmd(0x20);
-    ssd1306_send_cmd(0x00);
-    ssd1306_send_cmd(0xB0);
-    ssd1306_send_cmd(0xC8);
-    ssd1306_send_cmd(0x00);
-    ssd1306_send_cmd(0x10);
-    ssd1306_send_cmd(0x40);
-    ssd1306_send_cmd(0x81);
-    ssd1306_send_cmd(0xFF);
-    ssd1306_send_cmd(0xA1);
-    ssd1306_send_cmd(0xA6);
-    ssd1306_send_cmd(0xA8);
-    ssd1306_send_cmd(0x3F);
-    ssd1306_send_cmd(0xA4);
-    ssd1306_send_cmd(0xD3);
-    ssd1306_send_cmd(0x00);
-    ssd1306_send_cmd(0xD5);
-    ssd1306_send_cmd(0xF0);
-    ssd1306_send_cmd(0xD9);
-    ssd1306_send_cmd(0x22);
-    ssd1306_send_cmd(0xDA);
-    ssd1306_send_cmd(0x12);
-    ssd1306_send_cmd(0xDB);
-    ssd1306_send_cmd(0x20);
-    ssd1306_send_cmd(0x8D);
-    ssd1306_send_cmd(0x14);
-    ssd1306_send_cmd(0xAF);
+    /* 設定期間先關顯示，避免中間狀態閃到螢幕上。 */
+    ssd1306_send_cmd(0xAE);                             /* display OFF */
+
+    /* ---- 記憶體定址模式 ----
+     * 水平模式：GDDRAM 指標 column++，到 end column 自動歸零且 page++。
+     * 這是 ssd1306_update_screen() 能一發 DMA 推完 1024 bytes 的前提 ——
+     * 指標會自己跨頁，所以只要用 0x21/0x22 設一次視窗就夠。
+     * 若改成 page mode(0x02)，指標走到 column 127 會繞回同一頁的 0，
+     * 得拆成 8 次傳輸、每次前面補三個指令重設指標。 */
+    ssd1306_send_cmd(0x20); ssd1306_send_cmd(0x00);     /* 00=水平 01=垂直 10=頁 */
+
+    /* ---- 顯示方向 ----
+     * 這兩行成對 = 旋轉 180°（模組慣用的擺法）。只改其中一個會變成鏡像，
+     * 要動就兩個一起動。 */
+    ssd1306_send_cmd(0xC8);                             /* COM scan 反向 */
+    ssd1306_send_cmd(0xA1);                             /* segment remap */
+
+    /* ---- 面板參數（128×64 模組的標準值）---- */
+    ssd1306_send_cmd(0x40);                             /* display start line = 0 */
+    ssd1306_send_cmd(0x81); ssd1306_send_cmd(0xFF);     /* contrast = max */
+    ssd1306_send_cmd(0xA6);                             /* 正常顯示（非反白） */
+    ssd1306_send_cmd(0xA8); ssd1306_send_cmd(0x3F);     /* multiplex ratio = 64 列 */
+    ssd1306_send_cmd(0xA4);                             /* 顯示跟隨 GDDRAM（非全亮測試） */
+    ssd1306_send_cmd(0xD3); ssd1306_send_cmd(0x00);     /* display offset = 0 */
+    ssd1306_send_cmd(0xD5); ssd1306_send_cmd(0xF0);     /* clock divide / osc freq */
+    ssd1306_send_cmd(0xD9); ssd1306_send_cmd(0x22);     /* pre-charge period */
+    ssd1306_send_cmd(0xDA); ssd1306_send_cmd(0x12);     /* COM pin 配置：128×64 */
+    ssd1306_send_cmd(0xDB); ssd1306_send_cmd(0x20);     /* VCOMH deselect = 0.77×Vcc */
+
+    /* 模組只有 3.3V 輸入，面板需要的高壓靠晶片內建 charge pump 升上來。
+     * 漏掉這兩行的症狀是「初始化看起來全對，但螢幕全黑」。 */
+    ssd1306_send_cmd(0x8D); ssd1306_send_cmd(0x14);     /* enable charge pump */
+
+    ssd1306_send_cmd(0xAF);                             /* display ON */
 }
 
 /* ============================================================================
