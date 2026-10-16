@@ -37,6 +37,22 @@
 #define SD_TYPE_V2       2   /* SD v2.0+ 標準容量 SDSC（byte 定址）    */
 #define SD_TYPE_SDHC     3   /* SDHC/SDXC（block 定址，CCS=1）         */
 
+/* ---- 讀寫路徑的失敗現場 ----
+ * init 路徑有 sd_last_init_rc / sd_last_r1 / sd_r7 / sd_ocr 可查，但 I/O
+ * 路徑以前什麼都沒留：7 種失敗全被壓成 SD_ERR_READ / SD_ERR_WRITE，再壓成
+ * diskio 的 RES_ERROR、FatFs 的 FR_DISK_ERR，到 status 只剩一個數字。
+ * 「卡被拔掉」「供電不穩」「buffer 誤放 CCM」「線路雜訊」的處理方式天差地別，
+ * 但呈現出來一模一樣 —— 所以在最細的那層留一份快照。 */
+#define SD_IO_OK           0
+#define SD_IO_RD_CMD_R1    1   /* CMD17 的 R1 != 0（byte = 該 R1）        */
+#define SD_IO_RD_TOKEN_TMO 2   /* 等 data token 逾時（SD_READ_TIMEOUT_MS）*/
+#define SD_IO_RD_ERR_TOKEN 3   /* 收到 error token（byte = 該 token）     */
+#define SD_IO_WR_CMD_R1    4   /* CMD24 的 R1 != 0（byte = 該 R1）        */
+#define SD_IO_WR_DMA_MEM   5   /* buffer DMA 碰不到（典型是 CCM 上的 stack）*/
+#define SD_IO_WR_DMA_TMO   6   /* DMA/SPI 傳輸逾時                        */
+#define SD_IO_WR_RESP      7   /* data response 被拒（byte = 該 resp）    */
+#define SD_IO_WR_BUSY_TMO  8   /* 等 busy 結束逾時（SD_WRITE_TIMEOUT_MS） */
+
 /* debug 用全域（數值意義見 .c） */
 extern volatile uint8_t sd_last_r1;       /* 最後一次命令的原始 R1     */
 extern volatile uint8_t sd_last_init_rc;  /* 最後一次 sd_init() 回傳碼  */
@@ -44,6 +60,16 @@ extern volatile uint8_t sd_last_cmd55_r1; /* 最後一次 CMD55 的 R1      */
 extern volatile uint8_t sd_card_type;     /* SD_TYPE_*                 */
 extern volatile uint8_t sd_r7[4];       /* CMD8 的 4-byte trailing */
 extern volatile uint8_t sd_ocr[4];      /* CMD58 讀回的 OCR        */
+
+/* 讀寫路徑「最後一次失敗」的現場（SD_IO_*）。刻意不在成功時清掉 —— 失敗後
+ * 通常還會有成千上萬次成功寫入，清掉就查不到了。要判斷這份快照是否還有意義，
+ * 看 dl_status 的 err_count：為 0 就代表從沒失敗過，這三個值無意義。 */
+extern volatile uint8_t  sd_last_io_err;   /* SD_IO_*                      */
+extern volatile uint8_t  sd_last_io_byte;  /* 當時讀到的 R1 / token / resp */
+extern volatile uint32_t sd_last_io_blk;   /* 出事的 block 號              */
+
+/* SD_IO_* 的短字串（給 CLI 印）。未知值回 "?"。 */
+const char *sd_io_err_str(uint8_t code);
 
 /* CS 腳 GPIO 初始化（PB10 推挽輸出，預設拉高）。
  * spi1_init() 要先呼叫過，這裡只負責 CS。 */

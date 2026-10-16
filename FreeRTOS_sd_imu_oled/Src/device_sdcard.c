@@ -23,6 +23,7 @@
 #include "device_sdcard.h"
 #include "driver_spi1.h"
 #include "bus_port.h"    /* spi1_poll_yield()：等卡 busy 時讓出 CPU（RTOS 中立） */
+#include "dma_mem.h"     /* dma_mem_ok()：分類 spi1_send_buffer 的兩種失敗 */
 #include "systick.h"
 #include "stm32f407xx.h"
 
@@ -90,6 +91,36 @@ volatile uint8_t sd_r7[4] = { 0 };
 /* CMD58 讀回的 OCR（R3 後段，32-bit、MSB first），debug 用：
  *   ocr[0] bit7 = 卡 power-up 完成；ocr[0] bit6 = CCS（1 = SDHC/SDXC） */
 volatile uint8_t sd_ocr[4] = { 0 };
+
+/* 讀寫路徑最後一次失敗的現場，見 .h 的 SD_IO_*。不在成功時清掉。 */
+volatile uint8_t  sd_last_io_err  = SD_IO_OK;
+volatile uint8_t  sd_last_io_byte = 0;
+volatile uint32_t sd_last_io_blk  = 0;
+
+/* 記一次 I/O 失敗。寫入順序刻意把 err 放最後：先備好 byte/blk，最後才讓
+ * err 變成非 0，這樣 CLI 看到 err != 0 時另外兩個欄位一定已經是對的。 */
+static void sd_io_fail(uint8_t code, uint8_t byte, uint32_t block)
+{
+    sd_last_io_byte = byte;
+    sd_last_io_blk  = block;
+    sd_last_io_err  = code;
+}
+
+const char *sd_io_err_str(uint8_t code)
+{
+    switch (code) {
+        case SD_IO_OK:           return "ok";
+        case SD_IO_RD_CMD_R1:    return "rd CMD17 R1";
+        case SD_IO_RD_TOKEN_TMO: return "rd token timeout";
+        case SD_IO_RD_ERR_TOKEN: return "rd error token";
+        case SD_IO_WR_CMD_R1:    return "wr CMD24 R1";
+        case SD_IO_WR_DMA_MEM:   return "wr buf not DMA-able";
+        case SD_IO_WR_DMA_TMO:   return "wr DMA timeout";
+        case SD_IO_WR_RESP:      return "wr resp rejected";
+        case SD_IO_WR_BUSY_TMO:  return "wr busy timeout";
+        default:                 return "?";
+    }
+}
 
 /* ============================================================================
  *                              CS GPIO
@@ -302,6 +333,7 @@ uint8_t sd_read_block(uint32_t block, uint8_t *buf)
     /* CMD17 (READ_SINGLE_BLOCK)，CRC 被忽略送 0x01 */
     uint8_t r1 = sd_cmd_frame(17, sd_block_to_addr(block), 0x01);
     if (r1 != 0x00) {
+        sd_io_fail(SD_IO_RD_CMD_R1, r1, block);
         sd_deselect();
         return SD_ERR_READ;
     }
@@ -317,6 +349,7 @@ uint8_t sd_read_block(uint32_t block, uint8_t *buf)
             break;
         }
         if (systick_get_ms() - start > SD_READ_TIMEOUT_MS) {
+            sd_io_fail(SD_IO_RD_TOKEN_TMO, token, block);
             sd_deselect();
             return SD_ERR_READ;
         }
@@ -326,6 +359,7 @@ uint8_t sd_read_block(uint32_t block, uint8_t *buf)
     } while (1);
 
     if (token != SD_TOKEN_START) {             // error token，不是 0xFE
+        sd_io_fail(SD_IO_RD_ERR_TOKEN, token, block);
         sd_deselect();
         return SD_ERR_READ;
     }
@@ -348,6 +382,7 @@ uint8_t sd_write_block(uint32_t block, const uint8_t *buf)
     /* CMD24 (WRITE_SINGLE_BLOCK) */
     uint8_t r1 = sd_cmd_frame(24, sd_block_to_addr(block), 0x01);
     if (r1 != 0x00) {
+        sd_io_fail(SD_IO_WR_CMD_R1, r1, block);
         sd_deselect();
         return SD_ERR_WRITE;
     }
@@ -368,15 +403,24 @@ uint8_t sd_write_block(uint32_t block, const uint8_t *buf)
      * 讀得到的主 SRAM。FreeRTOS heap（= 所有 task stack）在 CCM，DMA 碰
      * 不到；目前的 FIL/FATFS 都是 static，所以沒問題。 */
     if (spi1_send_buffer(buf, SD_BLOCK_SIZE) != 0) {
-        sd_deselect();                  /* DMA 逾時：block 送到一半，整筆放棄 */
+        /* spi1_send_buffer 兩種失敗都回 -1：buffer 位址被 dma_mem_ok 擋下，
+         * 或 DMA/SPI 傳輸逾時。回頭自己判一次把兩者分開 —— 前者是程式錯誤
+         * （buffer 放在 CCM，要改 code），後者是硬體/供電問題，查的方向完全
+         * 不同，壓成同一個碼等於把最有用的線索丟掉。 */
+        sd_io_fail(dma_mem_ok(buf, SD_BLOCK_SIZE) ? SD_IO_WR_DMA_TMO
+                                                  : SD_IO_WR_DMA_MEM,
+                   0, block);
+        sd_deselect();                  /* block 送到一半，整筆放棄 */
         return SD_ERR_WRITE;
     }
     spi1_transfer_byte(0xFF);
     spi1_transfer_byte(0xFF);
 
-    /* data response token：低 5 bit = xxx00101 (0x05) 代表卡已接受 */
+    /* data response token：低 5 bit = xxx0_sss1，sss=010（-> 0x05）代表卡已接受。
+     * 其他常見值：0x0B = CRC error(sss=101)、0x0D = write error(sss=110)。 */
     uint8_t resp = spi1_transfer_byte(0xFF);
     if ((resp & 0x1F) != 0x05) {
+        sd_io_fail(SD_IO_WR_RESP, resp, block);
         sd_deselect();
         return SD_ERR_WRITE;
     }
@@ -392,6 +436,7 @@ uint8_t sd_write_block(uint32_t block, const uint8_t *buf)
     uint32_t spins = 0;
     while (spi1_transfer_byte(0xFF) == 0x00) {
         if (systick_get_ms() - start > SD_WRITE_TIMEOUT_MS) {
+            sd_io_fail(SD_IO_WR_BUSY_TMO, 0x00, block);
             sd_deselect();
             return SD_ERR_WRITE;
         }

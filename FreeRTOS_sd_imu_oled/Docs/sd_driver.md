@@ -343,6 +343,63 @@ Flash 才放行。檢查不過就不啟動 DMA、回 `-1`，SD 寫入因此走�
 
 ---
 
+## 9.5 診斷出口：錯誤碼往上走會被壓扁
+
+這是分層架構的固有代價，值得單獨講。
+
+### 壓扁鏈
+
+```
+sd_write_block 的 5 個失敗點
+  ├─ CMD24 的 R1 != 0
+  ├─ buffer 被 dma_mem_ok 擋下（CCM）
+  ├─ DMA/SPI 傳輸逾時
+  ├─ data response 被拒
+  └─ busy 輪詢逾時
+          ↓  全部回同一個 SD_ERR_WRITE
+    diskio.c  ->  RES_ERROR
+          ↓
+    FatFs     ->  FR_DISK_ERR，並鎖進 fp->err
+          ↓
+    status 的 "write err N (FRESULT 1)"
+```
+
+讀取同理，3 個失敗點全壓成 `SD_ERR_READ`。
+
+問題是 `FR_DISK_ERR` 背後這幾種原因的**處理方式完全不同**：
+
+| 實際原因 | 該做什麼 |
+|---|---|
+| 卡被拔掉 / 接觸不良 | 插回去、查座子 |
+| 供電不穩導致 busy 逾時 | 查電源、加電容 |
+| buffer 在 CCM 被擋 | **改 code** |
+| 線路雜訊造成假 token | 查接線、降速 |
+
+### 解法：在最細的那層留快照
+
+| 路徑 | 診斷出口 |
+|---|---|
+| **init** | `sd_last_init_rc`、`sd_last_r1`、`sd_last_cmd55_r1`、`sd_card_type`、`sd_r7`、`sd_ocr` —— 開機報告與 OLED 都印 |
+| **I/O** | `sd_last_io_err`（`SD_IO_*`）、`sd_last_io_byte`（當時的 R1/token/resp）、`sd_last_io_blk` |
+
+`status` 多一行（只在 `err_count != 0` 時印，否則快照無意義）：
+
+```
+  sd io err  wr busy timeout (byte 0x00, block 32768)
+```
+
+三個設計細節：
+
+1. **成功時刻意不清掉。** 失敗後通常還有成千上萬次成功寫入，清掉就查不到了。要判斷快照是否有效，看 `err_count`。
+2. **寫入順序是 byte/blk 先、err 最後。** 這樣 CLI 看到 `err != 0` 時，另兩個欄位一定已經更新完。
+3. **`spi1_send_buffer()` 的兩種失敗用 `dma_mem_ok()` 回頭分類。** 它對「位址被擋」和「DMA 逾時」都回 `-1`，但一個要改程式、一個要查硬體，壓成同一碼等於丟掉最有用的線索。
+
+> **原則：錯誤碼的粒度在最底層最細，每往上一層就少一點。** 所以要在最細的地方
+> 留快照，而不是試圖把細節塞進上層的回傳值 —— 後者會逼你改 `diskio` 甚至
+> FatFs 的介面，代價高得多。這裡的改動沒有動任何既有介面。
+
+---
+
 ## 10. 已知限制與取捨（誠實清單）
 
 面試時主動講這些，比被問出來好。
@@ -357,7 +414,7 @@ Flash 才放行。檢查不過就不啟動 DMA、回 `-1`，SD 寫入因此走�
 | 6 | **沒有熱插拔偵測** | 抽卡後要靠讀寫失敗才發現 | CD 腳或定期 CMD13 探測 |
 | 7 | **沒讀 CSD/CID（CMD9/CMD10）** | 不知道卡容量、廠商、序號 | 開機報告想印容量的話需要補 |
 | 8 | **`SD_BAUD_FAST` 保守設在 2.6MHz** | 低於 SPI 模式上限（25MHz） | 麵包板的保守值；線路乾淨可改 BR=3（5.25MHz）起跳測 |
-| 9 | **data response token 單讀一個 byte** | 規格上它緊接資料封包，但若卡慢一個 byte，`0xFF & 0x1F != 0x05` 會誤判成寫入失敗（資料其實已寫入） | 加 8 次上限的掃 `0xFF` 迴圈，成本約 25us |
+| 9 | **data response token 單讀一個 byte** | 規格上它緊接資料封包，但若卡慢一個 byte，`0xFF & 0x1F != 0x05` 會誤判成寫入失敗（資料其實已寫入）。現在至少看得出來了：`status` 會顯示 `wr resp rejected (byte 0xFF)` | 加 8 次上限的掃 `0xFF` 迴圈，成本約 25us |
 | 10 | **寫入 buffer 不能在 CCM**（§8） | task 的 local 陣列丟進 `f_write`（>=512B）會被 `dma_mem_ok()` 擋下回 `-1`。目前 `FIL`/`FATFS` 都是 static 所以安全，但這是呼叫端要記住的約束 | 已有執行期檢查且走正規錯誤路徑；要徹底解決得在 driver 內部加一個主 SRAM 的 bounce buffer（代價是多 512B 與一次 memcpy） |
 
 ### 文件待修
@@ -395,13 +452,14 @@ Flash 才放行。檢查不過就不啟動 DMA、回 `-1`，SD 寫入因此走�
 13. 為什麼寫用 DMA 讀不用？ -> TX-only DMA 收不到 MISO（§5）
 14. timeout 值怎麼定的？ -> 1000ms 的來由與 FatFs `fp->err` 鎖死的代價（§6）
 15. driver 怎麼同時支援 RTOS 與 bare-metal？ -> `bus_port.h` 間接層（§1）
-16. 為什麼 DMA 碰不到 CCM？你怎麼防？ -> CCM 只在 D-bus 不在 bus matrix；
+16. 錯誤碼往上層走會被壓扁，你怎麼處理？ -> 在最底層留快照而非改上層介面（§9.5）
+17. 為什麼 DMA 碰不到 CCM？你怎麼防？ -> CCM 只在 D-bus 不在 bus matrix；
     `dma_mem_ok()` 白名單檢查 + 回錯誤碼而非 assert（§8）
-17. 這個 driver 你會先改哪裡？ -> §10 的 #1（多 block，吞吐量）或 #2（CRC，可靠性），
+18. 這個 driver 你會先改哪裡？ -> §10 的 #1（多 block，吞吐量）或 #2（CRC，可靠性），
     視場景選一個並說出理由 —— **不要說「都要改」**
 
 ### 可能的延伸
 
-18. 為什麼不用 SDIO 介面？ -> F407 有 SDIO，4-bit + 硬體 CRC + 高時鐘，吞吐量高一個量級；
+19. 為什麼不用 SDIO 介面？ -> F407 有 SDIO，4-bit + 硬體 CRC + 高時鐘，吞吐量高一個量級；
     本專案選 SPI 是為了腳位彈性與 driver 可攜性，而 logger 的資料率（取樣級）遠低於瓶頸
-19. 多個裝置共用 SPI1 怎麼處理？ -> 軟體 CS + `spi1_lock` 互斥（§8）
+20. 多個裝置共用 SPI1 怎麼處理？ -> 軟體 CS + `spi1_lock` 互斥（§8）

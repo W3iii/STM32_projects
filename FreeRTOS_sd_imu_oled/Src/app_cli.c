@@ -14,6 +14,7 @@
 #include "app_datalogger.h"
 #include "app_tasks.h"          /* app_tasks_overruns（status 用）*/
 #include "bus_port.h"           /* i2cscan 指令：i2c1_lock / i2c1_unlock */
+#include "device_sdcard.h"      /* status：SD_IO_* 讀寫失敗現場（純讀全域，不碰匯流排）*/
 #include "device_tempsensor.h"  /* status：晶片溫度 raw / 換算除錯讀數 */
 #include "device_mpu6050.h"     /* i2cstuck 指令：MPU6050_ADDR / who_am_i */
 #include "driver_i2c1.h"        /* i2cscan 指令：i2c1_bus_scan / i2c1_bus_recovery */
@@ -172,6 +173,20 @@ static void cli_status(int argc, char **argv)
         usart1_send_string(")");
     }
     usart1_send_string("\r\n");
+
+    /* FRESULT 只告訴你「磁碟錯了」，分不出是卡被拔掉、供電不穩、buffer 誤放
+     * CCM 還是線路雜訊 —— 這四種的處理方式完全不同。driver 層在失敗當下留了
+     * 現場（device_sdcard.h 的 SD_IO_*），這裡把它攤開。
+     * 只在真的失敗過才印：err_count == 0 時那份快照沒有意義。 */
+    if (st.err_count != 0 && sd_last_io_err != SD_IO_OK) {
+        cli_label("sd io err");
+        usart1_send_string(sd_io_err_str(sd_last_io_err));
+        usart1_send_string(" (byte 0x");
+        cli_print_hex8(sd_last_io_byte);
+        usart1_send_string(", block ");
+        cli_print_u32(sd_last_io_blk);
+        usart1_send_string(")\r\n");
+    }
 
     cli_label("overruns");
     cli_print_u32(app_tasks_overruns());    /* Sensor 因佇列滿丟棄數，理想 0 */
