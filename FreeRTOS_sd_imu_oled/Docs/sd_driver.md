@@ -2,6 +2,7 @@
 
 > STM32F407VGTX / SPI1 / FatFs
 > 對應檔案：`Src/device_sdcard.c`、`Inc/device_sdcard.h`、`Src/diskio.c`
+> （§10 的恢復流程另外牽涉 `Src/app_datalogger.c`、`Src/app_tasks.c`、`Src/app_cli.c`）
 
 ---
 
@@ -12,7 +13,8 @@
 > 設計重點有三個：**init 階段的速率與時序約束**、**三種不同性質的等待各用不同策略**、
 > 以及 **在 RTOS 下不讓忙等吃掉 CPU**。」
 
-這三點就是後面章節的骨架，也是最可能被追問的地方。
+這三點就是後面章節的骨架，也是最可能被追問的地方。§10 另外記錄一次實際故障：
+供電邊界下寫入卡死，從症狀判讀到三層恢復的完整設計。
 
 ---
 
@@ -192,7 +194,8 @@ start token 與 error token 在最高位就分開（`1` vs `0`），不可能混
 ### 讀（CMD17）
 
 ```
-CS low -> CMD17 -> R1 必須 == 0x00
+CS low -> 等卡 ready（讀到 0xFF，見 §10.4）
+       -> CMD17 -> R1 必須 == 0x00
        -> 等 start token 0xFE（有 timeout + yield）
        -> 逐 byte 讀 512 bytes
        -> 讀掉 2 byte CRC16（丟棄）
@@ -202,7 +205,8 @@ CS low -> CMD17 -> R1 必須 == 0x00
 ### 寫（CMD24）
 
 ```
-CS low -> CMD24 -> R1 必須 == 0x00
+CS low -> 等卡 ready（讀到 0xFF，見 §10.4）
+       -> CMD24 -> R1 必須 == 0x00
        -> 1 dummy byte（N_WR 間隔）
        -> 送 start token 0xFE
        -> DMA 送 512 bytes           <- 與讀路徑不對稱；buf 必須在主 SRAM（見 §8）
@@ -233,10 +237,13 @@ dummy 固定用 `0xFF` 而非 `0x00`，是為了讓 MOSI 維持 idle 高電位 �
 
 ## 6. 三種等待，三種策略
 
-這是本 driver 最值得講的設計。**三個等待的規格約束完全不同，所以處理方式也不同**：
+這是本 driver 最值得講的設計。**每個等待的規格約束都不同，所以處理方式也不同**
+（標題的「三種」指 R1 / token / busy 三類延遲；命令前的 ready 是 §10 為了恢復加上的，
+本質上是「上一筆寫入的 busy」換個時間點等）：
 
 | 等什麼 | 規格允許的延遲 | 策略 |
 |---|---|---|
+| 讀寫命令前的 **ready** | 正常 0；上一筆寫入還在 program 時同 busy | `SD_READY_TIMEOUT_MS` = 1000ms + yield（§10.4） |
 | 命令後的 **R1** | `N_CR` = 1~8 bytes | 固定讀 8 次，無 timeout（上限明確） |
 | 讀取的 **start token** | `N_AC`，卡相關、可達數十 ms | `SD_READ_TIMEOUT_MS` = 200ms + yield |
 | 寫入後的 **busy** | 卡相關，block erase 可達數百 ms | `SD_WRITE_TIMEOUT_MS` = 1000ms + yield |
@@ -335,7 +342,7 @@ Flash 才放行。檢查不過就不啟動 DMA、回 `-1`，SD 寫入因此走�
 |---|---|
 | `disk_status` | 回 `s_stat`（`STA_NOINIT` 旗標） |
 | `disk_initialize` | 呼叫 `sd_init()`，成功則清 `STA_NOINIT`；回傳碼存進 `sd_last_init_rc` 供診斷 |
-| `disk_read` / `disk_write` | **for 迴圈逐 sector** 呼叫 `sd_read_block` / `sd_write_block` |
+| `disk_read` / `disk_write` | **for 迴圈逐 sector** 呼叫 `sd_read_block` / `sd_write_block`；`disk_write` 每個 sector 失敗後最多再重試 3 次（§10.4） |
 | `disk_ioctl` | **只實作 `CTRL_SYNC`，且是空操作** |
 | `get_fattime` | 固定值（`FF_FS_NORTC == 1` 時其實不會被呼叫） |
 
@@ -382,15 +389,15 @@ sd_write_block 的 5 個失敗點
 | **init** | `sd_last_init_rc`、`sd_last_r1`、`sd_last_cmd55_r1`、`sd_card_type`、`sd_r7`、`sd_ocr` —— 開機報告與 OLED 都印 |
 | **I/O** | `sd_last_io_err`（`SD_IO_*`）、`sd_last_io_byte`（當時的 R1/token/resp）、`sd_last_io_blk` |
 
-`status` 多一行（只在 `err_count != 0` 時印，否則快照無意義）：
+`status` 的 `[sd card]` 區多一行（只在 `write err` 或 `retry` 非 0 時印，否則快照無意義）：
 
 ```
-  sd io err  wr busy timeout (byte 0x00, block 32768)
+  last err  wr busy timeout  byte 0x00  block 32768
 ```
 
 三個設計細節：
 
-1. **成功時刻意不清掉。** 失敗後通常還有成千上萬次成功寫入，清掉就查不到了。要判斷快照是否有效，看 `err_count`。
+1. **成功時刻意不清掉。** 失敗後通常還有成千上萬次成功寫入，清掉就查不到了。要判斷快照是否有效，看 `err_count` 和 `sd_write_retries`（重試成功時只有後者會動，見 §10.5）。
 2. **寫入順序是 byte/blk 先、err 最後。** 這樣 CLI 看到 `err != 0` 時，另兩個欄位一定已經更新完。
 3. **`spi1_send_buffer()` 的兩種失敗用 `dma_mem_ok()` 回頭分類。** 它對「位址被擋」和「DMA 逾時」都回 `-1`，但一個要改程式、一個要查硬體，壓成同一碼等於丟掉最有用的線索。
 
@@ -400,7 +407,304 @@ sd_write_block 的 5 個失敗點
 
 ---
 
-## 10. 已知限制與取捨（誠實清單）
+## 10. 實戰案例：寫入卡死的偵測、吸收與恢復
+
+> 一次實際踩到的故障，從症狀一路推回根因，再設計成三層防線。
+> 前面各章講「driver 怎麼運作」，這章講「它壞掉時怎麼辦」。
+
+### 10.1 症狀
+
+錄製途中 OLED 從 `* REC` 變成 `!ERR 1`，計數停住。CLI 的 `status`：
+
+```
+  write err 1
+  sd retries3
+  sd io err not ready before cmd (byte 0x00, block 16384)
+  chip      31.0 C  (VDDA 2.78 V)
+```
+
+（這是改版前的 status 格式，兩個顯示 bug 也在裡面，見 §10.5。）
+
+`!ERR 1` 的 `1` 是 FatFs 的 FRESULT = `FR_DISK_ERR`，代表 `disk_write` 回了 `RES_ERROR`。
+手動 `stop` 再 `start` 之後恢復正常。
+
+### 10.2 判讀：從 status 推回根因
+
+每一行都是一條線索，合起來只有一個解釋：
+
+| 線索 | 代表什麼 |
+|---|---|
+| `retries 3`、`write err 1` | 同一個 sector 試了 4 次（1 次 + 重試 3 次）全失敗，才往上回報 |
+| `not ready before cmd`、`byte 0x00` | 最後一次嘗試在**送命令前**等了 1s，卡始終把 MISO 拉低 = 仍在 busy |
+| 兩者合起來 | 第 1 次 busy 逾時 1s + 後 3 次各等 ready 1s → 卡**連續 busy 至少 4 秒** |
+| `VDDA 2.78 V` | 3.3V 電源只剩 2.78V，SD 卡規格下限是 2.7V |
+| `stop` → `start` 就好 | 卡本身沒壞，從 CMD0 重新初始化即可恢復 |
+
+結論：**供電邊界下，卡寫 flash 的瞬間電流把電壓拉到下限以下，卡的控制器卡死在 busy。**
+SDHC/SDXC 規格的寫入 busy 上限是 500ms，4 秒不是「卡比較慢」，是「卡已經不會自己回來」。
+
+**VDDA 這個數字可信嗎？** `tempsensor_vdda()` 不是用 VREFINT 的 typ 值（1.21V，實際分佈
+1.18~1.24V，誤差 ±80mV）硬算，而是用 ST 出廠時在 VDDA = 3.3V 下量好、燒在
+`0x1FFF7A2A` 的 `VREFINT_CAL`，誤差約幾十 mV，足以判斷「是不是掉到 2.7V 附近」。
+但它量的是 **MCU 的 VDDA**；SD 模組若經過自己的 LDO（如 AMS1117）供電，實際電壓
+只會更低，要用電表在模組 VCC 腳確認。過去也在 2.74V 下踩過 `f_close` 寫不回 FAT
+（見 `app_datalogger_stop()` 的註解），同一個根因。
+
+### 10.3 為什麼一次失敗就毀掉整個 session
+
+根因在硬體，但軟體讓代價被放大了：
+
+```
+sd_write_block 失敗一次
+  → disk_write 回 RES_ERROR
+  → FatFs ABORT：把 FR_DISK_ERR 鎖進 fp->err
+  → 之後每一次 f_write 都在函式開頭直接返回，連卡都不碰
+  → logger 進 DL_ERROR，sensor 停止取樣
+  → 只能等人來 stop / start
+```
+
+`fp->err` 是黏住的，沒有「下一次就好了」這回事。所以設計目標是：
+**能吸收的錯誤不要讓它到達 FatFs；吸收不了的，自動恢復而不是等人。**
+
+### 10.4 設計：三層，各擋一種失敗
+
+失敗按嚴重度分成三種，每一層只處理自己那一種，處理不了才往上交：
+
+| 層 | 擋什麼 | 機制 | 位置 |
+|---|---|---|---|
+| ① driver | 上一筆還沒寫完就送下一個命令 | 每筆讀寫前先等卡 ready | `device_sdcard.c` `sd_wait_ready()` |
+| ② diskio | 偶發的單次失敗（busy 稍長、雜訊吃掉 response） | 同一個 sector 最多再寫 3 次 | `diskio.c` `disk_write()` |
+| ③ app | 卡真的卡死，重試救不回來 | 重置卡、收拾舊檔、開新檔、接著錄 | `app_datalogger.c` `app_datalogger_recover()` |
+
+#### ① driver 層：命令前先等 ready
+
+**這層不做，② 的重試幾乎必定失敗。** 原因是一個很隱蔽的誤判：
+
+```
+上一筆在 busy 階段逾時放棄 → 卡其實還在寫 flash，MISO = 0x00
+→ 重試直接送 CMD24
+→ sd_cmd_frame() 等 R1 的條件是「MSB = 0」，0x00 符合
+→ 把 busy 訊號誤認成 R1 = 0x00（命令接受）
+→ 送出 512B 資料，卡根本沒在聽
+→ data response 讀到 0x00，(0x00 & 0x1F) != 0x05 → 失敗
+```
+
+所以 `sd_read_block` / `sd_write_block` 在 CS 拉低後、送命令前先呼叫：
+
+```c
+static uint8_t sd_wait_ready(uint32_t timeout_ms)
+{
+    uint32_t start = systick_get_ms();
+    uint32_t spins = 0;
+    uint8_t  b;
+    while ((b = spi1_transfer_byte(0xFF)) != 0xFF) {    /* 0xFF = 卡放開 DO */
+        if (systick_get_ms() - start > timeout_ms) {
+            break;
+        }
+        if (++spins > SD_SPIN_BEFORE_YIELD) {
+            spi1_poll_yield();                          /* 跟 §6 同一套混合式等待 */
+        }
+    }
+    return b;                                           /* 0xFF = ready */
+}
+```
+
+| 決策 | 理由 |
+|---|---|
+| 逾時 `SD_READY_TIMEOUT_MS` = `SD_WRITE_TIMEOUT_MS`（1s） | 等的就是「上一筆寫入的 busy」，同一個上限 |
+| 回傳最後讀到的 byte 而不是 0/-1 | 逾時時把它存進快照（`SD_IO_NOT_READY`，byte = 那個值），`0x00` = busy 卡住、其他值 = 線路異常 |
+| **init 的命令不走這裡** | CMD0 之前卡的狀態未知，那段有自己的 10 次重試（§2）|
+| 正常路徑成本 | 卡早就 ready，第一個 byte 就是 `0xFF`，每筆讀寫只多約 3µs |
+
+ChaN 的 FatFs 範例 driver 也是在每個命令前 `wait_ready`，只對 CMD12 例外
+（CMD12 中止多 block 讀取時卡還在吐資料）；本 driver 沒有多 block，不涉及。
+
+#### ② diskio 層：重試
+
+```c
+#define DISK_WRITE_RETRIES  3       /* 每個 sector 失敗後再試幾次（不含第一次）*/
+
+uint8_t rc = sd_write_block(blk, src);
+for (int r = 0; rc != SD_OK && r < DISK_WRITE_RETRIES; r++) {
+    if (sd_last_io_err == SD_IO_WR_DMA_MEM) {
+        break;                      /* buffer 在 CCM 是程式錯誤，重試也一樣 */
+    }
+    sd_write_retries++;
+    rc = sd_write_block(blk, src);
+}
+```
+
+| 問題 | 回答 |
+|---|---|
+| 重寫安全嗎？ | 安全。全是單 block CMD24，同一個 block 寫同樣的資料是冪等的。**若改成多 block（CMD25），中途失敗要先送 Stop Tran token `0xFD` 讓卡離開接收狀態，不能直接重試** |
+| 哪些不重試？ | `SD_IO_WR_DMA_MEM`（buffer 在 CCM）—— 重試幾次結果都一樣。判斷直接讀 `sd_last_io_err`：它只在失敗時寫入，剛失敗時讀到的一定是這次的原因 |
+| 重試之間要 delay 嗎？ | 不用。下一次 `sd_write_block` 開頭的 ①會等卡 ready，等待時間由卡決定，不是猜一個數字 |
+| 代價？ | 最壞每次嘗試 = 等 ready 1s + 等 busy 1s，4 次約 8s，期間佔著 `spi1_lock`（OLED 停住）。只有卡真的卡死才會走到 |
+| 重試成功了，怎麼知道出過事？ | 累計 `sd_write_retries`，status 印出來（§10.5）。**被吸收的錯誤如果看不到，卡在邊緣時就毫無預警** |
+
+計數器放在 `device_sdcard.c` 而不是 `diskio.c`：CLI 刻意不 include `ff.h`，而
+`sd_last_init_rc` 已經是「driver 定義、diskio 設定」的先例。
+
+#### ③ app 層：自動恢復
+
+**觸發**：Logger task 看到 `DL_ERROR` 後先等 1 秒（讓電源和卡喘口氣），之後每秒呼叫
+一次 `app_datalogger_recover()`，直到成功或使用者 stop。
+
+```
+recover()                                     （整段持有 spi1_lock）
+  │
+  ├─ state 已不是 DL_ERROR？ → 返回（別人恢復了，或使用者 stop 了）
+  │
+  ├─ dl_salvage_locked()：收拾舊檔
+  │     disk_initialize()  ← 只重置卡（CMD0 起），volume 不動
+  │       ├─ 卡沒起來 → 舊檔留著，回 -1，下一秒再試
+  │       └─ 卡起來了 → f_close(&s_fil)
+  │             ├─ 成功：舊檔救到失敗前最後一筆
+  │             └─ 失敗：f_mount(NULL) 卸載，丟掉可能不一致的快取
+  │
+  ├─ volume 被卸載過？ → f_mount(&s_fs, "", 1) 重新掛載
+  ├─ 開新檔 log_NNN+1.csv、寫表頭
+  └─ state → DL_LOGGING，s_recover_count++，喚醒 sensor
+```
+
+**關鍵決策：重置卡用 `disk_initialize()`，不用 `f_mount()`。**
+
+直覺做法是 `f_close` → `f_mount(NULL)` → `f_mount(&fs)`，但卡卡死時 `f_close` 必定失敗，
+接著 `f_mount` 一換掉 volume，`s_fil` 就失效 —— `fp->buf` 裡沒寫出去的那個 sector、
+檔案長度、FAT 鏈全部跟著丟，舊檔只剩上一次 `f_sync`（每秒一次）的內容。
+
+反過來，先直接呼叫 `disk_initialize()` 只重置卡、volume 原封不動，再 `f_close`：
+
+- `f_sync` **不看 `fp->err`**（只有 `f_read` / `f_write` 看，可在 `ff.c` 的 `f_sync` 確認），
+  它只透過 `validate()` 檢查 volume 有效且 `disk_status()` 沒有 `STA_NOINIT`。
+- FatFs 在寫入失敗時**保留 dirty 旗標**（`FA_DIRTY`、`fs->wflag` 都只在成功後才清），
+  所以卡恢復後，`f_close` 會把失敗的那個 sector、FAT、目錄項依序重寫一遍。
+- 結果：舊檔救到失敗前最後一筆。代價是最後一行可能只寫了半行（`f_printf` 的輸出
+  跨 sector 時，前半段已經進了 buffer）。
+
+`diskio.c` 的 `disk_initialize()` 每次都真的重跑 `sd_init()`（沒有「初始化過就跳過」的
+static 旗標），這是整個做法成立的前提。
+
+**為什麼開新檔，不接回舊檔？** 斷線期間的樣本本來就沒了（sensor 只在 `LOGGING` 時取樣），
+接回去也是一個有斷層的檔。新檔起點乾淨，而且不依賴舊檔的 FAT / 目錄項最後到底寫成功
+沒有。`t_ms` 用的是開機後的 systick，跨檔仍然連續，斷層從兩檔的頭尾一眼就看得出來。
+
+**併發：自動恢復、手動 start、手動 stop 可能同時發生。**
+
+| 情境 | 處理 |
+|---|---|
+| Logger 自動恢復，同時使用者按 start | `start()` 在 `DL_ERROR` 下直接呼叫 `recover()`。狀態**在 `spi1_lock` 內才檢查**，後到的那個看到已是 `LOGGING` 就返回，不會開兩個檔 |
+| 恢復開好新檔的同時使用者 stop | stop 先翻 `IDLE` 才等 `spi1_lock`，所以 recover 在鎖內看到 `IDLE` → 不翻回 `LOGGING`，**當場在鎖內**關掉新檔（放開鎖再關，可能誤關使用者接著 start 開的檔） |
+| stop 讀到 `DL_ERROR` 後、進鎖前，recover 剛好成功 | stop 用 `s_fil_orphan`（在鎖內才準）而不是進鎖前讀的 state 決定走哪條：沒有孤兒檔就正常 `f_sync` + `f_close` 新檔 |
+
+鎖序沿用 §8：`spi1_lock` 在外、`s_state_mtx` 在內。
+
+**`DL_ERROR` 下的 stop 也改了。** 原本直接 `f_sync` + `f_close`，但卡多半還卡著，每個 sector
+都要走滿 ② 的重試，stop 會停十幾秒。現在 stop 也走 `dl_salvage_locked(give_up = 1)`：
+先重置卡，起得來就正常收尾，起不來就放棄舊檔、卸載 volume，立刻返回。
+
+### 10.5 可觀測性：status 重新分組
+
+舊的 status 十幾行平鋪，SD、I2C、logger 的計數混在一起，還有兩個顯示 bug：
+
+- `sd retries3`：標籤剛好 10 個字元，塞滿 `cli_label()` 的欄寬，數字黏上去
+- `byte 0x0x00`：`cli_print_hex8()` 自己會印 `0x`，呼叫端又多印一次
+
+改成四區，每區只回答一個問題：
+
+```
+[logger]                       ← 現在在不在錄、錄到哪
+  state     LOGGING
+  file      log_004.csv  (12345 samples)
+  overruns  0
+[sd card]                      ← 卡健不健康（由上往下嚴重度遞減）
+  mount     ok
+  write err 1
+  retry     3
+  recovered 1
+  last err  not ready before cmd  byte 0x00  block 16384
+[i2c]                          ← MPU6050 / INA219 那條匯流排
+  errors    nack 0  bus 0  timeout 0
+  recovery  0
+[chip]                         ← 晶片本身與供電
+  temp      31.0 C
+  VDDA      2.78 V  LOW (SD writes may hang)
+```
+
+`[sd card]` 區的讀法：
+
+| 行 | 非 0 代表 | 該做什麼 |
+|---|---|---|
+| `mount` 不是 ok | 卡沒掛上，降級模式 | 看 FRESULT：1/3 查供電接線、13 不是 FAT32 |
+| `write err` | 有樣本**真的沒寫進去** | 看 `last err` |
+| `retry` | 出過事但被 ② 吸收了 | 偶爾跳無妨；持續增加 = 卡在邊緣，查供電 |
+| `recovered` | 錄製中斷過、被 ③ 接回來 | CSV 分成多個檔，中間有斷層 |
+| `last err` | 最後一次失敗的現場（§9.5） | 對照下表 |
+
+`last err` 的判讀：
+
+| 顯示 | 意義 |
+|---|---|
+| `not ready before cmd`，byte `0x00` | 卡 busy 超過 1s 不放，幾乎都是供電（本案例） |
+| `wr CMD24 R1`，byte `0x01` / `0x05` | 卡退回 idle state，電源瞬斷，重試救不回來，要靠 ③ |
+| `wr resp rejected` / `wr busy timeout` | 寫入本身失敗，偶發是雜訊、連續是供電 |
+| `wr buf not DMA-able` | buffer 在 CCM，改程式（§8） |
+| `rd ...` | 讀取失敗，`disk_read` 沒有重試（§10.7） |
+
+`last err` 的顯示條件從「`err_count != 0`」改成「`err_count` 或 `retry` 非 0」：
+重試成功時 `err_count` 不會動，舊條件會把被吸收的錯誤現場藏起來。
+
+`VDDA` 低於 3.0V 標 `LOW`：規格下限 2.7V，加上寫入瞬間的壓降，實測 2.74V / 2.78V 都出過事，
+留 0.3V 餘裕。
+
+### 10.6 驗證方法
+
+困難在於：被改到的路徑正常情況下不會走到。所以分「沒改壞」和「真的會動」兩部分：
+
+**① 回歸**：正常錄 2~3 分鐘 → `retry 0`、`write err 0`、Peak CPU% 與改前相同（約 2.5%）、
+`dump` 出來 `t_ms` 每行間隔約 10ms 且行數等於 samples。重開機確認掛載正常（掛載階段每次
+讀取都會多走一次 ①）。
+
+**② 故障注入（測 ① + ②）**：不寫假錯誤，而是**暫時把寫入 busy 逾時調短**，讓真的 busy 逾時發生：
+
+```c
+#define SD_WRITE_TIMEOUT_MS   2      /* 測試用，原本 1000 */
+#define SD_READY_TIMEOUT_MS   1000   /* 跟寫入逾時拆開，維持 1s */
+```
+
+卡寫一個 block 的 program time 本來就 1~3ms，所以一部分寫入會在 busy 階段被放棄 ——
+正是本案例「放棄時卡還在寫」的情境。
+
+| 組別 | 預期 |
+|---|---|
+| 實驗組（① + ②） | `retry` 持續增加、`write err 0`、state 維持 `LOGGING`、`last err` = `wr busy timeout`、`dump` 無斷層 |
+| 對照組（註解掉 ①） | 很快 `write err`，`last err` 變成 `wr resp rejected` / `wr CMD24 R1` —— 0x00 被誤判成 R1 的證據 |
+
+實驗組過、對照組炸，就證明 ① 和 ② 缺一不可。測完務必把兩個巨集改回來。
+
+**③ 拔卡（測 ③）**：錄製中拔卡 → `!ERR` → 插回 → 1~2 秒內自動回到 `* REC`、計數從 0 開始、
+`recovered 1`、檔名跳號。`stop` 後 `ls` 舊檔大小非 0，`dump` 兩檔頭尾的 `t_ms` 差 ≈ 拔卡時間。
+另測「拔卡後不插回直接 stop」：應立刻返回 `FLUSH FAILED`，不卡住。拔卡測試已在板子上通過。
+
+### 10.7 沒解決的與取捨
+
+| 項目 | 說明 |
+|---|---|
+| **根因是供電，軟體只是止血** | 每次卡死仍會掉幾秒資料。正解是獨立 3.3V、SD 座旁加 10~100µF 電容、模組有 LDO 的接 5V |
+| **斷線期間不取樣** | sensor 只在 `LOGGING` 時取樣，`DL_ERROR` 到恢復之間的樣本不存在。要保住得在 RAM 做環形緩衝，代價是記憶體 |
+| **OLED 會凍住** | ② 最壞約 8s；③ 每次嘗試 `sd_init()` 的 ACMD41 最多 1.5s，都在 `spi1_lock` 內。卡健康時不發生。嫌久可把 `DISK_WRITE_RETRIES` 降到 1~2 |
+| **`disk_read` 沒有重試** | `f_write` 配置新 cluster 時會讀 FAT sector，讀失敗一樣鎖死 `fp->err`（由 ③ 兜底）。補法是同一套迴圈 |
+| **最後一行可能半行** | 救回的舊檔結尾可能是不完整的 CSV 行，解析端要容忍 |
+| **極少數情況留下只有表頭的檔** | 恢復與 stop 正好撞在同一瞬間時（§10.4 併發表第二列），無害 |
+
+> **面試可以講的點：** 這是「分層吸收失敗」的完整例子 —— 每層只處理自己看得懂的失敗，
+> 處理不了才往上交，而且每一層的吸收都留下計數，不讓問題被靜默藏起來。最值得講的是
+> ① 那個 bug：busy 的 `0x00` 跟 `R1 = 0x00` 在線上長得一模一樣，不先等 ready，重試
+> 反而會穩定失敗 —— 加一層防護之前，要先確認它的前提成立。
+
+---
+
+## 11. 已知限制與取捨（誠實清單）
 
 面試時主動講這些，比被問出來好。
 
@@ -410,12 +714,13 @@ sd_write_block 的 5 個失敗點
 | 2 | **CRC 全關** | 命令與資料都無完整性保護。假 start token（`0xFE` 與 idle `0xFF` 只差 1 bit）會讓 512B 雜訊被當資料收下，且**靜默** | 發 CMD59 開 CRC + 真的驗那兩個 CRC16 byte |
 | 3 | **讀取沒用 DMA** | 512 次 `transfer_byte` 迴圈佔 CPU，mount 階段最明顯 | full-duplex DMA（TX 餵 `0xFF`、RX 收 buffer） |
 | 4 | **`disk_ioctl` 只有 `CTRL_SYNC`** | `GET_SECTOR_COUNT` / `GET_SECTOR_SIZE` / `GET_BLOCK_SIZE` 都回 `RES_PARERR` -> **`f_mkfs()` 無法使用**，不能在裝置上格式化 | 補那三個 case（sector count 需讀 CSD -> CMD9） |
-| 5 | **busy 期間不放 `spi1_lock`** | OLED 可能凍住幾百 ms（§8） | 刻意取捨，不建議改 |
-| 6 | **沒有熱插拔偵測** | 抽卡後要靠讀寫失敗才發現 | CD 腳或定期 CMD13 探測 |
+| 5 | **busy 期間不放 `spi1_lock`** | OLED 可能凍住幾百 ms（§8）；卡死時 disk_write 重試最壞約 8s、每次自動恢復最多約 1.5s，期間 OLED 同樣停住（§10.7） | 刻意取捨，不建議改 |
+| 6 | **沒有熱插拔偵測** | 抽卡後要靠讀寫失敗才發現；插回後由 §10 的自動恢復接回，但中間的樣本會遺失 | CD 腳或定期 CMD13 探測 |
 | 7 | **沒讀 CSD/CID（CMD9/CMD10）** | 不知道卡容量、廠商、序號 | 開機報告想印容量的話需要補 |
 | 8 | **`SD_BAUD_FAST` 保守設在 2.6MHz** | 低於 SPI 模式上限（25MHz） | 麵包板的保守值；線路乾淨可改 BR=3（5.25MHz）起跳測 |
 | 9 | **data response token 單讀一個 byte** | 規格上它緊接資料封包，但若卡慢一個 byte，`0xFF & 0x1F != 0x05` 會誤判成寫入失敗（資料其實已寫入）。現在至少看得出來了：`status` 會顯示 `wr resp rejected (byte 0xFF)` | 加 8 次上限的掃 `0xFF` 迴圈，成本約 25us |
 | 10 | **寫入 buffer 不能在 CCM**（§8） | task 的 local 陣列丟進 `f_write`（>=512B）會被 `dma_mem_ok()` 擋下回 `-1`。目前 `FIL`/`FATFS` 都是 static 所以安全，但這是呼叫端要記住的約束 | 已有執行期檢查且走正規錯誤路徑；要徹底解決得在 driver 內部加一個主 SRAM 的 bounce buffer（代價是多 512B 與一次 memcpy） |
+| 11 | **`disk_read` 沒有重試** | 讀 FAT sector 偶發失敗一樣會鎖住 `fp->err`（§10.7） | 用 `disk_write` 同一套迴圈 |
 
 ### 文件待修
 
@@ -425,7 +730,7 @@ sd_write_block 的 5 個失敗點
 
 ---
 
-## 11. 可能被問的問題
+## 12. 可能被問的問題
 
 > 按「答得出來的收益」排序。
 
@@ -455,7 +760,7 @@ sd_write_block 的 5 個失敗點
 16. 錯誤碼往上層走會被壓扁，你怎麼處理？ -> 在最底層留快照而非改上層介面（§9.5）
 17. 為什麼 DMA 碰不到 CCM？你怎麼防？ -> CCM 只在 D-bus 不在 bus matrix；
     `dma_mem_ok()` 白名單檢查 + 回錯誤碼而非 assert（§8）
-18. 這個 driver 你會先改哪裡？ -> §10 的 #1（多 block，吞吐量）或 #2（CRC，可靠性），
+18. 這個 driver 你會先改哪裡？ -> §11 的 #1（多 block，吞吐量）或 #2（CRC，可靠性），
     視場景選一個並說出理由 —— **不要說「都要改」**
 
 ### 可能的延伸
@@ -463,3 +768,12 @@ sd_write_block 的 5 個失敗點
 19. 為什麼不用 SDIO 介面？ -> F407 有 SDIO，4-bit + 硬體 CRC + 高時鐘，吞吐量高一個量級；
     本專案選 SPI 是為了腳位彈性與 driver 可攜性，而 logger 的資料率（取樣級）遠低於瓶頸
 20. 多個裝置共用 SPI1 怎麼處理？ -> 軟體 CS + `spi1_lock` 互斥（§8）
+
+### 故障處理（§10）
+
+21. 寫入失敗為什麼會毀掉整個 session？ -> FatFs ABORT 把錯誤鎖進 `fp->err`（§10.3）
+22. 重試前為什麼一定要先等 ready？ -> busy 的 `0x00` 會被誤判成 `R1 = 0x00`（§10.4 ①）
+23. 重寫同一個 sector 安全嗎？換成多 block 呢？ -> 單 block 冪等；CMD25 要先送 `0xFD`（§10.4 ②）
+24. 恢復時為什麼用 `disk_initialize()` 而不是 `f_mount()`？ -> 保住 volume，`f_close` 才能把
+    dirty sector 寫回去；`f_sync` 不看 `fp->err`（§10.4 ③）
+25. 你怎麼驗證一條平常走不到的錯誤路徑？ -> 調短逾時做真實的故障注入 + 拿掉 ① 當對照組（§10.6）
