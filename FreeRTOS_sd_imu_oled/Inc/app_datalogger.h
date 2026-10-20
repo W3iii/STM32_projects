@@ -34,7 +34,11 @@ typedef enum {
  * CPU 用量完全正常，但一筆都沒寫進去 —— 實際踩過一次（供電不穩導致
  * SD 寫入逾時）。既然錯誤是鎖住的，第一次失敗就等於整個 session 作廢，
  * 所以直接翻到 DL_ERROR：Sensor 會停止取樣、Logger 不再嘗試寫入，
- * 使用者從 status / OLED 立刻看得到。 */
+ * 使用者從 status / OLED 立刻看得到。
+ *
+ * DL_ERROR 不是終點：Logger task 每秒呼叫 app_datalogger_recover()，
+ * 重置卡、收拾舊檔、開新檔 log_NNN+1.csv 後回到 DL_LOGGING。卡起不來
+ * 就留在 DL_ERROR 下一秒再試，直到使用者 stop。 */
 
 /* 狀態快照：給 Display / CLI status 一次取走，避免讀到半更新的欄位。 */
 typedef struct {
@@ -43,6 +47,7 @@ typedef struct {
     char       filename[16]; /* 目前/上一個檔名 */
     uint8_t    fres;         /* 失敗時的 FatFs FRESULT（fp->err）；0 = 沒錯 */
     uint32_t   err_count;    /* 累計寫入失敗次數（跨 session 不清）*/
+    uint32_t   recoveries;   /* 從 DL_ERROR 恢復成功的次數（跨 session 不清）*/
 } dl_status_t;
 
 /* 初始化：建立狀態 mutex、初始化 MPU6050 + 掛載 FAT32。
@@ -62,6 +67,12 @@ int app_datalogger_mounted(void);
 
 /* 開新檔 log_NNN.csv、寫表頭、進 LOGGING。回傳 0=OK / <0=失敗。 */
 int app_datalogger_start(void);
+
+/* 從 DL_ERROR 恢復：重置卡 → 舊檔 f_close（救到失敗前最後一筆）→ 開新檔
+ * → 回 DL_LOGGING 並喚醒 sensor。不在 DL_ERROR 時什麼都不做、回 0。
+ * Logger task 每秒自動呼叫；在 DL_ERROR 下 start 也走這條。
+ * 回傳 0=OK / -1=卡或掛載起不來（原因在 mount_result）/ -2=開檔失敗（原因在 fres）。 */
+int app_datalogger_recover(void);
 
 /* f_sync + f_close、回 IDLE。回傳 0。 */
 int app_datalogger_stop(void);

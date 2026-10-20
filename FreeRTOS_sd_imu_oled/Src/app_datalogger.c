@@ -23,6 +23,7 @@
 #include "app_datalogger.h"
 #include "bus_port.h"       /* spi1_lock（FatFs/SD）/ i2c1_lock（MPU6050 init）*/
 #include "ff.h"
+#include "diskio.h"     /* disk_initialize：只重置卡、不換掉 volume（見 dl_salvage_locked）*/
 #include "device_mpu6050.h"
 #include "FreeRTOS.h"
 #include "semphr.h"
@@ -39,6 +40,8 @@ static SemaphoreHandle_t s_state_mtx;   /* 保護 s_state / s_count / s_filename
 static uint8_t    s_fres;               /* 最後一次寫入失敗的 FatFs FRESULT */
 static uint32_t   s_err_count;          /* 累計寫入失敗次數 */
 static uint8_t    s_mount_retries;      /* 開機掛載重試了幾次（0 = 一次就過）*/
+static uint8_t    s_fil_orphan;         /* DL_ERROR 留下的舊檔還沒收拾（s_fil 仍掛在舊 volume）*/
+static uint32_t   s_recover_count;      /* DL_ERROR 自動/手動恢復成功次數（累計）*/
 
 static TaskHandle_t s_producer;         /* sensor task handle；start 成功時喚醒它 */
 
@@ -83,6 +86,62 @@ static FRESULT dl_make_filename(void)
     }
     /* 000..999 都被用了：沿用迴圈最後設定的 log_999.csv（會被覆蓋）*/
     return FR_OK;
+}
+
+/* 開新檔 + 寫表頭。呼叫端持有 spi1_lock。 */
+static FRESULT dl_open_new_locked(void)
+{
+    FRESULT fr = dl_make_filename();    /* 寫 s_filename（在 bus 內、稍後 state 內公布）*/
+    if (fr == FR_OK) {
+        fr = f_open(&s_fil, s_filename, FA_WRITE | FA_CREATE_ALWAYS);
+    }
+    if (fr == FR_OK) {
+        f_puts("t_ms,ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps,temp_c\n", &s_fil);
+    }
+    return fr;
+}
+
+/* 收拾 DL_ERROR 留下的舊檔。呼叫端持有 spi1_lock。
+ *
+ * 寫入失敗時卡多半只是卡住了（供電邊界下 busy 一直不放），從 CMD0 重新
+ * 初始化就會好 —— 實測 stop 再 start 就恢復。但重新初始化不能走 f_mount：
+ * volume 一換掉，s_fil 就失效，fp->buf 裡沒寫出去的那個 sector、檔案長度、
+ * FAT 鏈全部跟著丟，舊檔只剩上一次 f_sync 的內容。
+ *
+ * 所以直接呼叫 disk_initialize() 只重置卡，volume 原封不動，再 f_close。
+ * f_sync 不看 fp->err（只有 f_read/f_write 看），卡好了就會把 dirty sector、
+ * FAT、目錄項依序寫回去，舊檔救到失敗前最後一筆（最後一行可能只寫了半行）。
+ *
+ * give_up：卡還起不來時要不要放棄舊檔。自動恢復傳 0（留著下一秒再救），
+ * 使用者 stop 傳 1（stop 不能卡在一張死卡上）。
+ * 回傳 FR_OK = 收好了或本來就沒有舊檔；卡沒起來且 give_up = 0 時回
+ * FR_NOT_READY，s_fil_orphan 維持 1。 */
+static FRESULT dl_salvage_locked(int give_up)
+{
+    if (!s_fil_orphan) {
+        return FR_OK;
+    }
+    FRESULT fr;
+    if (disk_initialize(0) & STA_NOINIT) {
+        if (!give_up) {
+            return FR_NOT_READY;
+        }
+        fr = FR_NOT_READY;
+    } else {
+        fr = f_close(&s_fil);
+    }
+    s_fil_orphan = 0;
+
+    if (fr == FR_OK) {
+        s_mounted = 1;              /* 卡好了、volume 沒動過，直接可以開新檔 */
+    } else {
+        /* 救不回來：卸載 volume，讓 s_fil 跟 FatFs 的 FAT 快取一起作廢，
+         * 下次重新掛載，不帶著可能不一致的快取繼續寫。 */
+        f_mount(NULL, "", 0);
+        s_mounted   = 0;
+        s_mount_res = fr;           /* status 的 NOT MOUNTED 才印得出原因 */
+    }
+    return fr;
 }
 
 int app_datalogger_init(void)
@@ -135,6 +194,12 @@ int app_datalogger_mount_result(void)
 
 int app_datalogger_start(void)
 {
+    /* 從 DL_ERROR 直接 start：跟自動恢復走同一條路（先救舊檔再開新檔）。
+     * 不能先跑下面的 f_mount —— 那會換掉 volume，舊檔沒寫回去的部分就沒了。 */
+    if (app_datalogger_state() == DL_ERROR) {
+        return app_datalogger_recover();
+    }
+
     if (!s_mounted) {
         /* 開機那三次掛載失敗，不代表卡從此不能用 —— 供電邊界下卡往往只是
          * 慢了一步（FRESULT 3 = FR_NOT_READY）。但 s_mounted 以前是開機一鎚
@@ -162,29 +227,12 @@ int app_datalogger_start(void)
         return 0;                   /* 已在記錄 */
     }
 
-    /* 從 DL_ERROR 直接 start：上一個檔案還開著（write_sample 失敗時刻意不關，
-     * 把已寫入的部分留給 stop 收尾）。這裡要先把它關掉再開新檔，否則
-     * f_open 會蓋掉 s_fil，舊檔的 FAT/目錄項永遠寫不回去 —— 那一段資料就沒了。 */
-    if (app_datalogger_state() == DL_ERROR) {
-        spi1_lock();
-        f_close(&s_fil);            /* 已經壞掉了，f_close 的結果不必再看 */
-        spi1_unlock();
-        state_lock();
-        s_state = DL_IDLE;
-        state_unlock();
-    }
-
     int     rc = 0;
     FRESULT fr;
     spi1_lock();
-    fr = dl_make_filename();        /* 寫 s_filename（在 bus 內、稍後 state 內公布）*/
-    if (fr == FR_OK) {
-        fr = f_open(&s_fil, s_filename, FA_WRITE | FA_CREATE_ALWAYS);
-    }
+    fr = dl_open_new_locked();
     if (fr != FR_OK) {
         rc = -2;
-    } else {
-        f_puts("t_ms,ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps,temp_c\n", &s_fil);
     }
     spi1_unlock();
 
@@ -213,12 +261,73 @@ int app_datalogger_start(void)
     return 0;
 }
 
+int app_datalogger_recover(void)
+{
+    int     rc = 0;
+    FRESULT fr = FR_OK;
+
+    /* 整段持有 spi1_lock，並在鎖內才檢查狀態：自動恢復（Logger task）和
+     * CLI/按鈕的 start 可能同時進來，後到的會看到已經是 LOGGING 而直接返回。 */
+    spi1_lock();
+    if (app_datalogger_state() != DL_ERROR) {
+        spi1_unlock();
+        return 0;                   /* 已經被別人恢復，或使用者 stop 了 */
+    }
+
+    dl_salvage_locked(0);
+    if (s_fil_orphan) {
+        s_mount_res = FR_NOT_READY; /* 卡還起不來，舊檔留著下一秒再救 */
+        rc = -1;
+    } else {
+        if (!s_mounted) {           /* 舊檔救不回來時 volume 已卸載，重新掛載 */
+            s_mount_res = f_mount(&s_fs, "", 1);
+            s_mounted   = (s_mount_res == FR_OK);
+        }
+        if (!s_mounted) {
+            rc = -1;
+        } else {
+            fr = dl_open_new_locked();
+            if (fr != FR_OK) {
+                rc = -2;
+            }
+        }
+    }
+
+    /* 狀態在 spi1_lock 內決定（鎖序：spi1 在外、state 在內）。這段期間
+     * 使用者可能 stop 了（stop 先翻 IDLE 才等 spi1_lock）：那就不能翻回
+     * LOGGING，剛開的新檔也要當場關掉 —— 放開鎖再關的話，使用者接著
+     * start 開的檔會被誤關。留下一個只有表頭的檔，無害。 */
+    int resumed = 0;
+    state_lock();
+    if (rc == 0 && s_state == DL_ERROR) {
+        s_count = 0;
+        s_fres  = 0;
+        s_state = DL_LOGGING;
+        s_recover_count++;
+        resumed = 1;
+    } else if (rc == -2) {
+        s_fres = (uint8_t)fr;
+    }
+    state_unlock();
+    if (rc == 0 && !resumed) {
+        f_close(&s_fil);
+    }
+    spi1_unlock();
+
+    if (resumed && s_producer != NULL) {
+        /* DL_ERROR 時 sensor 已經退出取樣迴圈、回頂端睡了（跟 IDLE 一樣），
+         * 所以這個通知一定接得到。 */
+        xTaskNotifyGive(s_producer);
+    }
+    return rc;
+}
+
 int app_datalogger_stop(void)
 {
     dl_state_t st = app_datalogger_state();
 
-    /* DL_ERROR 也要能 stop：檔案還開著，要 f_close 把已寫入的部分
-     * 收尾到 FAT，否則整個 session 的資料都拿不回來。 */
+    /* DL_ERROR 也要能 stop：舊檔還沒收拾，要先重置卡再 f_close，把已寫入
+     * 的部分收尾到 FAT，否則整個 session 的資料都拿不回來（見 dl_salvage_locked）。 */
     if (st != DL_LOGGING && st != DL_ERROR) {
         return 0;
     }
@@ -232,14 +341,26 @@ int app_datalogger_stop(void)
      * 實測踩到：VDDA 掉到 2.74V 時 f_close 寫不回 FAT，檔案停在 0 B，CLI 卻
      * 回報成功 —— 使用者以為錄到了，實際上整個 session 都沒落地。
      * f_close 失敗時 FIL 的狀態已經不可信，一律把 state 留在 IDLE 不重試。 */
+    FRESULT fr;
     spi1_lock();
-    FRESULT fr  = f_sync(&s_fil);
-    FRESULT frc = f_close(&s_fil);
+    /* 看 s_fil_orphan 而不是 st：st 是進鎖前讀的，這中間自動恢復可能已經
+     * 開好新檔（那就該正常關新檔）；s_fil_orphan 在 spi1_lock 內才準。 */
+    if (s_fil_orphan) {
+        /* 不能直接 f_sync：卡多半還卡著，每個 sector 都要走滿 disk_write 的
+         * 重試，stop 會停十幾秒。先重置卡；起不來就放棄舊檔。 */
+        fr = dl_salvage_locked(1);
+    } else {
+        fr = f_sync(&s_fil);
+        FRESULT frc = f_close(&s_fil);
+        if (fr == FR_OK) {
+            fr = frc;
+        }
+        if (st == DL_ERROR && fr == FR_INVALID_OBJECT) {
+            fr = FR_OK;             /* 恢復時開新檔失敗：本來就沒有檔開著 */
+        }
+    }
     spi1_unlock();
 
-    if (fr == FR_OK) {
-        fr = frc;
-    }
     if (fr != FR_OK) {
         state_lock();
         s_fres = (uint8_t)fr;
@@ -315,18 +436,20 @@ int app_datalogger_write_sample(uint32_t t_ms,
             /* FatFs 已經把錯誤鎖進 s_fil.err，之後每次 f_write 都會在
              * 開頭直接返回。所以這次 session 到此為止，翻成 DL_ERROR：
              * Sensor 會停止取樣、Logger 不再嘗試寫，使用者看得到。
-             * 檔案先不關 —— 留給 stop 去 f_close，已寫進去的資料保住。
+             * 檔案先不關 —— 標成 s_fil_orphan，留給 recover（Logger task
+             * 每秒自動試）或 stop 先重置卡再 f_close，已寫進去的資料保住。
              *
              * s_mounted 也一併清掉：檔案層錯誤常常是卡片層退回 idle state
-             * 造成的（供電瞬斷、熱插拔），不能假設卡還在線。下次 start 會
-             * 因為 !s_mounted 真的重跑 f_mount(opt=1) → sd_init()，而不是
-             * 只清檔案狀態、對已經掉線的卡片視而不見。 */
+             * 造成的（供電瞬斷、熱插拔），不能假設卡還在線。recover 會從
+             * CMD0 重跑 sd_init()，而不是只清檔案狀態、對已經掉線的卡片
+             * 視而不見。 */
             state_lock();
             s_fres = (uint8_t)s_fil.err;
             s_err_count++;
             s_state = DL_ERROR;
             state_unlock();
-            s_mounted = 0;
+            s_mounted    = 0;
+            s_fil_orphan = 1;       /* 舊檔留給 recover / stop 收拾 */
         }
     }
     spi1_unlock();
@@ -347,7 +470,8 @@ void app_datalogger_sync(void)
             s_err_count++;
             s_state = DL_ERROR;
             state_unlock();
-            s_mounted = 0;
+            s_mounted    = 0;
+            s_fil_orphan = 1;       /* 舊檔留給 recover / stop 收拾 */
         }
     }
     spi1_unlock();
@@ -360,6 +484,7 @@ void app_datalogger_get_status(dl_status_t *out)
     out->count = s_count;
     out->fres      = s_fres;
     out->err_count = s_err_count;
+    out->recoveries = s_recover_count;
     for (int i = 0; i < (int)sizeof(s_filename); i++) {
         out->filename[i] = s_filename[i];
     }

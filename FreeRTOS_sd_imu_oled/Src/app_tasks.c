@@ -55,6 +55,7 @@
 #define SENSOR_PERIOD_MS     10          /* 100Hz */
 #define DISPLAY_PERIOD_MS    100         /* ~10Hz；也是 CPU 統計的取樣節拍，見下方 static_assert */
 #define LOGGER_SYNC_MS       1000        /* 每秒 f_sync */
+#define LOGGER_RECOVER_MS    1000        /* DL_ERROR 時每秒試一次自動恢復 */
 #define BTN_DEBOUNCE_MS      20          /* EXTI 喚醒後等接點沉澱，再重讀電位確認 */
 
 /* 連續幾次 I2C 讀取失敗才觸發 bus recovery。偶發一次（雜訊、暫時性 NACK）
@@ -309,7 +310,9 @@ static void sensor_task(void *arg)
 static void logger_task(void *arg)
 {
     (void)arg;
-    TickType_t last_sync = xTaskGetTickCount();
+    TickType_t last_sync    = xTaskGetTickCount();
+    TickType_t last_recover = 0;
+    int        in_error     = 0;
     for (;;) {
         imu_sample_t s;
         /* 等樣本；timeout 讓我們也能定期 sync、不會永遠卡住 */
@@ -320,6 +323,25 @@ static void logger_task(void *arg)
         if ((xTaskGetTickCount() - last_sync) >= pdMS_TO_TICKS(LOGGER_SYNC_MS)) {
             last_sync = xTaskGetTickCount();
             app_datalogger_sync();          /* 內部只在 LOGGING 時做事 */
+        }
+
+        /* 自動恢復：寫入失敗多半是卡在供電邊界下卡住，從 CMD0 重新初始化就
+         * 會好（實測 stop 再 start 就恢復），不必等人來按。剛進 DL_ERROR 先
+         * 等一個週期再試，讓電源和卡喘口氣；失敗就每秒再試，取樣在恢復前
+         * 是停的（sensor 只在 LOGGING 時取樣）。
+         * DL_ERROR 時佇列是空的，上面的 xQueueReceive 每 100ms 就逾時一次，
+         * 所以這裡的檢查頻率夠。 */
+        if (app_datalogger_state() == DL_ERROR) {
+            TickType_t now = xTaskGetTickCount();
+            if (!in_error) {
+                in_error     = 1;
+                last_recover = now;
+            } else if ((now - last_recover) >= pdMS_TO_TICKS(LOGGER_RECOVER_MS)) {
+                last_recover = now;
+                app_datalogger_recover();
+            }
+        } else {
+            in_error = 0;
         }
     }
 }
