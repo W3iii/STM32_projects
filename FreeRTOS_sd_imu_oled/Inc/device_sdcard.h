@@ -52,6 +52,7 @@
 #define SD_IO_WR_DMA_TMO   6   /* DMA/SPI 傳輸逾時                        */
 #define SD_IO_WR_RESP      7   /* data response 被拒（byte = 該 resp）    */
 #define SD_IO_WR_BUSY_TMO  8   /* 等 busy 結束逾時（SD_WRITE_TIMEOUT_MS） */
+#define SD_IO_NOT_READY    9   /* 送命令前等卡 ready 逾時（byte = 最後讀到的值）*/
 
 /* debug 用全域（數值意義見 .c） */
 extern volatile uint8_t sd_last_r1;       /* 最後一次命令的原始 R1     */
@@ -67,6 +68,12 @@ extern volatile uint8_t sd_ocr[4];      /* CMD58 讀回的 OCR        */
 extern volatile uint8_t  sd_last_io_err;   /* SD_IO_*                      */
 extern volatile uint8_t  sd_last_io_byte;  /* 當時讀到的 R1 / token / resp */
 extern volatile uint32_t sd_last_io_blk;   /* 出事的 block 號              */
+
+/* diskio 的 disk_write 重試了幾次（累計，不清）。由 diskio 累加，跟
+ * sd_last_init_rc 一樣放在這裡，CLI 才不必 include ff.h。
+ * 重試成功時 err_count 不會動，所以這個值非 0 而 err_count == 0，代表
+ * 「有出過事但被吸收了」—— 那份 sd_last_io_* 快照這時也有意義。 */
+extern volatile uint32_t sd_write_retries;
 
 /* SD_IO_* 的短字串（給 CLI 印）。未知值回 "?"。 */
 const char *sd_io_err_str(uint8_t code);

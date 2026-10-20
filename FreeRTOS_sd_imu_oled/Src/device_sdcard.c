@@ -51,6 +51,10 @@
 #define SD_READ_TIMEOUT_MS    200
 #define SD_WRITE_TIMEOUT_MS   1000
 
+/* 送讀寫命令前等卡 ready 的逾時。等的是「上一筆寫入還沒 program 完」，
+ * 所以跟寫入 busy 用同一個上限。 */
+#define SD_READY_TIMEOUT_MS   SD_WRITE_TIMEOUT_MS
+
 /* 「等卡」的迴圈先忙等幾次，之後才改成 spi1_poll_yield()。
  *
  * 64 次 × 3.1µs @2.6MHz ≈ 200µs。卡在正常狀況下就在這個範圍內回應
@@ -96,6 +100,7 @@ volatile uint8_t sd_ocr[4] = { 0 };
 volatile uint8_t  sd_last_io_err  = SD_IO_OK;
 volatile uint8_t  sd_last_io_byte = 0;
 volatile uint32_t sd_last_io_blk  = 0;
+volatile uint32_t sd_write_retries = 0;
 
 /* 記一次 I/O 失敗。寫入順序刻意把 err 放最後：先備好 byte/blk，最後才讓
  * err 變成非 0，這樣 CLI 看到 err != 0 時另外兩個欄位一定已經是對的。 */
@@ -118,6 +123,7 @@ const char *sd_io_err_str(uint8_t code)
         case SD_IO_WR_DMA_TMO:   return "wr DMA timeout";
         case SD_IO_WR_RESP:      return "wr resp rejected";
         case SD_IO_WR_BUSY_TMO:  return "wr busy timeout";
+        case SD_IO_NOT_READY:    return "not ready before cmd";
         default:                 return "?";
     }
 }
@@ -148,6 +154,32 @@ static void sd_deselect(void)
 {
     SD_CS_HIGH();
     spi1_transfer_byte(0xFF);
+}
+
+/* 等卡放開 DO（讀到 0xFF）。CS 要已經拉低。回傳最後讀到的 byte：0xFF = ready。
+ *
+ * 為什麼每筆讀寫前都要等：上一筆寫入如果在 busy 階段逾時放棄，卡其實還在
+ * 寫 flash，MISO 被拉低回 0x00。這時直接送命令，sd_cmd_frame 會把那個 0x00
+ * 當成 R1 = 0（「命令接受」），接著送出去的資料卡根本沒在聽 —— disk_write
+ * 的重試會一路撞牆。先等卡閒下來，重試才有意義。ChaN 的範例 driver 也是在
+ * 每個命令前 wait_ready。
+ *
+ * init 的命令（sd_send_cmd）不走這裡：CMD0 之前卡的狀態未知，那段有自己的
+ * 重試。正常情況下卡早就 ready，第一個 byte 就是 0xFF，只多付約 3µs。 */
+static uint8_t sd_wait_ready(uint32_t timeout_ms)
+{
+    uint32_t start = systick_get_ms();
+    uint32_t spins = 0;
+    uint8_t  b;
+    while ((b = spi1_transfer_byte(0xFF)) != 0xFF) {
+        if (systick_get_ms() - start > timeout_ms) {
+            break;
+        }
+        if (++spins > SD_SPIN_BEFORE_YIELD) {
+            spi1_poll_yield();
+        }
+    }
+    return b;
 }
 
 /* 送一個命令 frame（6 byte）+ 讀 R1。不碰 CS —— 由呼叫者自己管。
@@ -330,6 +362,13 @@ uint8_t sd_read_block(uint32_t block, uint8_t *buf)
 {
     SD_CS_LOW();
 
+    uint8_t rdy = sd_wait_ready(SD_READY_TIMEOUT_MS);
+    if (rdy != 0xFF) {
+        sd_io_fail(SD_IO_NOT_READY, rdy, block);
+        sd_deselect();
+        return SD_ERR_READ;
+    }
+
     /* CMD17 (READ_SINGLE_BLOCK)，CRC 被忽略送 0x01 */
     uint8_t r1 = sd_cmd_frame(17, sd_block_to_addr(block), 0x01);
     if (r1 != 0x00) {
@@ -378,6 +417,13 @@ uint8_t sd_read_block(uint32_t block, uint8_t *buf)
 uint8_t sd_write_block(uint32_t block, const uint8_t *buf)
 {
     SD_CS_LOW();
+
+    uint8_t rdy = sd_wait_ready(SD_READY_TIMEOUT_MS);
+    if (rdy != 0xFF) {
+        sd_io_fail(SD_IO_NOT_READY, rdy, block);
+        sd_deselect();
+        return SD_ERR_WRITE;
+    }
 
     /* CMD24 (WRITE_SINGLE_BLOCK) */
     uint8_t r1 = sd_cmd_frame(24, sd_block_to_addr(block), 0x01);

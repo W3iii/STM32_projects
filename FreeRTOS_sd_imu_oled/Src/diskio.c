@@ -18,6 +18,17 @@
 
 #define DEV_SD   0       /* 只有一個磁碟：SD 卡 = pdrv 0 */
 
+/* disk_write 每個 block 失敗後再重試幾次（不含第一次）。
+ *
+ * 一次 RES_ERROR 會被 FatFs 鎖進 fp->err，整個 session 從此寫不進去，
+ * 代價太大；而偶發的 busy 逾時 / data response 被雜訊吃掉，再寫一次
+ * 通常就過了。全是單 block CMD24，同一個 block 寫同樣的資料，重寫安全。
+ * 重試前 sd_write_block 會先 wait_ready，不會撞上還在 program 的卡。
+ *
+ * 最壞情況：每次嘗試 = 等 ready 1s + 等 busy 1s，4 次約 8s，期間佔著
+ * spi1_lock（OLED 會停住）。卡真的死了才會走到這麼久。 */
+#define DISK_WRITE_RETRIES  3
+
 /* 目前磁碟狀態。FatFs 靠 STA_NOINIT 判斷有沒有初始化過。 */
 static volatile DSTATUS s_stat = STA_NOINIT;
 
@@ -72,7 +83,19 @@ DRESULT disk_write(BYTE pdrv, const BYTE *buff, LBA_t sector, UINT count)
         return RES_NOTRDY;
     }
     for (UINT i = 0; i < count; i++) {
-        if (sd_write_block((uint32_t)sector + i, buff + i * SD_BLOCK_SIZE) != SD_OK) {
+        uint32_t    blk = (uint32_t)sector + i;
+        const BYTE *src = buff + i * SD_BLOCK_SIZE;
+        uint8_t     rc  = sd_write_block(blk, src);
+
+        for (int r = 0; rc != SD_OK && r < DISK_WRITE_RETRIES; r++) {
+            /* buffer 在 CCM 是程式錯誤，重試幾次結果都一樣 */
+            if (sd_last_io_err == SD_IO_WR_DMA_MEM) {
+                break;
+            }
+            sd_write_retries++;
+            rc = sd_write_block(blk, src);
+        }
+        if (rc != SD_OK) {
             return RES_ERROR;
         }
     }
