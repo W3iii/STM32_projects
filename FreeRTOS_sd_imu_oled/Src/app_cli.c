@@ -127,6 +127,19 @@ static void cli_label(const char *name)
     cli_field(name, 10);
 }
 
+/* status 的分組標題。以前十幾行平鋪，SD 和 I2C 的計數混在一起，要找
+ * 「SD 出過什麼事」得一行一行對；分組之後每區只回答一個問題。 */
+static void cli_section(const char *name)
+{
+    usart1_send_string("[");
+    usart1_send_string(name);
+    usart1_send_string("]\r\n");
+}
+
+/* VDDA 低於這個值就在 status 標 LOW。SD 卡規格下限 2.7V，寫 flash 的瞬間
+ * 電流會再往下拉；實測 2.74V / 2.78V 都出過寫入卡死，留 0.3V 餘裕。 */
+#define CLI_VDDA_LOW_V   3.0f
+
 static void cli_status(int argc, char **argv)
 {
     (void)argc;
@@ -134,77 +147,88 @@ static void cli_status(int argc, char **argv)
     dl_status_t st;
     app_datalogger_get_status(&st);     /* 一次取走快照（mState 保護）*/
 
-    /* SD 沒掛上時系統會進降級模式：CLI/OLED/i2cscan 都還在，只是 start 會失敗。
-     * 這一行要放最前面 —— 掛載失敗時它才是你第一個該看到的東西。 */
-    if (!app_datalogger_mounted()) {
-        cli_label("SD");
-        usart1_send_string("NOT MOUNTED (logging disabled, FRESULT ");
-        cli_print_u32((uint32_t)app_datalogger_mount_result());
-        usart1_send_string(")\r\n");
-    } else if (app_datalogger_mount_retries() > 0) {
-        cli_label("SD");
-        usart1_send_string("mounted after ");
-        cli_print_u32((uint32_t)app_datalogger_mount_retries());
-        usart1_send_string(" retry (power margin?)\r\n");
-    }
-
+    /* ── logger：現在在不在錄、錄到哪 ── */
+    cli_section("logger");
     cli_label("state");
     usart1_send_string(st.state == DL_LOGGING ? "LOGGING\r\n"
-                     : st.state == DL_ERROR   ? "ERROR (write failed)\r\n"
+                     : st.state == DL_ERROR   ? "ERROR (write failed, auto-recovering)\r\n"
                                               : "IDLE\r\n");
     if (st.state == DL_LOGGING || st.state == DL_ERROR) {
         cli_label("file");
         usart1_send_string(st.filename);
-        usart1_send_string("\r\n");
-        cli_label("samples");
+        usart1_send_string("  (");
         cli_print_u32(st.count);
-        usart1_send_string("\r\n");
+        usart1_send_string(" samples)\r\n");
+    }
+    cli_label("overruns");
+    cli_print_u32(app_tasks_overruns());    /* Sensor 因佇列滿丟棄數，理想 0 */
+    usart1_send_string("\r\n");
+
+    /* ── sd card：掛載、錯誤、被吸收的錯誤、恢復 ──
+     * 由上往下是嚴重度遞減的順序讀：mount 不過什麼都別談；write err 是
+     * 真的丟了資料；retry 是出過事但被吸收；recovered 是中斷後接回來。 */
+    cli_section("sd card");
+    cli_label("mount");
+    if (!app_datalogger_mounted() && st.state != DL_ERROR) {
+        /* 降級模式：CLI/OLED/i2cscan 都還在，只是 start 會失敗。
+         * DL_ERROR 時 s_mounted 也是 0，但那是恢復流程中的暫態，不算。 */
+        usart1_send_string("NOT MOUNTED (FRESULT ");
+        cli_print_u32((uint32_t)app_datalogger_mount_result());
+        usart1_send_string(") - logging disabled\r\n");
+    } else if (app_datalogger_mount_retries() > 0) {
+        usart1_send_string("ok after ");
+        cli_print_u32((uint32_t)app_datalogger_mount_retries());
+        usart1_send_string(" retry (power margin?)\r\n");
+    } else {
+        usart1_send_string("ok\r\n");
     }
 
-    /* 寫入錯誤。非 0 就代表有樣本沒被寫進卡片 —— 以前這件事完全沒有出口，
-     * state 停在 LOGGING、計數不動，看起來像「還在錄」。
+    /* 寫入錯誤。非 0 就代表有樣本沒被寫進卡片。
      * fres 是 FatFs 的 FRESULT（1=FR_DISK_ERR、2=FR_INT_ERR、9=FR_INVALID_OBJECT…），
-     * FR_DISK_ERR 多半是供電/接觸不良，或卡片忙碌超過 SD_WRITE_TIMEOUT_MS。 */
+     * FR_DISK_ERR 多半是供電/接觸不良。恢復成功時 fres 會清掉，err 累計保留。 */
     cli_label("write err");
     cli_print_u32(st.err_count);
     if (st.fres != 0) {
-        usart1_send_string(" (FRESULT ");
+        usart1_send_string("  (FRESULT ");
         cli_print_u32(st.fres);
         usart1_send_string(")");
     }
     usart1_send_string("\r\n");
 
-    /* FRESULT 只告訴你「磁碟錯了」，分不出是卡被拔掉、供電不穩、buffer 誤放
-     * CCM 還是線路雜訊 —— 這四種的處理方式完全不同。driver 層在失敗當下留了
-     * 現場（device_sdcard.h 的 SD_IO_*），這裡把它攤開。
-     * 只在真的失敗過才印：err_count == 0 時那份快照沒有意義。 */
-    if (st.err_count != 0 && sd_last_io_err != SD_IO_OK) {
-        cli_label("sd io err");
+    /* disk_write 重試成功不會動 err_count —— 沒有這行，被吸收掉的偶發錯誤
+     * 永遠看不到，卡在邊緣也毫無預警。 */
+    cli_label("retry");
+    cli_print_u32(sd_write_retries);
+    usart1_send_string("\r\n");
+
+    /* 自動恢復成功的次數：非 0 代表錄製中斷過、被接回來了，CSV 會分成好幾個
+     * log_NNN.csv，中間缺一段（t_ms 跳號）。 */
+    cli_label("recovered");
+    cli_print_u32(st.recoveries);
+    usart1_send_string("\r\n");
+
+    /* FRESULT 只說「磁碟錯了」，分不出卡被拔、供電不穩、buffer 誤放 CCM 還是
+     * 線路雜訊。driver 在失敗當下留了現場（device_sdcard.h 的 SD_IO_*）。
+     * err 和 retry 都是 0 時那份快照沒有意義，不印。 */
+    if ((st.err_count != 0 || sd_write_retries != 0) && sd_last_io_err != SD_IO_OK) {
+        cli_label("last err");
         usart1_send_string(sd_io_err_str(sd_last_io_err));
-        usart1_send_string(" (byte 0x");
+        usart1_send_string("  byte ");
         cli_print_hex8(sd_last_io_byte);
-        usart1_send_string(", block ");
+        usart1_send_string("  block ");
         cli_print_u32(sd_last_io_blk);
-        usart1_send_string(")\r\n");
+        usart1_send_string("\r\n");
     }
 
-    cli_label("overruns");
-    cli_print_u32(app_tasks_overruns());    /* Sensor 因佇列滿丟棄數，理想 0 */
-    usart1_send_string("\r\n");
-
-    /* Sensor 連續 I2C 讀取失敗而觸發 bus recovery 的次數，理想 0。
-     * 非 0 代表匯流排曾經卡住 —— 通常是供電、接觸或拉電阻的問題。 */
-    cli_label("i2c recov");
-    cli_print_u32(app_tasks_i2c_recovers());
-    usart1_send_string("\r\n");
-
+    /* ── i2c：MPU6050 / INA219 那條匯流排 ── */
+    cli_section("i2c");
     /* 非同步 I2C 的失敗次數，依類型分開 —— 三者指向完全不同的方向，
      * 混成一個數字就沒辦法對症下藥。理想全 0；偶爾跳 nack 在麵包板上
      * 算正常（Display 對 INA219 有一次重試，所以畫面不一定會閃 "--"）。 */
     {
         uint32_t nack = 0, bus = 0, tmo = 0;
         i2c1_async_err_counts(&nack, &bus, &tmo);
-        cli_label("i2c err");
+        cli_label("errors");
         usart1_send_string("nack ");
         cli_print_u32(nack);
         usart1_send_string("  bus ");
@@ -213,13 +237,24 @@ static void cli_status(int argc, char **argv)
         cli_print_u32(tmo);
         usart1_send_string("\r\n");
     }
+    /* Sensor 連續 I2C 讀取失敗而觸發 bus recovery 的次數，理想 0。
+     * 非 0 代表匯流排曾經卡住 —— 通常是供電、接觸或拉電阻的問題。 */
+    cli_label("recovery");
+    cli_print_u32(app_tasks_i2c_recovers());
+    usart1_send_string("\r\n");
 
-    /* 晶片溫度（VREFINT 補償後）＋ 反推的實際 VDDA。die 溫，非室溫。 */
-    cli_label("chip");
+    /* ── chip：晶片溫度（VREFINT 補償後，die 溫非室溫）＋ 實際 VDDA ──
+     * VDDA 用出廠 VREFINT_CAL 換算，誤差約幾十 mV，拿來判斷 SD 供電夠不夠
+     * 是可信的。SD 寫入卡死的頭號嫌疑就是它，所以低於門檻直接標出來。 */
+    cli_section("chip");
+    cli_label("temp");
     cli_print_fixed(tempsensor_read_c(), 1);
-    usart1_send_string(" C  (VDDA ");
-    cli_print_fixed(tempsensor_vdda(), 2);
-    usart1_send_string(" V)\r\n");
+    usart1_send_string(" C\r\n");
+    float vdda = tempsensor_vdda();
+    cli_label("VDDA");
+    cli_print_fixed(vdda, 2);
+    usart1_send_string(vdda < CLI_VDDA_LOW_V ? " V  LOW (SD writes may hang)\r\n"
+                                             : " V\r\n");
 }
 
 /* dl_dump 的 per-line 回呼：把一行印到 UART，行尾 \n 補 \r 才不會階梯。
@@ -760,7 +795,7 @@ static const cli_cmd_t s_tasks_sub[] = {
 static const cli_cmd_t s_cmds[] = {
     { "start",    cli_start,        NULL,         "",         "begin logging (new log_NNN.csv)"    },
     { "stop",     cli_stop,         NULL,         "",         "stop logging"                       },
-    { "status",   cli_status,       NULL,         "",         "logger state + chip temp"           },
+    { "status",   cli_status,       NULL,         "",         "logger / sd / i2c / chip health"    },
     { "dump",     cli_dump,         NULL,         "[file]",   "print a csv (default: last session)" },
     { "ls",       cli_ls,           NULL,         "",         "list files + free space"            },
     { "clear",    cli_clear,        NULL,         "",         "delete all logs"                    },
