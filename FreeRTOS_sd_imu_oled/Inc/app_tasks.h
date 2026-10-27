@@ -41,6 +41,10 @@ uint32_t app_tasks_overruns(void);
  * 非 0 代表 I2C 匯流排曾經卡住 —— 通常是供電、接觸或拉電阻的問題。 */
 uint32_t app_tasks_i2c_recovers(void);
 
+/* MPU6050 目前在不在線（1/0）。開機探一次，之後 Display 每秒重探，LOGGING
+ * 中由 Sensor 的讀取結果更新。不在線時 start 會被擋下（CLI 與按鈕）。 */
+int app_tasks_mpu_ok(void);
+
 /* IDLE task 要不要用 WFI 睡覺（1 = 睡，0 = 空轉）。CLI 的 wfi 指令直接改它，
  * 實作與完整說明在 app_tasks.c 的 vApplicationIdleHook。 */
 extern volatile uint8_t g_wfi_enabled;

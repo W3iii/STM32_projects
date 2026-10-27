@@ -13,6 +13,10 @@
 /* 初始化 */
 void ssd1306_init(void);
 
+/* 重送設定序列（不 reset、不清畫面），讓熱插拔回來的模組重新亮起來。
+ * 呼叫端持有 spi1_lock。 */
+void ssd1306_reconfigure(void);
+
 /* framebuffer 操作（不會自動更新螢幕） */
 void ssd1306_clear(void);
 void ssd1306_fill(void);

@@ -88,6 +88,21 @@ void ssd1306_init(void)
     /* 設定期間先關顯示，避免中間狀態閃到螢幕上。 */
     ssd1306_send_cmd(0xAE);                             /* display OFF */
 
+    ssd1306_reconfigure();
+}
+
+/* 只重送設定序列，不碰 GPIO、不拉 RES、不先關顯示 —— 給熱插拔用。
+ *
+ * SPI 只送不收，模組被拔掉 MCU 完全不知道；插回來的晶片是 power-on 預設值：
+ * display OFF、charge pump 關、定址模式是 page mode。framebuffer 照推也是
+ * 一片黑，就算亮了，1024 bytes 一發也只會在第 0 頁繞圈。偵測不到就乾脆
+ * 週期性地當它剛插上，Display task 每秒呼叫一次。
+ *
+ * 不拉 RES：硬體 reset 會清掉 GDDRAM，每秒閃一次黑屏。不送 0xAE：線上的
+ * 模組會在 OFF→ON 之間閃一下。整段約 25 個 byte，SPI 上不到 0.1ms。
+ * 呼叫端持有 spi1_lock。 */
+void ssd1306_reconfigure(void)
+{
     /* ---- 記憶體定址模式 ----
      * 水平模式：GDDRAM 指標 column++，到 end column 自動歸零且 page++。
      * 這是 ssd1306_update_screen() 能一發 DMA 推完 1024 bytes 的前提 ——

@@ -229,6 +229,11 @@ static void cli_status(int argc, char **argv)
 
     /* ── i2c：MPU6050 / INA219 那條匯流排 ── */
     cli_section("i2c");
+    /* MPU 掉線時 logger 仍可能是 LOGGING（檔案開著、取樣暫停），只看
+     * [logger] 會以為一切正常。 */
+    cli_label("mpu6050");
+    usart1_send_string(app_tasks_mpu_ok() ? "ok\r\n"
+                                          : "NOT FOUND (reprobe every 1s)\r\n");
     /* 非同步 I2C 的失敗次數，依類型分開 —— 三者指向完全不同的方向，
      * 混成一個數字就沒辦法對症下藥。理想全 0；偶爾跳 nack 在麵包板上
      * 算正常（Display 對 INA219 有一次重試，所以畫面不一定會閃 "--"）。 */
@@ -732,6 +737,11 @@ static void cli_start(int argc, char **argv)
 {
     (void)argc;
     (void)argv;
+    if (!app_tasks_mpu_ok() && app_datalogger_state() != DL_LOGGING) {
+        /* 不擋的話會開出一個只有表頭的 CSV：Sensor 不在線時不取樣。 */
+        usart1_send_string("start failed: MPU6050 not found - check wiring (try: i2cscan)\r\n");
+        return;
+    }
     int start_rc = app_datalogger_start();
     if (start_rc == 0) {
         usart1_send_string("started: ");

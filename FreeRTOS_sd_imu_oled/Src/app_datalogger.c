@@ -21,11 +21,11 @@
  */
 
 #include "app_datalogger.h"
-#include "bus_port.h"       /* spi1_lock（FatFs/SD）/ i2c1_lock（MPU6050 init）*/
+#include "bus_port.h"       /* spi1_lock（FatFs/SD）*/
 #include "ff.h"
 #include "diskio.h"     /* disk_initialize：只重置卡、不換掉 volume（見 dl_salvage_locked）*/
 #include "device_sdcard.h"  /* sd_check_alive：IDLE 時偵測拔卡（FatFs 沒有對應的 API）*/
-#include "device_mpu6050.h"
+#include "device_mpu6050.h"   /* mpu6050_axes_t（write_sample 的參數）*/
 #include "FreeRTOS.h"
 #include "semphr.h"
 #include "task.h"       /* TaskHandle_t / xTaskNotifyGive */
@@ -155,15 +155,10 @@ int app_datalogger_init(void)
     if (s_state_mtx == NULL) {
         return -3;
     }
-    /* mpu6050_init() 是「讀 WHO_AM_I → 寫 PWR_MGMT_1」兩筆交易，整段包在
-     * i2c1_lock 內才是原子的。此刻只有 bootstrap task 在跑，但照規矩上鎖，
-     * 免得日後有人把初始化搬到別處就踩到。 */
-    i2c1_lock();
-    int mpu_rc = mpu6050_init();
-    i2c1_unlock();
-    if (mpu_rc != 0) {
-        return -1;                  /* WHO_AM_I 不對 */
-    }
+    /* MPU6050 不在這裡 init 了：以前 MPU 沒過就直接 return、連卡都不掛，
+     * 而 MPU 之後插上去也沒人回頭掛卡，只能重開機。MPU 的在線狀態改由
+     * app_tasks 管（開機探一次，之後 Display 每秒重探），跟 SD 互不牽連。 */
+
     /* 掛載重試：f_mount(opt=1) 會呼叫 disk_initialize() → sd_init()，而
      * diskio 沒有快取狀態，每次都真的重跑一次初始化，所以重試是有意義的。
      *

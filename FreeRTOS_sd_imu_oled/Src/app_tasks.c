@@ -84,6 +84,17 @@
  * 也不能每輪都探 —— 沒接的時候每輪吃 NACK/timeout 會把 10Hz 更新拖垮。 */
 #define INA_REPROBE_PERIOD     50
 
+/* MPU6050 的重探週期（Display 迴圈輪數）。10Hz 下 10 輪 = 1s。
+ * 不在線時：跑 mpu6050_init()，插回來最多 1 秒就回到線上。
+ * 在線但沒在錄時：同樣跑 init 當在線偵測（WHO_AM_I + 寫 PWR_MGMT_1，兩筆
+ * 交易約 0.2ms），不然 IDLE 沒人讀它，拔掉了 OLED 還是 READY。
+ * LOGGING 且在線時不探：Sensor 每 10ms 的讀取本身就是在線偵測。 */
+#define MPU_PROBE_PERIOD       10
+
+/* OLED 重送設定序列的週期（Display 迴圈輪數），10 輪 = 1s。
+ * SPI 偵測不到模組被拔，只能週期性重送，見 ssd1306_reconfigure()。 */
+#define OLED_REINIT_PERIOD     10
+
 #define QSAMPLES_LEN         64          /* 64 × 16B ≈ 640ms 緩衝 */
 
 #define PRIO_SENSOR          4
@@ -140,10 +151,16 @@ static ina219_data_t s_power;
 static uint8_t       s_power_valid;     /* 0 = INA219 不在線或還沒量到 */
 static uint8_t       s_ina_present;     /* init 成功才在 Display 迴圈裡讀它 */
 
-/* MPU6050 有沒有過 init。bootstrap 在建立 task 之前寫好，之後不變，Display
- * 讀它不需同步。MPU 沒找到時 init 根本沒跑到掛載，s_mounted 也是 0 ——
- * 只看 mounted 的話 OLED 會把它誤報成 SD 掛不上。 */
-static uint8_t       s_mpu_ok;
+/* MPU6050 在不在線。以前是開機探一次就定終身，開機沒接之後插上去也不會
+ * 恢復。現在 bootstrap 給初值，之後兩個 writer：Sensor（LOGGING 中 recovery
+ * 後重新 init 沒過 → 0）與 Display（每秒重探）。兩邊都只在持有 i2c1_lock
+ * 時寫，跟 s_i2c_recovers 一樣由那支 mutex 序列化；Sensor 迴圈頂端不上鎖
+ * 讀它，讀到舊值只是晚一輪才停 / 才恢復取樣。 */
+static volatile uint8_t s_mpu_ok;
+static uint32_t      s_mpu_probe;       /* Display 的重探倒數 */
+static uint32_t      s_oled_reinit;     /* Display 的 OLED 重送設定倒數 */
+
+int app_tasks_mpu_ok(void) { return s_mpu_ok; }
 
 /* ---- 最近 N 筆量測的環形緩衝：給 CLI 的 power 指令做平均 ----
  * 為什麼要平均：單筆讀數偶爾會跳出離群值 —— 麵包板上的 I2C 雜訊讓某個
@@ -284,6 +301,12 @@ static void sensor_task(void *arg)
             if (app_datalogger_state() != DL_LOGGING) {
                 break;                               /* stop 落在這次等待中：不取這筆 */
             }
+            if (!s_mpu_ok) {
+                /* 掉線中：不讀。每輪都去撞 NACK、每 50ms 搖一次匯流排沒有意義，
+                 * 還會把 recovery 計數灌爆。重探交給 Display（每秒一次），
+                 * 插回來之後這裡下一輪就接著取樣。 */
+                continue;
+            }
 
             imu_sample_t s;
             s.t_ms = systick_get_ms();
@@ -302,7 +325,10 @@ static void sensor_task(void *arg)
                  * 在 task 脈絡做（所以不放在 ISR 的錯誤處理裡）。 */
                 if (++s_i2c_fails >= SENSOR_I2C_FAIL_LIMIT) {
                     i2c1_bus_recovery();
-                    mpu6050_init();                  /* recovery 會重設周邊，要重新喚醒 sensor */
+                    /* recovery 會重設周邊，要重新喚醒 sensor。init 沒過 = 不是
+                     * 匯流排卡住而是 MPU 不見了（被拔、接觸不良），標成離線，
+                     * OLED 顯示 NO MPU，等 Display 重探。 */
+                    s_mpu_ok       = (mpu6050_init() == 0) ? 1 : 0;
                     s_i2c_fails    = 0;
                     s_i2c_recovers++;
                 }
@@ -364,27 +390,25 @@ static void logger_task(void *arg)
             in_error = 0;
 
             /* SD 插拔：已掛載就每秒問卡在不在，沒掛載就定期重探。重探成功只回
-             * READY，不自動開錄。MPU 沒過時都不做：掛上了也錄不了，白白讓
-             * OLED 停頓。 */
-            if (s_mpu_ok) {
-                TickType_t now = xTaskGetTickCount();
-                if (app_datalogger_mounted()) {
-                    if ((now - last_presence) >= pdMS_TO_TICKS(SD_PRESENCE_MS)) {
-                        last_presence = now;
-                        if (app_datalogger_check_card() != 0) {
-                            /* 剛被拔：sd_last_init_rc 還是上次成功的 SD_OK，
-                             * 照它判斷會用慢節奏，插回去要等 5 秒。 */
-                            sd_fast      = 1;
-                            last_reprobe = now;
-                        }
-                    }
-                } else {
-                    uint32_t period = sd_fast ? SD_REPROBE_MS : SD_REPROBE_SLOW_MS;
-                    if ((now - last_reprobe) >= pdMS_TO_TICKS(period)) {
+             * READY，不自動開錄。以前 MPU 沒過時整段不做（掛上了也錄不了），
+             * 但 MPU 現在插回來會自己恢復，卡要先準備好。 */
+            TickType_t now = xTaskGetTickCount();
+            if (app_datalogger_mounted()) {
+                if ((now - last_presence) >= pdMS_TO_TICKS(SD_PRESENCE_MS)) {
+                    last_presence = now;
+                    if (app_datalogger_check_card() != 0) {
+                        /* 剛被拔：sd_last_init_rc 還是上次成功的 SD_OK，
+                         * 照它判斷會用慢節奏，插回去要等 5 秒。 */
+                        sd_fast      = 1;
                         last_reprobe = now;
-                        app_datalogger_remount();
-                        sd_fast = (sd_last_init_rc == SD_ERR_CMD0);
                     }
+                }
+            } else {
+                uint32_t period = sd_fast ? SD_REPROBE_MS : SD_REPROBE_SLOW_MS;
+                if ((now - last_reprobe) >= pdMS_TO_TICKS(period)) {
+                    last_reprobe = now;
+                    app_datalogger_remount();
+                    sd_fast = (sd_last_init_rc == SD_ERR_CMD0);
                 }
             }
         }
@@ -395,10 +419,11 @@ static void logger_task(void *arg)
  * 版面（5x8 字型，字距 6px → 一行 21 字）：
  *   y=0   IMU LOGGER
  *   y=16  * REC  1234        ← 筆數不再獨佔一行，接在 REC 後空兩格
+ *         * REC  NO MPU      ← 錄製中 MPU 掉線（取樣暫停，插回來自己接上）
  *         READY              ← IDLE 時沒有筆數
  *         !ERR 1             ← DL_ERROR，後接寫入的 FRESULT
+ *         NO MPU
  *         NO SD 13           ← 沒掛載，後接掛載的 FRESULT
- *         MPU FAIL
  *   y=32  P:5.02V 118mA      ← INA219；不在線時 "P: --"
  *   y=48  T:35.0C
  *
@@ -509,23 +534,49 @@ static void display_task(void *arg)
             }
         }
 
+        /* ---- MPU6050 在線偵測 / 重探（理由見 MPU_PROBE_PERIOD）----
+         * init 失敗重試一次再下結論，跟 INA219 一樣：偶發一次 NACK 就把
+         * 在線的 MPU 判成離線，OLED 會閃一下 NO MPU。 */
+        if (++s_mpu_probe >= MPU_PROBE_PERIOD) {
+            s_mpu_probe = 0;
+            if (!s_mpu_ok || st.state != DL_LOGGING) {
+                i2c1_lock();
+                int mrc = mpu6050_init();
+                if (mrc != 0) {
+                    mrc = mpu6050_init();
+                }
+                s_mpu_ok = (mrc == 0) ? 1 : 0;
+                i2c1_unlock();
+            }
+        }
+
         char line[22];
 
         spi1_lock();
+        if (++s_oled_reinit >= OLED_REINIT_PERIOD) {
+            s_oled_reinit = 0;
+            ssd1306_reconfigure();          /* 熱插拔回來的模組要重新設定才會亮 */
+        }
         ssd1306_clear();
         ssd1306_draw_string(0, 0, "IMU LOGGER");
 
         /* 第 2 行：狀態 + 筆數（同一行，"* REC" 佔 5 字 = 30px，空兩格 → x=42）*/
         if (st.state == DL_LOGGING) {
             ssd1306_draw_string(0, 16, "* REC");
-            ssd1306_draw_int(42, 16, (int32_t)st.count);
+            if (s_mpu_ok) {
+                ssd1306_draw_int(42, 16, (int32_t)st.count);
+            } else {
+                /* 檔案還開著，但 Sensor 沒在取樣。只畫凍住的筆數的話，
+                 * 看起來跟正常錄製一模一樣。 */
+                ssd1306_draw_string(42, 16, "NO MPU");
+            }
         } else if (st.state == DL_ERROR) {
             /* 寫入失敗。停在這個畫面比「* REC 但計數不動」誠實太多 ——
              * 後面接 FatFs 的 FRESULT，方便直接對照原因。 */
             ssd1306_draw_string(0, 16, "!ERR");
             ssd1306_draw_int(36, 16, (int32_t)st.fres);
         } else if (!s_mpu_ok) {
-            ssd1306_draw_string(0, 16, "MPU FAIL");
+            ssd1306_draw_string(0, 16, "NO MPU");
         } else if (!app_datalogger_mounted()) {
             /* 掛載失敗（開機三次沒過，或 DL_ERROR 下 stop 放棄舊檔後卸載）。
              * 不能只靠 bootstrap 畫的 FS FAIL：本 task 每 100ms 重畫，會立刻
@@ -586,6 +637,8 @@ static void toggle_logging(void)
     if (app_datalogger_state() == DL_LOGGING) {
         app_datalogger_stop();
         usart1_send_string("\r\n[BTN] stopped\r\n> ");
+    } else if (!s_mpu_ok) {
+        usart1_send_string("\r\n[BTN] start failed: no MPU6050\r\n> ");
     } else if (app_datalogger_start() == 0) {
         usart1_send_string("\r\n[BTN] started: ");
         usart1_send_string(app_datalogger_filename());
@@ -736,54 +789,53 @@ static void bootstrap_task(void *arg)
      * 改成降級模式：照樣把所有 task 建起來，只是 app_datalogger_start()
      * 會因為 s_mounted == 0 而失敗。CLI、OLED、i2cscan、power、tasks 全部可用。
      * 這在供電邊界的板子上很重要 —— 失敗時你需要一台還能跟你對話的機器。 */
+    /* MPU6050 跟 SD 分開初始化：以前 MPU 沒過就連卡都不掛。開機沒接只是
+     * 初值，Display 之後每秒重探，插上去就回到線上。
+     * mpu6050_init() 是「讀 WHO_AM_I → 寫 PWR_MGMT_1」兩筆交易，整段包在
+     * i2c1_lock 內才是原子的。此刻只有 bootstrap 在跑，但照規矩上鎖。 */
+    i2c1_lock();
+    s_mpu_ok = (mpu6050_init() == 0) ? 1 : 0;
+    i2c1_unlock();
+
     int rc = app_datalogger_init();
-    if (rc != 0 && rc != -1 && rc != -2) {
+    if (rc != 0 && rc != -2) {
         /* -3 = state mutex 建不出來，那是 heap 不夠，沒得降級。 */
         usart1_send_string("  [!!] FATAL     init error (out of heap?)\r\n");
         vTaskSuspend(NULL);
     }
-    s_mpu_ok = (rc != -1);
 
     /* ---- 開機報告：一個裝置一行 ----
-     * 順序照初始化的依賴：MPU6050 → SD 卡 → FAT32 → INA219。
-     * app_datalogger_init() 在 MPU6050 失敗時不會去掛載，所以 SD/FAT32 兩行
-     * 只在 MPU6050 那關過了才印，免得印出根本沒跑過的步驟。 */
-    if (rc == -1) {
-        usart1_send_string("  [!!] MPU6050   not found -> logging disabled (try: i2cscan)\r\n");
+     * 順序：MPU6050 → SD 卡 → FAT32 → INA219。MPU 沒過不再擋住 SD 那兩行。 */
+    usart1_send_string(s_mpu_ok
+        ? "  [ok] MPU6050   @0x68\r\n"
+        : "  [!!] MPU6050   not found -> start disabled until plugged in (try: i2cscan)\r\n");
+    boot_print_sd();
+
+    if (rc == -2) {
+        int mr = app_datalogger_mount_result();
+        usart1_send_string("  [!!] FAT32     mount failed x3, FRESULT ");
+        boot_u32((uint32_t)mr);
+        usart1_send_string(" (");
+        usart1_send_string(fres_hint(mr));
+        usart1_send_string(")\r\n"
+                           "       logging disabled; CLI still up\r\n");
         ssd1306_clear();
-        ssd1306_draw_string(0, 0, "MPU FAIL");
-        ssd1306_draw_string(0, 16, "CLI OK");
+        ssd1306_draw_string(0, 0, "FS FAIL");
+        ssd1306_draw_string(0, 16, "FRES:");
+        ssd1306_draw_int(48, 16, mr);
+        ssd1306_draw_string(0, 32, "SDINIT:");      /* 卡在哪一步：1=CMD0 3=ACMD41 */
+        ssd1306_draw_int(64, 32, sd_last_init_rc);
         ssd1306_update_screen();
     } else {
-        usart1_send_string("  [ok] MPU6050   @0x68\r\n");
-        boot_print_sd();
-
-        if (rc == -2) {
-            int mr = app_datalogger_mount_result();
-            usart1_send_string("  [!!] FAT32     mount failed x3, FRESULT ");
-            boot_u32((uint32_t)mr);
-            usart1_send_string(" (");
-            usart1_send_string(fres_hint(mr));
-            usart1_send_string(")\r\n"
-                               "       logging disabled; CLI still up\r\n");
-            ssd1306_clear();
-            ssd1306_draw_string(0, 0, "FS FAIL");
-            ssd1306_draw_string(0, 16, "FRES:");
-            ssd1306_draw_int(48, 16, mr);
-            ssd1306_draw_string(0, 32, "SDINIT:");      /* 卡在哪一步：1=CMD0 3=ACMD41 */
-            ssd1306_draw_int(64, 32, sd_last_init_rc);
-            ssd1306_update_screen();
-        } else {
-            usart1_send_string("  [ok] FAT32     mounted");
-            if (app_datalogger_mount_retries() > 0) {
-                /* 一次就過才是健康的。需要重試代表 SD 在初始化期間電壓不夠穩 ——
-                 * 這次被重試救回來了，但它是供電邊界的早期警訊，值得在硬體上處理。 */
-                usart1_send_string(" after ");
-                boot_u32((uint32_t)app_datalogger_mount_retries());
-                usart1_send_string(" retry (power margin?)");
-            }
-            usart1_send_string("\r\n");
+        usart1_send_string("  [ok] FAT32     mounted");
+        if (app_datalogger_mount_retries() > 0) {
+            /* 一次就過才是健康的。需要重試代表 SD 在初始化期間電壓不夠穩 ——
+             * 這次被重試救回來了，但它是供電邊界的早期警訊，值得在硬體上處理。 */
+            usart1_send_string(" after ");
+            boot_u32((uint32_t)app_datalogger_mount_retries());
+            usart1_send_string(" retry (power margin?)");
         }
+        usart1_send_string("\r\n");
     }
 
     /* ---- INA219（選配）----

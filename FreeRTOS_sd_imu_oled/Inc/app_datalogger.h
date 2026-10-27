@@ -50,8 +50,8 @@ typedef struct {
     uint32_t   recoveries;   /* 從 DL_ERROR 恢復成功的次數（跨 session 不清）*/
 } dl_status_t;
 
-/* 初始化：建立狀態 mutex、初始化 MPU6050 + 掛載 FAT32。
- * 回傳 0=OK / -1=MPU6050 沒找到 / -2=掛載失敗。
+/* 初始化：建立狀態 mutex + 掛載 FAT32（MPU6050 由 app_tasks 自己 init）。
+ * 回傳 0=OK / -2=掛載失敗 / -3=mutex 建不出來。
  * 注意：I2C1/SPI1/SD CS 等匯流排要先初始化好；需在排程器啟動後呼叫。 */
 int app_datalogger_init(void);
 
