@@ -172,8 +172,15 @@ static void cli_status(int argc, char **argv)
     if (!app_datalogger_mounted() && st.state != DL_ERROR) {
         /* 降級模式：CLI/OLED/i2cscan 都還在，只是 start 會失敗。
          * DL_ERROR 時 s_mounted 也是 0，但那是恢復流程中的暫態，不算。 */
+        /* init step = sd_last_init_rc（1=CMD0 卡不在、3=ACMD41 卡在但起不來，
+         * 0 = 卡沒問題、是 FatFs 那層掛不上）。開機報告有印，但之後的重探
+         * 失敗以前只看得到 FRESULT 3，分不出「沒插」還是「插了起不來」。 */
         usart1_send_string("NOT MOUNTED (FRESULT ");
         cli_print_u32((uint32_t)app_datalogger_mount_result());
+        usart1_send_string(", init step ");
+        cli_print_u32(sd_last_init_rc);
+        usart1_send_string(", reprobe ");
+        cli_print_u32(app_datalogger_remount_tries());
         usart1_send_string(") - logging disabled\r\n");
     } else if (app_datalogger_mount_retries() > 0) {
         usart1_send_string("ok after ");

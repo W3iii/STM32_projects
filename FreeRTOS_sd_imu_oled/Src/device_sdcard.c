@@ -55,6 +55,10 @@
  * 所以跟寫入 busy 用同一個上限。 */
 #define SD_READY_TIMEOUT_MS   SD_WRITE_TIMEOUT_MS
 
+/* sd_check_alive 送 CMD13 前等 ready 的逾時。只在 IDLE 呼叫，沒有上一筆
+ * 寫入在 program，在線的卡第一個 byte 就是 0xFF；等不到就是卡不在。 */
+#define SD_ALIVE_READY_MS     10
+
 /* 「等卡」的迴圈先忙等幾次，之後才改成 spi1_poll_yield()。
  *
  * 64 次 × 3.1µs @2.6MHz ≈ 200µs。卡在正常狀況下就在這個範圍內回應
@@ -412,6 +416,28 @@ uint8_t sd_read_block(uint32_t block, uint8_t *buf)
 
     sd_deselect();
     return SD_OK;
+}
+
+/* CMD13 (SEND_STATUS)，回應是 R2 = R1 + 1 byte status，在線且健康的卡兩個都是 0x00。
+ *
+ * 為什麼要先 wait_ready：卡不在時 MISO 可能被上拉成 0xFF（R1 收不到 MSB=0，
+ * 自然失敗），也可能浮接讀成 0x00 —— 單看 R1 會把 0x00 當成「命令接受」。
+ * 先要求讀到 0xFF（卡放開 DO）再送命令，浮接的線很難同時騙過這兩關。 */
+uint8_t sd_check_alive(void)
+{
+    SD_CS_LOW();
+
+    uint8_t rdy = sd_wait_ready(SD_ALIVE_READY_MS);
+    if (rdy != 0xFF) {
+        sd_deselect();
+        return SD_ERR_STATUS;
+    }
+
+    uint8_t r1 = sd_cmd_frame(13, 0x00000000, 0x01);
+    uint8_t r2 = spi1_transfer_byte(0xFF);
+    sd_deselect();
+
+    return (r1 == 0x00 && r2 == 0x00) ? SD_OK : SD_ERR_STATUS;
 }
 
 uint8_t sd_write_block(uint32_t block, const uint8_t *buf)

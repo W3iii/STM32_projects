@@ -27,6 +27,7 @@
 #define SD_ERR_CMD58     4   /* CMD58 讀 OCR 失敗                       */
 #define SD_ERR_READ      5   /* CMD17 讀失敗（R1 非 0 或沒等到 data token）*/
 #define SD_ERR_WRITE     6   /* CMD24 寫失敗（R1 非 0 / 拒絕 / busy 逾時） */
+#define SD_ERR_STATUS    7   /* CMD13 沒回應或 status 非 0（卡被拔 / 重新上電過）*/
 
 /* 一個 block 固定 512 byte */
 #define SD_BLOCK_SIZE    512
@@ -95,5 +96,10 @@ uint8_t sd_read_block(uint32_t block, uint8_t *buf);
 /* CMD24：把 buf（512 byte）寫進單一 block。
  * 回傳 SD_OK 或 SD_ERR_WRITE。 */
 uint8_t sd_write_block(uint32_t block, const uint8_t *buf);
+
+/* CMD13：問卡還在不在（沒有 card-detect 腳時偵測拔卡用）。
+ * 回傳 SD_OK 或 SD_ERR_STATUS。插回來的卡也回 SD_ERR_STATUS：重新上電後
+ * 要從 CMD0 重新 init 才認 SPI 命令。 */
+uint8_t sd_check_alive(void);
 
 #endif /* DEVICE_SDCARD_H_ */

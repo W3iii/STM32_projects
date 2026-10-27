@@ -65,6 +65,20 @@ int app_datalogger_mount_retries(void);
 /* SD 是否已掛載。0 = 降級模式（CLI/OLED 可用，start 會失敗）。 */
 int app_datalogger_mounted(void);
 
+/* 沒掛載時重掛一次（只重掛，不開檔、不進 LOGGING）。只在 IDLE 做事：
+ * DL_ERROR 的卸載狀態歸 recover 管。Logger task 定期呼叫，讓插回來的卡
+ * 不必等人 start 就回到 READY。回傳 0=已掛載 / -1=沒掛上（原因在 mount_result）。 */
+int app_datalogger_remount(void);
+
+/* IDLE 且已掛載時問卡還在不在（CMD13）；不在就卸載，交給 remount 接手。
+ * 沒有 card-detect 腳，IDLE 時又沒有 I/O 碰卡，不問的話拔卡後 OLED 會一直
+ * 停在 READY。Logger task 每秒呼叫。回傳 0=在線或不適用 / -1=偵測到拔卡、已卸載。 */
+int app_datalogger_check_card(void);
+
+/* remount 實際跑過幾次 f_mount（累計）。status 用：NOT MOUNTED 時這個數字
+ * 不動，代表重探根本沒在跑；在動但掛不上，就看 init step 卡在哪。 */
+uint32_t app_datalogger_remount_tries(void);
+
 /* 開新檔 log_NNN.csv、寫表頭、進 LOGGING。回傳 0=OK / <0=失敗。 */
 int app_datalogger_start(void);
 

@@ -752,6 +752,8 @@ i2c_status_t i2c1_bus_recovery(void)
     }
 
     /* 5. 產生一次 STOP condition（SDA 由 low → high 當 SCL high）*/
+    GPIOB->ODR &= ~(1U << 8);   /* SCL low */
+    short_delay();
     GPIOB->ODR &= ~(1U << 9);   /* SDA low */
     short_delay();
     GPIOB->ODR |=  (1U << 8);   /* SCL high */

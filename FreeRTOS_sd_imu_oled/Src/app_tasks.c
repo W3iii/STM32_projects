@@ -56,6 +56,18 @@
 #define DISPLAY_PERIOD_MS    100         /* ~10Hz；也是 CPU 統計的取樣節拍，見下方 static_assert */
 #define LOGGER_SYNC_MS       1000        /* 每秒 f_sync */
 #define LOGGER_RECOVER_MS    1000        /* DL_ERROR 時每秒試一次自動恢復 */
+
+/* SD 沒掛載時的重探週期。理由同 INA219 的重探：開機掛不上就定終身的話，
+ * 卡插回來也要等人 start。依卡在哪一步失敗分快慢，因為重探整段持有
+ * spi1_lock，OLED 會停住同樣久：
+ *   CMD0 沒回應 = 卡不在，一次約 15ms，每秒探也無感
+ *   卡在但半途失敗（ACMD41 逾時、不是 FAT32）= 一次可達 1.5s，探太勤 OLED 幾乎不動 */
+#define SD_REPROBE_MS        1000
+#define SD_REPROBE_SLOW_MS   5000
+
+/* IDLE 已掛載時問卡還在不在（CMD13）的週期。一次約 30µs，每秒問無感；
+ * 拔卡後最多 1 秒 OLED 就會變 NO SD。 */
+#define SD_PRESENCE_MS       1000
 #define BTN_DEBOUNCE_MS      20          /* EXTI 喚醒後等接點沉澱，再重讀電位確認 */
 
 /* 連續幾次 I2C 讀取失敗才觸發 bus recovery。偶發一次（雜訊、暫時性 NACK）
@@ -127,6 +139,11 @@ static volatile int32_t s_last_temp_c10;
 static ina219_data_t s_power;
 static uint8_t       s_power_valid;     /* 0 = INA219 不在線或還沒量到 */
 static uint8_t       s_ina_present;     /* init 成功才在 Display 迴圈裡讀它 */
+
+/* MPU6050 有沒有過 init。bootstrap 在建立 task 之前寫好，之後不變，Display
+ * 讀它不需同步。MPU 沒找到時 init 根本沒跑到掛載，s_mounted 也是 0 ——
+ * 只看 mounted 的話 OLED 會把它誤報成 SD 掛不上。 */
+static uint8_t       s_mpu_ok;
 
 /* ---- 最近 N 筆量測的環形緩衝：給 CLI 的 power 指令做平均 ----
  * 為什麼要平均：單筆讀數偶爾會跳出離群值 —— 麵包板上的 I2C 雜訊讓某個
@@ -312,6 +329,9 @@ static void logger_task(void *arg)
     (void)arg;
     TickType_t last_sync    = xTaskGetTickCount();
     TickType_t last_recover = 0;
+    TickType_t last_reprobe = xTaskGetTickCount();   /* 開機剛試過 3 次，先隔一個週期 */
+    TickType_t last_presence = xTaskGetTickCount();
+    int        sd_fast      = (sd_last_init_rc == SD_ERR_CMD0);  /* 重探用快節奏 = 卡不在 */
     int        in_error     = 0;
     for (;;) {
         imu_sample_t s;
@@ -342,6 +362,31 @@ static void logger_task(void *arg)
             }
         } else {
             in_error = 0;
+
+            /* SD 插拔：已掛載就每秒問卡在不在，沒掛載就定期重探。重探成功只回
+             * READY，不自動開錄。MPU 沒過時都不做：掛上了也錄不了，白白讓
+             * OLED 停頓。 */
+            if (s_mpu_ok) {
+                TickType_t now = xTaskGetTickCount();
+                if (app_datalogger_mounted()) {
+                    if ((now - last_presence) >= pdMS_TO_TICKS(SD_PRESENCE_MS)) {
+                        last_presence = now;
+                        if (app_datalogger_check_card() != 0) {
+                            /* 剛被拔：sd_last_init_rc 還是上次成功的 SD_OK，
+                             * 照它判斷會用慢節奏，插回去要等 5 秒。 */
+                            sd_fast      = 1;
+                            last_reprobe = now;
+                        }
+                    }
+                } else {
+                    uint32_t period = sd_fast ? SD_REPROBE_MS : SD_REPROBE_SLOW_MS;
+                    if ((now - last_reprobe) >= pdMS_TO_TICKS(period)) {
+                        last_reprobe = now;
+                        app_datalogger_remount();
+                        sd_fast = (sd_last_init_rc == SD_ERR_CMD0);
+                    }
+                }
+            }
         }
     }
 }
@@ -351,6 +396,9 @@ static void logger_task(void *arg)
  *   y=0   IMU LOGGER
  *   y=16  * REC  1234        ← 筆數不再獨佔一行，接在 REC 後空兩格
  *         READY              ← IDLE 時沒有筆數
+ *         !ERR 1             ← DL_ERROR，後接寫入的 FRESULT
+ *         NO SD 13           ← 沒掛載，後接掛載的 FRESULT
+ *         MPU FAIL
  *   y=32  P:5.02V 118mA      ← INA219；不在線時 "P: --"
  *   y=48  T:35.0C
  *
@@ -476,6 +524,16 @@ static void display_task(void *arg)
              * 後面接 FatFs 的 FRESULT，方便直接對照原因。 */
             ssd1306_draw_string(0, 16, "!ERR");
             ssd1306_draw_int(36, 16, (int32_t)st.fres);
+        } else if (!s_mpu_ok) {
+            ssd1306_draw_string(0, 16, "MPU FAIL");
+        } else if (!app_datalogger_mounted()) {
+            /* 掛載失敗（開機三次沒過，或 DL_ERROR 下 stop 放棄舊檔後卸載）。
+             * 不能只靠 bootstrap 畫的 FS FAIL：本 task 每 100ms 重畫，會立刻
+             * 蓋掉。條件跟 CLI status 的 NOT MOUNTED 一致（DL_ERROR 時 mounted
+             * 也是 0，但那是恢復中的暫態，上面已先攔下）；start 重掛成功後自動
+             * 回 READY。 */
+            ssd1306_draw_string(0, 16, "NO SD");
+            ssd1306_draw_int(42, 16, app_datalogger_mount_result());
         } else {
             ssd1306_draw_string(0, 16, "READY");
         }
@@ -684,6 +742,7 @@ static void bootstrap_task(void *arg)
         usart1_send_string("  [!!] FATAL     init error (out of heap?)\r\n");
         vTaskSuspend(NULL);
     }
+    s_mpu_ok = (rc != -1);
 
     /* ---- 開機報告：一個裝置一行 ----
      * 順序照初始化的依賴：MPU6050 → SD 卡 → FAT32 → INA219。

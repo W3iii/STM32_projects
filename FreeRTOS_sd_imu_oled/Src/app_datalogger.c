@@ -24,6 +24,7 @@
 #include "bus_port.h"       /* spi1_lock（FatFs/SD）/ i2c1_lock（MPU6050 init）*/
 #include "ff.h"
 #include "diskio.h"     /* disk_initialize：只重置卡、不換掉 volume（見 dl_salvage_locked）*/
+#include "device_sdcard.h"  /* sd_check_alive：IDLE 時偵測拔卡（FatFs 沒有對應的 API）*/
 #include "device_mpu6050.h"
 #include "FreeRTOS.h"
 #include "semphr.h"
@@ -42,10 +43,14 @@ static uint32_t   s_err_count;          /* 累計寫入失敗次數 */
 static uint8_t    s_mount_retries;      /* 開機掛載重試了幾次（0 = 一次就過）*/
 static uint8_t    s_fil_orphan;         /* DL_ERROR 留下的舊檔還沒收拾（s_fil 仍掛在舊 volume）*/
 static uint32_t   s_recover_count;      /* DL_ERROR 自動/手動恢復成功次數（累計）*/
+static uint32_t   s_remount_tries;      /* IDLE 沒掛載時 remount 實際試過幾次（累計）*/
 
 static TaskHandle_t s_producer;         /* sensor task handle；start 成功時喚醒它 */
 
-/* 診斷：保留最後一次 f_mount 的 FRESULT，方便 bootstrap 顯示掛載失敗原因
+/* 診斷：volume 目前為什麼沒掛上（s_mounted = 0 時才有意義）。
+ * 來源不只 f_mount：DL_ERROR 收拾舊檔失敗時是 f_close 的結果，卡重置起不來
+ * 或 IDLE 偵測到拔卡時直接記 FR_NOT_READY。讀的人：開機 FS FAIL 畫面、
+ * OLED 的 NO SD、status 的 NOT MOUNTED、start 失敗訊息。
  *   1=FR_DISK_ERR、3=FR_NOT_READY → SPI/卡片硬體；13=FR_NO_FILESYSTEM → 不是 FAT32 */
 static volatile FRESULT s_mount_res = FR_OK;
 
@@ -189,7 +194,7 @@ int app_datalogger_init(void)
 
 int app_datalogger_mount_result(void)
 {
-    return (int)s_mount_res;        /* 診斷用：最後一次 f_mount 的 FRESULT */
+    return (int)s_mount_res;        /* 診斷用：volume 為什麼沒掛上，見 s_mount_res */
 }
 
 int app_datalogger_start(void)
@@ -259,6 +264,53 @@ int app_datalogger_start(void)
         xTaskNotifyGive(s_producer);
     }
     return 0;
+}
+
+int app_datalogger_remount(void)
+{
+    int rc = -1;
+
+    /* 只在 IDLE 重掛。DL_ERROR 時 s_mounted 也是 0，但 s_fil 還掛在舊 volume
+     * 上等 recover 收拾 —— 這裡一 f_mount 就把它作廢，舊檔沒寫回去的部分全丟。
+     *
+     * 跟 start 的重掛可能同時發生：兩邊都在 spi1_lock 內 f_mount，而且都是
+     * 「掛好才開檔」，所以最壞只是同一個 volume 多掛一次，不會換掉開著的檔。 */
+    spi1_lock();
+    if (s_mounted) {
+        rc = 0;
+    } else if (app_datalogger_state() == DL_IDLE) {
+        s_remount_tries++;
+        s_mount_res = f_mount(&s_fs, "", 1);
+        if (s_mount_res == FR_OK) {
+            s_mounted = 1;
+            rc = 0;
+        }
+    }
+    spi1_unlock();
+    return rc;
+}
+
+int app_datalogger_check_card(void)
+{
+    int rc = 0;
+
+    /* 只在 IDLE 且已掛載時問。LOGGING 時寫入失敗就會進 DL_ERROR，不必另外問；
+     * DL_ERROR 歸 recover 管。
+     *
+     * 失敗要連兩次才算拔卡：麵包板上偶發一次雜訊就卸載，雖然下一秒會重掛回來，
+     * 但白白重跑一次 init。卡真的不在的話，第二次一樣失敗，只多花幾十 µs。 */
+    spi1_lock();
+    if (s_mounted && app_datalogger_state() == DL_IDLE
+        && sd_check_alive() != SD_OK && sd_check_alive() != SD_OK) {
+        /* 跟 dl_salvage_locked 救不回來時同一套：卸載 volume，丟掉 FatFs 對
+         * 這張卡的快取。插回來的可能是另一張卡，不能帶著舊的 FAT 快取繼續用。 */
+        f_mount(NULL, "", 0);
+        s_mounted   = 0;
+        s_mount_res = FR_NOT_READY;
+        rc = -1;
+    }
+    spi1_unlock();
+    return rc;
 }
 
 int app_datalogger_recover(void)
@@ -512,6 +564,11 @@ int app_datalogger_mount_retries(void)
 int app_datalogger_mounted(void)
 {
     return (int)s_mounted;
+}
+
+uint32_t app_datalogger_remount_tries(void)
+{
+    return s_remount_tries;
 }
 
 uint32_t app_datalogger_count(void)
