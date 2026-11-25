@@ -64,25 +64,22 @@ int mpu6050_init(void)
 {
     uint8_t id;
 
-    /* Step 1: 讀 WHO_AM_I，順便偵測 bus 狀態 */
+    /* Step 1: 讀 WHO_AM_I。
+     *
+     * 以前收到 TIMEOUT 會在這裡自己呼叫 i2c1_bus_recovery() —— 讓一顆晶片
+     * 的 driver 去決定整條匯流排要不要重置，INA219 那邊卻沒有，兩套邏輯
+     * 各管各的。現在只回報錯誤種類，動不動匯流排由 app_i2c1_supervisor 統一決定。 */
     i2c_status_t st = i2c1_read_regs(MPU6050_ADDR, REG_WHO_AM_I, &id, 1);
-
-    if (st == I2C_ERR_TIMEOUT) {
-        /* bus 卡住，試著恢復 */
-        i2c1_bus_recovery();
-        return -2;              /* bus error */
-    }
     if (st != I2C_OK) {
-        return -1;              /* NACK / 其他：沒接到 sensor */
+        return (int)st;
     }
     if (id != MPU6050_WHO_AM_I_VAL) {
-        return -1;              /* 有回應但不是 MPU6050 */
+        return (int)I2C_ERR_NACK;   /* 有回應但不是 MPU6050：當成「不在」*/
     }
 
-    /* Step 2: 喚醒 */
-    i2c1_write_reg(MPU6050_ADDR, REG_PWR_MGMT_1, 0x00);
-
-    return 0;
+    /* Step 2: 喚醒。以前不看結果，寫失敗也回 OK —— 晶片停在 sleep，
+     * 之後讀到的全是 0，看起來像「不動」而不是「壞了」。 */
+    return (int)i2c1_write_reg(MPU6050_ADDR, REG_PWR_MGMT_1, 0x00);
 }
 
 void mpu6050_read_accel(mpu6050_axes_t *acc)

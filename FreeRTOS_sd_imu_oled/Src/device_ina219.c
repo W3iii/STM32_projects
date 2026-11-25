@@ -46,40 +46,48 @@
  *
  * 呼叫端（bootstrap 的 ina219_init、Display 的 ina219_read）都已持有
  * i2c1_lock，且都在排程器啟動後才跑，符合 async 版的前提。 */
-static int ina219_read16(uint8_t reg, uint16_t *out)
+static i2c_status_t ina219_read16(uint8_t reg, uint16_t *out)
 {
     uint8_t buf[2];
-    if (i2c1_read_regs_async(INA219_ADDR, reg, buf, 2) != I2C_OK) {
-        return -1;
+    i2c_status_t st = i2c1_read_regs_async(INA219_ADDR, reg, buf, 2);
+    if (st != I2C_OK) {
+        return st;
     }
     *out = (uint16_t)((uint16_t)buf[0] << 8 | buf[1]);
-    return 0;
+    return I2C_OK;
 }
 
 int ina219_init(void)
 {
-    if (i2c1_write_reg16(INA219_ADDR, REG_CONFIG, CONFIG_VALUE) != I2C_OK) {
-        return -1;                  /* NACK：位址不對或根本沒接 */
+    i2c_status_t st = i2c1_write_reg16(INA219_ADDR, REG_CONFIG, CONFIG_VALUE);
+    if (st != I2C_OK) {
+        return (int)st;             /* NACK：位址不對或根本沒接 */
     }
 
     /* read-back 當在線偵測：INA219 沒有 WHO_AM_I 可讀。 */
     uint16_t cfg;
-    if (ina219_read16(REG_CONFIG, &cfg) != 0) {
-        return -1;
+    st = ina219_read16(REG_CONFIG, &cfg);
+    if (st != I2C_OK) {
+        return (int)st;
     }
-    return (cfg == CONFIG_VALUE) ? 0 : -1;
+    /* 有回應但值不對：不是 INA219（或位址撞到別顆），當成「不在」*/
+    return (cfg == CONFIG_VALUE) ? (int)I2C_OK : (int)I2C_ERR_NACK;
 }
 
 int ina219_read(ina219_data_t *out)
 {
     uint16_t raw_shunt, raw_bus;
 
-    /* 兩次獨立交易：暫存器指標不會自動遞增（見 .h 的說明）。 */
-    if (ina219_read16(REG_SHUNT_V, &raw_shunt) != 0) {
-        return -1;
+    /* 兩次獨立交易：暫存器指標不會自動遞增（見 .h 的說明）。
+     * 失敗時回傳錯誤種類而不是 -1：NACK（晶片不在）和 TIMEOUT（匯流排卡住）
+     * 的處理方式完全不同，壓成 -1 上層就分不出來。 */
+    i2c_status_t st = ina219_read16(REG_SHUNT_V, &raw_shunt);
+    if (st != I2C_OK) {
+        return (int)st;
     }
-    if (ina219_read16(REG_BUS_V, &raw_bus) != 0) {
-        return -1;
+    st = ina219_read16(REG_BUS_V, &raw_bus);
+    if (st != I2C_OK) {
+        return (int)st;
     }
 
     /* shunt：16-bit 二補數，直接轉 int16_t 就拿到有號值（反接電流為負）。 */

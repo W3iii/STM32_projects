@@ -42,7 +42,8 @@ typedef struct {
  * 再讀回來比對當作「在線偵測」——INA219 沒有 WHO_AM_I 暫存器，
  * config read-back 是慣用的替代做法。
  *
- * 回傳：0 = OK，-1 = 沒回應或讀回值不符（沒接、位址不對、線鬆）
+ * 回傳：0 = OK，非 0 = i2c_status_t 的值。讀回值不符（不是 INA219）也回
+ *       I2C_ERR_NACK，跟「沒接」一樣當成不在線。
  */
 int ina219_init(void);
 
@@ -54,7 +55,7 @@ int ina219_init(void);
  *       兩筆之間若被別的 task 插進來上 bus，讀到的會是不同時刻的值 →
  *       呼叫端要把整支函式包在 i2c1_lock() 內（見 bus_port.h）。
  *
- * 回傳：0 = OK，-1 = I2C 失敗（out 不會被寫）
+ * 回傳：0 = OK，非 0 = 失敗那筆交易的 i2c_status_t（out 不會被寫）
  */
 int ina219_read(ina219_data_t *out);
 

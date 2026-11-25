@@ -37,12 +37,9 @@ void app_tasks_start(void);
 /* Sensor 因佇列滿而丟棄的樣本數（理想為 0；給 CLI status 觀察用）。 */
 uint32_t app_tasks_overruns(void);
 
-/* Sensor 因連續 I2C 讀取失敗而觸發 bus recovery 的累計次數（理想為 0）。
- * 非 0 代表 I2C 匯流排曾經卡住 —— 通常是供電、接觸或拉電阻的問題。 */
-uint32_t app_tasks_i2c_recovers(void);
-
-/* MPU6050 目前在不在線（1/0）。開機探一次，之後 Display 每秒重探，LOGGING
- * 中由 Sensor 的讀取結果更新。不在線時 start 會被擋下（CLI 與按鈕）。 */
+/* MPU6050 目前在不在線（1/0）。開機探一次，之後由 app_i2c1_supervisor 依
+ * 讀取結果與每秒重探更新。不在線時 start 會被擋下（CLI 與按鈕）。
+ * I2C 的 recovery 次數等統計改由 app_i2c1_supervisor.h 提供。 */
 int app_tasks_mpu_ok(void);
 
 /* IDLE task 要不要用 WFI 睡覺（1 = 睡，0 = 空轉）。CLI 的 wfi 指令直接改它，

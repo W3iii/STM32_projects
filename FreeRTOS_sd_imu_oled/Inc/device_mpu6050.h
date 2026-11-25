@@ -29,7 +29,10 @@ typedef struct {
 #define MPU6050_GYRO_LSB_PER_DPS   131.0f     /* ±250°/s 量程 */
 
 /* ---- 初始化 ----
- *  回傳值：0 = OK, -1 = WHO_AM_I 不對（沒接好 / 模組壞了）
+ *  回傳 0 = OK，非 0 = i2c_status_t 的值：
+ *    I2C_ERR_NACK            沒回應，或 WHO_AM_I 不對（沒接 / 不是 MPU6050）
+ *    I2C_ERR_TIMEOUT / BUS   匯流排有問題
+ *  不會自己做 bus recovery —— 那是 app_i2c1_supervisor 的決定。
  */
 int mpu6050_init(void);
 

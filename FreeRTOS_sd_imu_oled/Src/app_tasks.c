@@ -50,6 +50,7 @@
 #include "app_cli.h"
 #include "app_button.h"
 #include "app_cpu_stats.h"
+#include "app_i2c1_supervisor.h"  /* MPU6050 / INA219 的在線狀態與匯流排 recovery */
 
 /* ---- task 參數 ---- */
 #define SENSOR_PERIOD_MS     10          /* 100Hz */
@@ -70,26 +71,15 @@
 #define SD_PRESENCE_MS       1000
 #define BTN_DEBOUNCE_MS      20          /* EXTI 喚醒後等接點沉澱，再重讀電位確認 */
 
-/* 連續幾次 I2C 讀取失敗才觸發 bus recovery。偶發一次（雜訊、暫時性 NACK）
- * 重試就好；設 5 表示 50ms 內都讀不到才動手，避免小抖動就去搖匯流排。 */
-#define SENSOR_I2C_FAIL_LIMIT  5
-
-/* Display 讀 INA219 連續失敗幾次才做 bus recovery。10Hz 下 5 次 = 0.5s。
- * 熱插拔（把 INA219 拔掉再插回）會在交易途中抽走 slave，插回的瞬間接點彈跳
- * 也可能讓它的狀態機停在半途抓著 SDA —— 那不會自己好，得搖 clock 把它踢出來。 */
-#define DISPLAY_I2C_FAIL_LIMIT 5
-
-/* INA219 不在線時的重探週期（Display 迴圈輪數）。10Hz 下 50 輪 = 5s。
- * 不能只在開機探一次就定終身：探不到就永遠不再讀，插回來也不會恢復。
- * 也不能每輪都探 —— 沒接的時候每輪吃 NACK/timeout 會把 10Hz 更新拖垮。 */
-#define INA_REPROBE_PERIOD     50
-
-/* MPU6050 的重探週期（Display 迴圈輪數）。10Hz 下 10 輪 = 1s。
- * 不在線時：跑 mpu6050_init()，插回來最多 1 秒就回到線上。
- * 在線但沒在錄時：同樣跑 init 當在線偵測（WHO_AM_I + 寫 PWR_MGMT_1，兩筆
- * 交易約 0.2ms），不然 IDLE 沒人讀它，拔掉了 OLED 還是 READY。
- * LOGGING 且在線時不探：Sensor 每 10ms 的讀取本身就是在線偵測。 */
-#define MPU_PROBE_PERIOD       10
+/* I2C1 上的晶片清單在 bootstrap 登記給 app_i2c1_supervisor：失敗門檻、
+ * bus recovery 的時機是那邊的通用規則，這裡只決定每顆的重探週期。
+ * task 只負責「在線才讀、讀完回報」。
+ *
+ *   MPU 1s  —— 掉線要盡快接回來（錄製中斷一秒就少 100 筆）；IDLE 時沒人讀它，
+ *              也靠這個週期當在線偵測（init = WHO_AM_I + 寫一個暫存器，約 0.2ms）
+ *   INA 5s  —— 選配的電源監測，不在線時每輪吃 NACK/timeout 會拖慢 10Hz 畫面 */
+#define MPU_PROBE_MS         1000
+#define INA_PROBE_MS         5000
 
 /* OLED 重送設定序列的週期（Display 迴圈輪數），10 輪 = 1s。
  * SPI 偵測不到模組被拔，只能週期性重送，見 ssd1306_reconfigure()。 */
@@ -125,17 +115,7 @@ static volatile uint32_t s_overruns;
 /* spi1_lock()/spi1_unlock() 的實作已搬到 bus_port_freertos.c（匯流排鎖屬於
  * bus 自己，見 bus_port.h）；這裡只在 app_tasks_start() 呼叫 bus_port_init()。 */
 
-/* I2C 健康度：連續失敗計數（成功即歸零）與累計 recovery 次數。
- * s_i2c_recovers 有兩個 writer（Sensor 與 Display），但兩邊都在持有 i2c1_lock
- * 期間才遞增，所以那支 mutex 已經把它序列化了；reader(CLI) 讀到舊值無害。
- * s_i2c_fails / s_ina_fails 各自只有一個 writer。 */
-static uint32_t          s_i2c_fails;
-static uint32_t          s_ina_fails;     /* Display 讀 INA219 的連續失敗數 */
-static uint32_t          s_ina_reprobe;   /* 不在線時的重探倒數 */
-static volatile uint32_t s_i2c_recovers;
-
 uint32_t app_tasks_overruns(void) { return s_overruns; }
-uint32_t app_tasks_i2c_recovers(void) { return s_i2c_recovers; }
 
 /* Sensor 每輪更新的最新晶片溫度（×10，整數）。給 Display task 顯示用。
  * 單一 writer(Sensor) / 單一 reader(Display)、32-bit 對齊存取，讀到舊值無害，
@@ -149,18 +129,13 @@ static volatile int32_t s_last_temp_c10;
  * 關中斷時間可忽略），比為此再開一支 mutex 便宜。 */
 static ina219_data_t s_power;
 static uint8_t       s_power_valid;     /* 0 = INA219 不在線或還沒量到 */
-static uint8_t       s_ina_present;     /* init 成功才在 Display 迴圈裡讀它 */
-
-/* MPU6050 在不在線。以前是開機探一次就定終身，開機沒接之後插上去也不會
- * 恢復。現在 bootstrap 給初值，之後兩個 writer：Sensor（LOGGING 中 recovery
- * 後重新 init 沒過 → 0）與 Display（每秒重探）。兩邊都只在持有 i2c1_lock
- * 時寫，跟 s_i2c_recovers 一樣由那支 mutex 序列化；Sensor 迴圈頂端不上鎖
- * 讀它，讀到舊值只是晚一輪才停 / 才恢復取樣。 */
-static volatile uint8_t s_mpu_ok;
-static uint32_t      s_mpu_probe;       /* Display 的重探倒數 */
 static uint32_t      s_oled_reinit;     /* Display 的 OLED 重送設定倒數 */
 
-int app_tasks_mpu_ok(void) { return s_mpu_ok; }
+/* bootstrap 登記後才有效；登記前是 -1，supervisor 一律當成離線。 */
+static i2c1_dev_t    s_dev_mpu = -1;
+static i2c1_dev_t    s_dev_ina = -1;
+
+int app_tasks_mpu_ok(void) { return i2c1_sup_online(s_dev_mpu); }
 
 /* ---- 最近 N 筆量測的環形緩衝：給 CLI 的 power 指令做平均 ----
  * 為什麼要平均：單筆讀數偶爾會跳出離群值 —— 麵包板上的 I2C 雜訊讓某個
@@ -301,10 +276,9 @@ static void sensor_task(void *arg)
             if (app_datalogger_state() != DL_LOGGING) {
                 break;                               /* stop 落在這次等待中：不取這筆 */
             }
-            if (!s_mpu_ok) {
-                /* 掉線中：不讀。每輪都去撞 NACK、每 50ms 搖一次匯流排沒有意義，
-                 * 還會把 recovery 計數灌爆。重探交給 Display（每秒一次），
-                 * 插回來之後這裡下一輪就接著取樣。 */
+            if (!i2c1_sup_online(s_dev_mpu)) {
+                /* 掉線中：不讀。每輪都去撞 NACK 沒有意義；重探由 Display 的
+                 * i2c1_sup_tick() 每秒做一次，插回來之後這裡下一輪就接著取樣。 */
                 continue;
             }
 
@@ -312,31 +286,18 @@ static void sensor_task(void *arg)
             s.t_ms = systick_get_ms();
             i2c1_lock();                             /* I2C1 互斥：CLI 的 i2cscan / INA219 也會上這條 bus */
             int rc = mpu6050_read_all(&s.acc, &s.gyro);  /* 14-byte burst，400kHz 約 0.4ms */
+            /* 不重試：100Hz 熱路徑，丟一筆比多等一筆交易划算。失敗的種類交給
+             * app_i2c1_supervisor 判斷 —— NACK 連續夠多次就離線，TIMEOUT/BUS 才去
+             * 動匯流排。以前這裡不分種類，拔掉 MPU 也每 50ms 搖一次匯流排。 */
+            i2c1_sup_report(s_dev_mpu, rc);
+            i2c1_unlock();
 
             if (rc != 0) {
-                /* 讀失敗。以前這裡把回傳值丟掉，於是 acc/gyro 保留上一次的
+                /* 這筆作廢，不送進佇列。以前把回傳值丟掉，acc/gyro 保留上一次的
                  * 殘值被當成新樣本寫進 CSV —— 看起來像「sensor 不動了」而不是
-                 * 「壞掉了」。現在這筆直接不送進佇列。
-                 *
-                 * 連續失敗才做 recovery：偶發一次（雜訊、NACK）重試就好，
-                 * 但 slave 把 SDA 拉住不放這種情況不會自己好，得手動搖 SCL
-                 * 把它從半途的交易踢出來。recovery 會關掉 I2C1、把腳位切成
-                 * GPIO bit-bang 九個 clock 再重新初始化，幾十微秒等級，只能
-                 * 在 task 脈絡做（所以不放在 ISR 的錯誤處理裡）。 */
-                if (++s_i2c_fails >= SENSOR_I2C_FAIL_LIMIT) {
-                    i2c1_bus_recovery();
-                    /* recovery 會重設周邊，要重新喚醒 sensor。init 沒過 = 不是
-                     * 匯流排卡住而是 MPU 不見了（被拔、接觸不良），標成離線，
-                     * OLED 顯示 NO MPU，等 Display 重探。 */
-                    s_mpu_ok       = (mpu6050_init() == 0) ? 1 : 0;
-                    s_i2c_fails    = 0;
-                    s_i2c_recovers++;
-                }
-                i2c1_unlock();
-                continue;                            /* 這筆作廢，等下一個週期 */
+                 * 「壞掉了」。 */
+                continue;
             }
-            s_i2c_fails = 0;                         /* 成功就把連續失敗計數歸零 */
-            i2c1_unlock();
 
             s.temp_c = tempsensor_read_c();          /* 同一時間點的晶片溫度（ADC，不走 I2C）*/
             s_last_temp_c10 = (int32_t)(s.temp_c * 10.0f);   /* 給 Display 顯示 */
@@ -471,43 +432,27 @@ static void display_task(void *arg)
         dl_status_t st;
         app_datalogger_get_status(&st);
 
+        /* ---- I2C 晶片：該重探的探一次（離線的、或太久沒成功交易的）----
+         * IDLE 時 MPU 沒人讀，也是靠這裡每秒探一次當在線偵測，不然拔掉了
+         * OLED 還是 READY。規則見 app_i2c1_supervisor.h，週期見 MPU_PROBE_MS。 */
+        i2c1_sup_tick();
+
         /* ---- 量 INA219（I2C1，和 Sensor task 互斥）----
-         * 只在 init 成功時才讀：沒接的話每輪都會吃 NACK，白花 bus 時間，
-         * 線真的斷掉時更會每輪吃滿 timeout 把 10Hz 更新拖垮。 */
-        if (s_ina_present) {
+         * 只在在線時讀：沒接的話每輪都會吃 NACK，白花 bus 時間，線真的斷掉
+         * 時更會每輪吃滿 timeout 把 10Hz 更新拖垮。 */
+        if (i2c1_sup_online(s_dev_ina)) {
             ina219_data_t p;
             i2c1_lock();
             int rc = ina219_read(&p);       /* 兩筆交易，整段包在鎖內才同時刻 */
             if (rc != 0) {
                 /* 重試一次。ina219_read 是兩筆交易，任一筆遇到暫時性的
-                 * NACK / 雜訊整個讀取就作廢，而原本沒有任何重試 —— 於是
-                 * 偶發一次 glitch 就讓這一幀顯示 "--"。麵包板上的 I2C 偶爾
-                 * 出錯是常態，一次重試就能把絕大多數蓋掉。
-                 * 代價：失敗時多花約 500µs（10Hz 下可忽略）。
-                 * 真正的失敗率仍然看得到 —— status 的 i2c err 是在 driver
-                 * 層計數的，重試不會把它藏起來。 */
+                 * NACK / 雜訊整個讀取就作廢，偶發一次 glitch 就讓這一幀顯示
+                 * "--"。10Hz 下多花約 500µs 可忽略（MPU 的 100Hz 熱路徑則
+                 * 選擇不重試、直接丟一筆）。真正的失敗率仍然看得到 ——
+                 * status 的 i2c errors 是在 driver 層計數的。 */
                 rc = ina219_read(&p);
             }
-
-            /* 重試還是失敗就開始累計。連續 DISPLAY_I2C_FAIL_LIMIT 次才動手 ——
-             * 偶發 NACK 上面那次重試已經蓋掉了，還過不去就不是雜訊。
-             *
-             * 以前這裡沒有任何 recovery：bus_recovery 只接在 Sensor task 上，
-             * 而 Sensor 只有 logging 中才在跑。所以把 INA219 拔掉再插回、
-             * slave 卡住 SDA 時，OLED 就永遠停在 "--"，沒人去救。
-             *
-             * recovery 之後要重跑 ina219_init()：熱插拔回來的晶片已經回到
-             * power-on 預設值，而且 init 的 config read-back 順便當在線偵測。 */
-            if (rc != 0) {
-                if (++s_ina_fails >= DISPLAY_I2C_FAIL_LIMIT) {
-                    i2c1_bus_recovery();
-                    s_ina_present = (ina219_init() == 0) ? 1 : 0;
-                    s_ina_fails   = 0;
-                    s_i2c_recovers++;       /* 在 i2c1_lock 內，與 Sensor 序列化 */
-                }
-            } else {
-                s_ina_fails = 0;
-            }
+            i2c1_sup_report(s_dev_ina, rc);
             i2c1_unlock();
             taskENTER_CRITICAL();
             if (rc == 0) {
@@ -523,31 +468,7 @@ static void display_task(void *arg)
             }
             taskEXIT_CRITICAL();
         } else {
-            /* 不在線：每 INA_REPROBE_PERIOD 輪重探一次，讓插回來的晶片能自己
-             * 回到線上。s_ina_present 以前是開機探一次就定終身 —— 開機時沒接
-             * （或 recovery 後 init 沒過）就再也不會讀，插回去也不會恢復。 */
-            if (++s_ina_reprobe >= INA_REPROBE_PERIOD) {
-                s_ina_reprobe = 0;
-                i2c1_lock();
-                s_ina_present = (ina219_init() == 0) ? 1 : 0;
-                i2c1_unlock();
-            }
-        }
-
-        /* ---- MPU6050 在線偵測 / 重探（理由見 MPU_PROBE_PERIOD）----
-         * init 失敗重試一次再下結論，跟 INA219 一樣：偶發一次 NACK 就把
-         * 在線的 MPU 判成離線，OLED 會閃一下 NO MPU。 */
-        if (++s_mpu_probe >= MPU_PROBE_PERIOD) {
-            s_mpu_probe = 0;
-            if (!s_mpu_ok || st.state != DL_LOGGING) {
-                i2c1_lock();
-                int mrc = mpu6050_init();
-                if (mrc != 0) {
-                    mrc = mpu6050_init();
-                }
-                s_mpu_ok = (mrc == 0) ? 1 : 0;
-                i2c1_unlock();
-            }
+            s_power_valid = 0;              /* 離線：別讓 CLI / OLED 印最後一筆舊值 */
         }
 
         char line[22];
@@ -563,7 +484,7 @@ static void display_task(void *arg)
         /* 第 2 行：狀態 + 筆數（同一行，"* REC" 佔 5 字 = 30px，空兩格 → x=42）*/
         if (st.state == DL_LOGGING) {
             ssd1306_draw_string(0, 16, "* REC");
-            if (s_mpu_ok) {
+            if (i2c1_sup_online(s_dev_mpu)) {
                 ssd1306_draw_int(42, 16, (int32_t)st.count);
             } else {
                 /* 檔案還開著，但 Sensor 沒在取樣。只畫凍住的筆數的話，
@@ -575,7 +496,7 @@ static void display_task(void *arg)
              * 後面接 FatFs 的 FRESULT，方便直接對照原因。 */
             ssd1306_draw_string(0, 16, "!ERR");
             ssd1306_draw_int(36, 16, (int32_t)st.fres);
-        } else if (!s_mpu_ok) {
+        } else if (!i2c1_sup_online(s_dev_mpu)) {
             ssd1306_draw_string(0, 16, "NO MPU");
         } else if (!app_datalogger_mounted()) {
             /* 掛載失敗（開機三次沒過，或 DL_ERROR 下 stop 放棄舊檔後卸載）。
@@ -637,7 +558,7 @@ static void toggle_logging(void)
     if (app_datalogger_state() == DL_LOGGING) {
         app_datalogger_stop();
         usart1_send_string("\r\n[BTN] stopped\r\n> ");
-    } else if (!s_mpu_ok) {
+    } else if (!i2c1_sup_online(s_dev_mpu)) {
         usart1_send_string("\r\n[BTN] start failed: no MPU6050\r\n> ");
     } else if (app_datalogger_start() == 0) {
         usart1_send_string("\r\n[BTN] started: ");
@@ -791,10 +712,14 @@ static void bootstrap_task(void *arg)
      * 這在供電邊界的板子上很重要 —— 失敗時你需要一台還能跟你對話的機器。 */
     /* MPU6050 跟 SD 分開初始化：以前 MPU 沒過就連卡都不掛。開機沒接只是
      * 初值，Display 之後每秒重探，插上去就回到線上。
-     * mpu6050_init() 是「讀 WHO_AM_I → 寫 PWR_MGMT_1」兩筆交易，整段包在
-     * i2c1_lock 內才是原子的。此刻只有 bootstrap 在跑，但照規矩上鎖。 */
+     * probe 內的 mpu6050_init() 是「讀 WHO_AM_I → 寫 PWR_MGMT_1」兩筆交易，
+     * 整段包在 i2c1_lock 內才是原子的。此刻只有 bootstrap 在跑，但照規矩上鎖。 */
+    /* 登記 I2C1 上的晶片：在建立任何會讀它們的 task 之前，之後清單固定。 */
+    s_dev_mpu = i2c1_sup_register("mpu6050", mpu6050_init, MPU_PROBE_MS);
+    s_dev_ina = i2c1_sup_register("ina219",  ina219_init,  INA_PROBE_MS);
+
     i2c1_lock();
-    s_mpu_ok = (mpu6050_init() == 0) ? 1 : 0;
+    int mpu_ok = i2c1_sup_probe(s_dev_mpu);
     i2c1_unlock();
 
     int rc = app_datalogger_init();
@@ -806,7 +731,7 @@ static void bootstrap_task(void *arg)
 
     /* ---- 開機報告：一個裝置一行 ----
      * 順序：MPU6050 → SD 卡 → FAT32 → INA219。MPU 沒過不再擋住 SD 那兩行。 */
-    usart1_send_string(s_mpu_ok
+    usart1_send_string(mpu_ok
         ? "  [ok] MPU6050   @0x68\r\n"
         : "  [!!] MPU6050   not found -> start disabled until plugged in (try: i2cscan)\r\n");
     boot_print_sd();
@@ -840,11 +765,11 @@ static void bootstrap_task(void *arg)
 
     /* ---- INA219（選配）----
      * 沒接不算致命：只是 OLED 第 3 行與 CLI power 顯示 "--"，其餘照跑。
-     * 這個旗標決定 Display task 之後要不要每輪去讀它。 */
+     * 在線與否決定 Display task 之後要不要每輪去讀它（不在線每 5s 重探）。 */
     i2c1_lock();
-    s_ina_present = (ina219_init() == 0) ? 1 : 0;
+    int ina_ok = i2c1_sup_probe(s_dev_ina);
     i2c1_unlock();
-    usart1_send_string(s_ina_present
+    usart1_send_string(ina_ok
         ? "  [ok] INA219    @0x40\r\n"
         : "  [--] INA219    not found (try: i2cscan)\r\n");
 

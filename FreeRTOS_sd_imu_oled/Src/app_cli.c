@@ -13,6 +13,7 @@
 #include "app_cli.h"
 #include "app_datalogger.h"
 #include "app_tasks.h"          /* app_tasks_overruns（status 用）*/
+#include "app_i2c1_supervisor.h" /* status：I2C 晶片在線狀態與 bus recovery 統計 */
 #include "bus_port.h"           /* i2cscan 指令：i2c1_lock / i2c1_unlock */
 #include "device_sdcard.h"      /* status：SD_IO_* 讀寫失敗現場（純讀全域，不碰匯流排）*/
 #include "device_tempsensor.h"  /* status：晶片溫度 raw / 換算除錯讀數 */
@@ -227,13 +228,48 @@ static void cli_status(int argc, char **argv)
         usart1_send_string("\r\n");
     }
 
-    /* ── i2c：MPU6050 / INA219 那條匯流排 ── */
+    /* ── i2c：MPU6050 / INA219 那條匯流排 ──
+     * 跟 app_i2c1_supervisor 的兩層對應：先看每顆晶片（NACK → 離線），再看匯流排
+     * （TIMEOUT/BUS → recovery）。MPU 掉線時 logger 仍可能是 LOGGING（檔案
+     * 開著、取樣暫停），只看 [logger] 會以為一切正常。 */
     cli_section("i2c");
-    /* MPU 掉線時 logger 仍可能是 LOGGING（檔案開著、取樣暫停），只看
-     * [logger] 會以為一切正常。 */
-    cli_label("mpu6050");
-    usart1_send_string(app_tasks_mpu_ok() ? "ok\r\n"
-                                          : "NOT FOUND (reprobe every 1s)\r\n");
+    for (int i = 0; i < i2c1_sup_dev_count(); i++) {
+        i2c1_sup_dev_stats_t ds;
+        i2c1_sup_dev_stats(i, &ds);
+        cli_label(ds.name);
+        if (ds.online) {
+            usart1_send_string("ok");
+        } else {
+            usart1_send_string("OFFLINE (reprobe every ");
+            cli_print_u32(ds.probe_ms / 1000U);
+            usart1_send_string("s)");
+        }
+        if (ds.went_offline != 0) {
+            /* 非 0 = 掉線過又接回來（或還沒接回來）：接觸不良、被拔過 */
+            usart1_send_string("  lost ");
+            cli_print_u32(ds.went_offline);
+            usart1_send_string("x");
+        }
+        usart1_send_string("\r\n");
+    }
+
+    /* bus recovery 次數，理想 0。非 0 代表匯流排曾經卡住 —— 通常是熱插拔、
+     * 供電、接觸或拉電阻的問題。最後一次沒救回來就把結果印出來：SCL 被拉住
+     * 是硬體問題，搖 clock 沒用。 */
+    {
+        i2c1_sup_bus_stats_t bs;
+        i2c1_sup_bus_stats(&bs);
+        cli_label("bus");
+        usart1_send_string("recovery ");
+        cli_print_u32(bs.recoveries);
+        if (bs.recoveries != 0 && bs.last_rc != I2C_OK) {
+            usart1_send_string(bs.last_rc == I2C_ERR_SCL_STUCK
+                               ? "  (last: SCL held low - hardware)"
+                               : "  (last: SDA still low)");
+        }
+        usart1_send_string("\r\n");
+    }
+
     /* 非同步 I2C 的失敗次數，依類型分開 —— 三者指向完全不同的方向，
      * 混成一個數字就沒辦法對症下藥。理想全 0；偶爾跳 nack 在麵包板上
      * 算正常（Display 對 INA219 有一次重試，所以畫面不一定會閃 "--"）。 */
@@ -249,11 +285,6 @@ static void cli_status(int argc, char **argv)
         cli_print_u32(tmo);
         usart1_send_string("\r\n");
     }
-    /* Sensor 連續 I2C 讀取失敗而觸發 bus recovery 的次數，理想 0。
-     * 非 0 代表匯流排曾經卡住 —— 通常是供電、接觸或拉電阻的問題。 */
-    cli_label("recovery");
-    cli_print_u32(app_tasks_i2c_recovers());
-    usart1_send_string("\r\n");
 
     /* ── chip：晶片溫度（VREFINT 補償後，die 溫非室溫）＋ 實際 VDDA ──
      * VDDA 用出廠 VREFINT_CAL 換算，誤差約幾十 mV，拿來判斷 SD 供電夠不夠
@@ -695,9 +726,10 @@ static void cli_cmd_i2cscan(int argc, char **argv)
  *   i2cstuck raw    只注入就放手，讓 Sensor task 的自動路徑去救
  *
  * raw 模式是端到端測試：離開時 I2C1 是 disabled，之後每筆 mpu6050_read_all()
- * 都會吃滿逾時，連續 SENSOR_I2C_FAIL_LIMIT 次後 app_tasks.c 觸發 recovery。
- * 驗收方式是 status 的 i2c recov 從 0 變 1、取樣自動續跑（CSV 中間少幾筆）。
- * 要先 start 讓 Sensor task 在跑，否則沒人會去救，匯流排會一直卡著。
+ * 都會吃滿逾時，連續 I2C1_SUP_BUS_ERR_LIMIT 次後 app_i2c1_supervisor 觸發 recovery。
+ * 驗收方式是 status 的 [i2c] bus recovery 從 0 變 1、取樣自動續跑（CSV 中間
+ * 少幾筆）。
+ * 不必先 start：IDLE 時 Display 讀 INA219 / 重探 MPU 一樣會回報錯誤，只是比較慢。
  */
 static void cli_cmd_i2cstuck(int argc, char **argv)
 {
@@ -711,8 +743,11 @@ static void cli_cmd_i2cstuck(int argc, char **argv)
 
     if (raw) {
         i2c1_unlock();      /* 匯流排就這樣壞著交出去 */
-        usart1_send_string("  left broken: Sensor task should recover in ~250ms\r\n");
-        usart1_send_string("  check 'status' i2c recov (needs logging active)\r\n");
+        /* 誰先撞到誰回報：錄製中 Sensor 100Hz 約 250ms 就湊滿門檻；IDLE 時靠
+         * Display 讀 INA219（10Hz，約 0.5s），INA 不在線則靠 MPU 每秒的重探
+         * （約 5s）。 */
+        usart1_send_string("  left broken: auto recovery in ~0.25-5s (fastest while logging)\r\n");
+        usart1_send_string("  check 'status' [i2c] bus recovery\r\n");
         return;
     }
 
